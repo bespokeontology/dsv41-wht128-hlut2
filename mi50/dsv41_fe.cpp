@@ -762,7 +762,7 @@ void handle_connection(int fd, dsv41::Dsv41Runtime* rt, const std::string& defau
                     std::printf("[DSV41_FE] #%llu stream OK | prompt=%d (reuse=%d [radix=%d] in %.2fms=%.0f tok/s | fresh=%d in %.1fms=%.1f tok/s) | "
                                 "gen=%d in %.1fms=%.2f tok/s [bb=%.0fms p150=%.0fms dsp=%.0fms smp=%.0fms steps=%llu tau=%.2f] | "
                                 "stages[attn=%.0fms hsi=%.0fms moe=%.0fms p150w=%.0fms ar=%.0fms egw=%.1fms] | "
-                                "DSpark acc=%llu/%llu (%.1f%%) | tools=%zu%s\n",
+                                "DSpark acc=%llu/%llu (%.1f%%, tree=%llu/%llu) | tools=%zu%s\n",
                                 static_cast<unsigned long long>(req_num),
                                 stats.prompt_tokens,
                                 stats.cached_prefix_tokens, stats.radix_hit_tokens, stats.prefix_reuse_ms, reuse_tps,
@@ -774,7 +774,10 @@ void handle_connection(int fd, dsv41::Dsv41Runtime* rt, const std::string& defau
                                 stats.t_allreduce_ms, stats.t_engram_wait_ms,
                                 static_cast<unsigned long long>(stats.dspark_accepted),
                                 static_cast<unsigned long long>(stats.dspark_drafted),
-                                acc_pct, std::max(parsed_final.tool_calls.size(), streamed_tool_cnt), tg_note);
+                                acc_pct,
+                                static_cast<unsigned long long>(stats.dspark_tree_accepted),
+                                static_cast<unsigned long long>(stats.dspark_tree_steps),
+                                std::max(parsed_final.tool_calls.size(), streamed_tool_cnt), tg_note);
                     std::fflush(stdout);
                 } else {
                     std::printf("[DSV41_FE] #%llu stream aborted by client disconnect after %d tokens\n",
@@ -863,7 +866,7 @@ void handle_connection(int fd, dsv41::Dsv41Runtime* rt, const std::string& defau
                 std::printf("[DSV41_FE] #%llu sync OK | prompt=%d (reuse=%d [radix=%d] in %.2fms=%.0f tok/s | fresh=%d in %.1fms=%.1f tok/s) | "
                             "gen=%d in %.1fms=%.2f tok/s [bb=%.0fms p150=%.0fms dsp=%.0fms smp=%.0fms steps=%llu tau=%.2f] | "
                             "stages[attn=%.0fms hsi=%.0fms moe=%.0fms p150w=%.0fms ar=%.0fms egw=%.1fms] | "
-                            "DSpark acc=%llu/%llu (%.1f%%) | tools=%zu%s\n",
+                            "DSpark acc=%llu/%llu (%.1f%%, tree=%llu/%llu) | tools=%zu%s\n",
                             static_cast<unsigned long long>(req_num),
                             stats.prompt_tokens,
                             stats.cached_prefix_tokens, stats.radix_hit_tokens, stats.prefix_reuse_ms, reuse_tps,
@@ -875,7 +878,10 @@ void handle_connection(int fd, dsv41::Dsv41Runtime* rt, const std::string& defau
                             stats.t_allreduce_ms, stats.t_engram_wait_ms,
                             static_cast<unsigned long long>(stats.dspark_accepted),
                             static_cast<unsigned long long>(stats.dspark_drafted),
-                            acc_pct, parsed.tool_calls.size(), tg_note);
+                            acc_pct,
+                            static_cast<unsigned long long>(stats.dspark_tree_accepted),
+                            static_cast<unsigned long long>(stats.dspark_tree_steps),
+                            parsed.tool_calls.size(), tg_note);
                 std::fflush(stdout);
             }
         } catch (const std::exception& e) {

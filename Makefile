@@ -1,4 +1,4 @@
-# Top-Level Pure-C++ Makefile for DeepSeek-V4.1-Flash-1017 WHT128-HLUT2 (Wave 6C Canonical)
+# Top-Level Pure-C++ Makefile for DeepSeek-V4.1-Flash-1017 WHT128-HLUT2 (Wave 7B Canonical)
 # Lead Tier: 2x Tenstorrent Blackhole P150A (p150/) + 3x AMD Instinct MI50 (mi50/) + Offline Tools (tools/)
 # 100% Pure C++17 / gfx906 HIP / TT-Metal C++20 — Zero Python Anywhere.
 
@@ -20,6 +20,7 @@ TOOLS_BINS := \
 	$(BIN_DIR)/bench_hlut2 \
 	$(BIN_DIR)/verify_wave5_all \
 	$(BIN_DIR)/verify_wave6_math \
+	$(BIN_DIR)/verify_wave7_opt \
 	$(BIN_DIR)/test_think_loop_guard
 
 all: tools mi50 p150_if_present
@@ -60,21 +61,25 @@ $(BUILD_DIR)/tools/dsv41_tokenizer_dsml.o: $(ROOT)/mi50/dsv41_tokenizer_dsml.cpp
 $(BIN_DIR)/verify_wave6_math: $(ROOT)/tools/verify_wave6_math.cpp $(BUILD_DIR)/tools/dsv41_tokenizer_dsml.o | $(BIN_DIR)
 	$(CXX) $(TOOL_CXXFLAGS) $^ $(TOK_LDFLAGS) -o $@
 
+$(BIN_DIR)/verify_wave7_opt: $(ROOT)/tools/verify_wave7_opt.cpp $(ROOT)/p150/dsv41_p150_l1.hpp $(ROOT)/mi50/dsv41_kolmogorov_tree_verifier.hpp $(ROOT)/mi50/dsv41_tree_spec.hpp $(ROOT)/src/hlut2_pack.hpp | $(BIN_DIR)
+	$(CXX) $(TOOL_CXXFLAGS) $< -o $@
+
 $(BIN_DIR)/test_think_loop_guard: $(ROOT)/mi50/dsv41_think_loop_guard.hpp | $(BIN_DIR)
 	$(CXX) -O3 -std=c++17 -Wall -Wextra -Werror -x c++ -DDSV41_THINK_GUARD_SELFTEST $< -o $@
 
-check: $(BIN_DIR)/verify_wave5_all $(BIN_DIR)/verify_wave6_math $(BIN_DIR)/test_think_loop_guard
+check: $(BIN_DIR)/verify_wave5_all $(BIN_DIR)/verify_wave6_math $(BIN_DIR)/verify_wave7_opt $(BIN_DIR)/test_think_loop_guard
 	$(BIN_DIR)/verify_wave5_all
 	$(BIN_DIR)/verify_wave6_math
+	$(BIN_DIR)/verify_wave7_opt
 	$(BIN_DIR)/test_think_loop_guard
 
 audit-gfx906: | $(BUILD_DIR)/tools
-	$(HIPCC) --gcc-install-dir=$(GCC_DIR) -O3 -std=c++17 --offload-arch=gfx906 -fno-gpu-rdc -S $(ROOT)/mi50/dsv41_mi50_kernels.hip -o $(BUILD_DIR)/tools/wave6c_gfx906.s
-	@echo "Total gfx906 kernels: $$(grep -cE 'ScratchSize:[[:space:]]+' $(BUILD_DIR)/tools/wave6c_gfx906.s)"
-	@echo "Zero-scratch kernels: $$(grep -cE 'ScratchSize:[[:space:]]+0$$' $(BUILD_DIR)/tools/wave6c_gfx906.s)"
-	@echo "Device trig instructions (v_sin_f32/v_cos_f32): $$(grep -cE 'v_sin_f32|v_cos_f32' $(BUILD_DIR)/tools/wave6c_gfx906.s || true)"
-	@test "$$(grep -cE 'ScratchSize:[[:space:]]+' $(BUILD_DIR)/tools/wave6c_gfx906.s)" -eq "$$(grep -cE 'ScratchSize:[[:space:]]+0$$' $(BUILD_DIR)/tools/wave6c_gfx906.s)"
-	@! grep -qE "v_sin_f32|v_cos_f32" $(BUILD_DIR)/tools/wave6c_gfx906.s
+	$(HIPCC) --gcc-install-dir=$(GCC_DIR) -O3 -std=c++17 --offload-arch=gfx906 -fno-gpu-rdc -S $(ROOT)/mi50/dsv41_mi50_kernels.hip -o $(BUILD_DIR)/tools/wave7b_gfx906.s
+	@echo "Total gfx906 kernels: $$(grep -cE 'ScratchSize:[[:space:]]+' $(BUILD_DIR)/tools/wave7b_gfx906.s)"
+	@echo "Zero-scratch kernels: $$(grep -cE 'ScratchSize:[[:space:]]+0$$' $(BUILD_DIR)/tools/wave7b_gfx906.s)"
+	@echo "Device trig instructions (v_sin_f32/v_cos_f32): $$(grep -cE 'v_sin_f32|v_cos_f32' $(BUILD_DIR)/tools/wave7b_gfx906.s || true)"
+	@test "$$(grep -cE 'ScratchSize:[[:space:]]+' $(BUILD_DIR)/tools/wave7b_gfx906.s)" -eq "$$(grep -cE 'ScratchSize:[[:space:]]+0$$' $(BUILD_DIR)/tools/wave7b_gfx906.s)"
+	@! grep -qE "v_sin_f32|v_cos_f32" $(BUILD_DIR)/tools/wave7b_gfx906.s
 	@! grep -rn "hipDeviceEnablePeerAccess" $(ROOT)/mi50 $(ROOT)/src $(ROOT)/p150 $(ROOT)/tools
 
 clean:

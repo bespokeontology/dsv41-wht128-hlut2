@@ -54,6 +54,21 @@ public:
         const uint8_t* image_mask,
         std::vector<int64_t>& out_hashes);
 
+    // Causal-tree 4-gram hash evaluation for M <= 8 speculative tree nodes without mutating seq_cache_ with cousins
+    void compute_hashes_tree(
+        const int32_t* token_ids,
+        const int32_t* parent_ids,
+        const uint32_t* depths,
+        int M,
+        int start_pos,
+        std::vector<int64_t>& out_hashes);
+
+    // Commit verified branch tokens [0..count-1] into seq_cache_[start_pos .. start_pos + count - 1]
+    void commit_accepted_tokens(
+        const int32_t* accepted_tokens,
+        int count,
+        int start_pos);
+
     void gather_dequant_tp3(
         int engram_idx,
         const int64_t* all_hashes,

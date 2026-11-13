@@ -502,6 +502,99 @@ void Dsv41EngramEngine::compute_hashes(
     }
 }
 
+void Dsv41EngramEngine::compute_hashes_tree(
+    const int32_t* token_ids,
+    const int32_t* parent_ids,
+    const uint32_t* depths,
+    int M,
+    int start_pos,
+    std::vector<int64_t>& out_hashes)
+{
+    static constexpr int32_t kDead = -1;
+    if (start_pos + M > int(seq_cache_.size())) {
+        seq_cache_.resize(size_t(start_pos + M + 4096), pad_compressed_id_);
+    }
+
+    int32_t node_cid[16];
+    for (int s = 0; s < M; ++s) {
+        const int32_t tid = token_ids[s];
+        node_cid[s] = (tid >= 0 && size_t(tid) < token_map_.size()) ? token_map_[size_t(tid)] : pad_compressed_id_;
+    }
+
+    out_hashes.resize(size_t(M) * 2ULL * 24ULL);
+
+    for (int s = 0; s < M; ++s) {
+        int32_t anc_cid[16];
+        for (int k = 0; k < 16; ++k) anc_cid[k] = pad_compressed_id_;
+        int cur = s;
+        for (int guard = 0; cur >= 0 && guard < 16; ++guard) {
+            const uint32_t cd = depths[cur];
+            if (cd < 16u) anc_cid[cd] = node_cid[cur];
+            cur = parent_ids[cur];
+        }
+
+        const int pos = start_pos + int(depths[s]);
+        int64_t toks[4];
+        bool blocked = false;
+        for (int shift = 0; shift < 4; ++shift) {
+            const int idx = pos - shift;
+            if (idx < 0) {
+                blocked = true;
+                toks[shift] = int64_t(pad_compressed_id_);
+            } else {
+                const int32_t src = (idx >= start_pos)
+                    ? anc_cid[idx - start_pos]
+                    : seq_cache_[size_t(idx)];
+                if (src == kDead) blocked = true;
+                toks[shift] = blocked ? int64_t(pad_compressed_id_) : int64_t(src);
+            }
+        }
+
+        for (int l = 0; l < 2; ++l) {
+            int64_t* dst = out_hashes.data() + (size_t(s) * 2ULL + size_t(l)) * 24ULL;
+            int64_t rolling = toks[0] * multipliers_[l][0];
+            for (int i = 1; i < 4; ++i) {
+                rolling ^= (toks[i] * multipliers_[l][i]);
+                const int base_col = (i - 1) * 8;
+                const uint64_t ux = uint64_t(rolling);
+                const __m256d vx0 = _mm256_set1_pd(double(ux & 0x1FFFFFULL));
+                const __m256d vx1 = _mm256_set1_pd(double((ux >> 21) & 0x1FFFFFULL));
+                const __m256d vx2 = _mm256_set1_pd(double((ux >> 42) & 0x1FFFFFULL));
+                const __m256d vb63 = _mm256_set1_pd(double(ux >> 63));
+                for (int g = 0; g < 2; ++g) {
+                    const int c0 = base_col + g * 4;
+                    const __m256d vp = _mm256_load_pd(&barrett_p_[l][c0]);
+                    const __m256d vinv = _mm256_load_pd(&barrett_inv_p_[l][c0]);
+                    __m256d vS = _mm256_fmadd_pd(vx1, _mm256_load_pd(&barrett_r21_[l][c0]), vx0);
+                    vS = _mm256_fmadd_pd(vx2, _mm256_load_pd(&barrett_r42_[l][c0]), vS);
+                    vS = _mm256_fmadd_pd(vb63, _mm256_load_pd(&barrett_r63_neg_[l][c0]), vS);
+                    const __m256d vq = _mm256_floor_pd(_mm256_mul_pd(vS, vinv));
+                    __m256d vrem = _mm256_fnmadd_pd(vq, vp, vS);
+                    vrem = _mm256_sub_pd(vrem, _mm256_and_pd(_mm256_cmp_pd(vrem, vp, _CMP_GE_OQ), vp));
+                    const __m128i vi32 = _mm256_cvttpd_epi32(_mm256_add_pd(vrem, _mm256_load_pd(&barrett_off_[l][c0])));
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + c0), _mm256_cvtepi32_epi64(vi32));
+                }
+            }
+        }
+    }
+}
+
+void Dsv41EngramEngine::commit_accepted_tokens(
+    const int32_t* accepted_tokens,
+    int count,
+    int start_pos)
+{
+    if (count <= 0) return;
+    if (start_pos + count > int(seq_cache_.size())) {
+        seq_cache_.resize(size_t(start_pos + count + 4096), pad_compressed_id_);
+    }
+    for (int i = 0; i < count; ++i) {
+        const int32_t tid = accepted_tokens[i];
+        const int32_t cid = (tid >= 0 && size_t(tid) < token_map_.size()) ? token_map_[size_t(tid)] : pad_compressed_id_;
+        seq_cache_[size_t(start_pos + i)] = cid;
+    }
+}
+
 void Dsv41EngramEngine::gather_dequant_tp3(
     int engram_idx,
     const int64_t* all_hashes,
@@ -525,8 +618,8 @@ void Dsv41EngramEngine::gather_dequant_tp3(
     const uint8_t* __restrict__ s_base = tbl.scale_ue8m0;
     const int total_jobs = seqlen * 24;
 
-    // Small-M OpenMP Gate + Hardware MSHR Prefetch Burst (seqlen=1: 0 OpenMP barrier; seqlen<=6: 4 threads)
-    if (seqlen <= 6) {
+    // Small-M OpenMP Gate + Hardware MSHR Prefetch Burst (seqlen=1: 0 OpenMP barrier; seqlen<=8: 4 threads)
+    if (seqlen <= 8) {
         for (int job = 0; job < total_jobs; ++job) {
             const int s = job / 24;
             if (image_mask && image_mask[s]) continue;

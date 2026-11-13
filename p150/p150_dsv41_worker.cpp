@@ -2,7 +2,9 @@
 // Zero Python anywhere. Serves M=1 decode, M=6 DSpark verify, and M=64..512 prefill over /dsv41_p150_ipc.
 
 #include "p150_dsv41_engine.hpp"
+#include "dsv41_p150_l1.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
@@ -32,10 +34,17 @@ int main(int argc, char** argv) {
         bool enable_trace       = true;
         bool reuse_shm          = false;
         uint32_t max_layers     = 40u;
+        uint32_t hot_shards     = dsv41::kP150ConfiguredHotShards;
 
         for (int i = 1; i < argc; ++i) {
             const std::string arg(argv[i]);
             if (arg == "--link-check") {
+                dsv41::p150_l1_geometry_report();
+                if (!dsv41::p150_hot_shards_fit(hot_shards)) {
+                    std::fprintf(stderr, "[P150_DSV41] Hot-shard geometry link check FAILED for %u\n",
+                                 unsigned(hot_shards));
+                    return 2;
+                }
                 std::cout << "[P150_DSV41] Link check OK (no devices opened)\n";
                 return 0;
             } else if (arg == "--model-dir" && i + 1 < argc) {
@@ -60,6 +69,10 @@ int main(int argc, char** argv) {
                 enable_trace = false;
             } else if (arg == "--reuse-shm") {
                 reuse_shm = true;
+            } else if (arg == "--hot-shards" && i + 1 < argc) {
+                hot_shards = std::clamp<uint32_t>(static_cast<uint32_t>(std::stoul(argv[++i])),
+                                                  dsv41::kP150MinHotShards,
+                                                  dsv41::kP150MaxHotL1Shards);
             } else if (arg == "--rarebal-overlay" && i + 1 < argc) {
                 rarebal_overlay = argv[++i];
             } else if (arg == "--no-rarebal-overlay") {
@@ -70,7 +83,7 @@ int main(int argc, char** argv) {
         std::signal(SIGINT, on_signal);
         std::signal(SIGTERM, on_signal);
 
-        dsv41::P150Dsv41Engine engine(packed_root, kernels_dir, enable_trace, rarebal_overlay);
+        dsv41::P150Dsv41Engine engine(packed_root, kernels_dir, enable_trace, rarebal_overlay, hot_shards);
 
         if (selfcheck_only) {
             const bool ok = engine.selfcheck_layer(selfcheck_layer);

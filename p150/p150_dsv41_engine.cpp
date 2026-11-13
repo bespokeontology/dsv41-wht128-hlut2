@@ -254,6 +254,18 @@ ttnn::Tensor alloc_dram_sharded0(
         TensorTopology::create_sharded_tensor_topology(mesh.shape(), 0));
 }
 
+ttnn::Tensor alloc_dram_replicated(
+    distributed::MeshDevice& mesh,
+    const Shape& shape,
+    DataType dtype,
+    Layout layout)
+{
+    return ttnn::create_device_tensor(
+        TensorSpec(shape, TensorLayout(dtype, PageConfig(layout), ttnn::DRAM_MEMORY_CONFIG)),
+        &mesh,
+        TensorTopology::create_fully_replicated_tensor_topology(mesh.shape()));
+}
+
 void write_sharded_pair_blocking(
     distributed::MeshDevice& mesh,
     ttnn::Tensor& dst,
@@ -306,27 +318,42 @@ struct ResidentLayerBank {
 };
 
 struct CoreWorkspace1 {
-    uint32_t m_tiles_ws = kBatchSlots;      // 12 expert slots batched in L1 per kernel launch
-    uint32_t max_slots = kMaxCompactSlots;  // 276 slots (serves both M<=32 decode & M<=512 compact prefill!)
+    uint32_t m_tiles_ws = kBatchSlots;      // 16 expert slots batched in L1 per kernel launch
+    uint32_t max_slots = kMaxCompactSlots;  // 288 slots (serves both M<=32 decode & M<=512 compact prefill!)
     uint32_t k_splits_up = 10;
     uint32_t k_splits_down = 2;
+    bool x_tilized_dram = false;    // Tier 1 (14..18): demotes 16-slot M>32 prefill gather arena (5.0 MiB) to replicated GDDR6
+    bool x_decode_dram = false;     // Tier 2 (18 only): demotes 1-slot M<=32 decode activation tile (320 KiB) to replicated GDDR6
+    bool weights_dram = false;      // Tier 1b (17..18): demotes scalar combine weights (1.125 MiB) to GDDR6 under FABRIC_1D
 
-    ttnn::Tensor x_tilized;         // L1 replicated [1, 12, 32, 5120] BFLOAT16 TILE (3.75 MiB)
-    ttnn::Tensor slot_ids;          // L1 replicated [1, 1, 1, 288] UINT16 ROW_MAJOR (576 B)
-    ttnn::Tensor weights_tiled;     // L1 replicated [1, 276, 32, 32] FLOAT32 TILE (1.08 MiB)
-    ttnn::Tensor gate_partials;     // L1 sharded    [2, k_splits_up, 12*32, 1152] FLOAT32 TILE
-    ttnn::Tensor up_partials;       // L1 sharded    [2, k_splits_up, 12*32, 1152] FLOAT32 TILE
-    ttnn::Tensor z_rot_bf16;        // L1 sharded    [2, 1, 12*32, 1152] BFLOAT16 TILE
-    ttnn::Tensor down_partials;     // L1 sharded    [2, k_splits_down, 12*32, 5120] FLOAT32 TILE
+    ttnn::Tensor x_tilized;         // Replicated [1, 16, 32, 5120] BFLOAT16 TILE (5.0 MiB M>32 prefill gather)
+    ttnn::Tensor x_decode;          // Replicated [1, 1, 32, 5120] BFLOAT16 TILE (320 KiB dedicated L1 decode tile at 14..17!)
+    ttnn::Tensor slot_ids;          // L1 replicated [1, 1, 1, kSlotIdsBytes / 2u] UINT16 ROW_MAJOR (640 B)
+    ttnn::Tensor weights_tiled;     // Replicated [1, 288, 32, 32] FLOAT32 TILE (1.125 MiB)
+    ttnn::Tensor gate_partials;     // L1 sharded    [2, k_splits_up, 16*32, 1152] FLOAT32 TILE
+    ttnn::Tensor up_partials;       // L1 sharded    [2, k_splits_up, 16*32, 1152] FLOAT32 TILE
+    ttnn::Tensor z_rot_bf16;        // L1 sharded    [2, 1, 16*32, 1152] BFLOAT16 TILE
+    ttnn::Tensor down_partials;     // L1 sharded    [2, k_splits_down, 16*32, 5120] FLOAT32 TILE
     ttnn::Tensor combined_f32;      // L1 sharded    [2, 1, 32, 5120] FLOAT32 TILE (M<=32 decode output)
     std::array<ttnn::Tensor, 3> finish_decode;
 
-    CoreWorkspace1(distributed::MeshDevice& mesh, uint32_t k_up, uint32_t k_dn)
+    CoreWorkspace1(distributed::MeshDevice& mesh, uint32_t k_up, uint32_t k_dn,
+                   bool dram_prefill_x, bool dram_decode_x, bool dram_weights)
         : k_splits_up(k_up),
           k_splits_down(k_dn),
-          x_tilized(alloc_l1(mesh, Shape({1, kBatchSlots, 32u, 5120u}), DataType::BFLOAT16, Layout::TILE, false)),
+          x_tilized_dram(dram_prefill_x),
+          x_decode_dram(dram_decode_x),
+          weights_dram(dram_weights),
+          x_tilized(dram_prefill_x
+                        ? alloc_dram_replicated(mesh, Shape({1, kBatchSlots, 32u, 5120u}), DataType::BFLOAT16, Layout::TILE)
+                        : alloc_l1(mesh, Shape({1, kBatchSlots, 32u, 5120u}), DataType::BFLOAT16, Layout::TILE, false)),
+          x_decode((dram_prefill_x && !dram_decode_x)
+                       ? alloc_l1(mesh, Shape({1, 1u, 32u, 5120u}), DataType::BFLOAT16, Layout::TILE, false)
+                       : x_tilized),
           slot_ids(alloc_l1(mesh, Shape({1, 1, 1, kSlotIdsBytes / 2u}), DataType::UINT16, Layout::ROW_MAJOR, false)),
-          weights_tiled(alloc_l1(mesh, Shape({1, kMaxCompactSlots, 32u, 32u}), DataType::FLOAT32, Layout::TILE, false)),
+          weights_tiled(dram_weights
+                            ? alloc_dram_replicated(mesh, Shape({1, kMaxCompactSlots, 32u, 32u}), DataType::FLOAT32, Layout::TILE)
+                            : alloc_l1(mesh, Shape({1, kMaxCompactSlots, 32u, 32u}), DataType::FLOAT32, Layout::TILE, false)),
           gate_partials(alloc_l1(mesh, Shape({1, k_up, kBatchSlots * 32u, 1152u}), DataType::FLOAT32, Layout::TILE, true)),
           up_partials(alloc_l1(mesh, Shape({1, k_up, kBatchSlots * 32u, 1152u}), DataType::FLOAT32, Layout::TILE, true)),
           z_rot_bf16(alloc_l1(mesh, Shape({1, 1, kBatchSlots * 32u, 1152u}), DataType::BFLOAT16, Layout::TILE, true)),
@@ -338,10 +365,26 @@ struct CoreWorkspace1 {
         }
     }
 
+    const MemoryConfig& finish_untilize_mem_cfg() const {
+        return weights_dram ? ttnn::DRAM_MEMORY_CONFIG : ttnn::L1_MEMORY_CONFIG;
+    }
+
     size_t l1_bytes_per_card() const {
-        return x_tilized.buffer()->size() + slot_ids.buffer()->size() + weights_tiled.buffer()->size() +
-               gate_partials.buffer()->size() + up_partials.buffer()->size() + z_rot_bf16.buffer()->size() +
-               combined_f32.buffer()->size();
+        size_t bytes = slot_ids.buffer()->size() +
+                       gate_partials.buffer()->size() + up_partials.buffer()->size() +
+                       z_rot_bf16.buffer()->size() + combined_f32.buffer()->size();
+        if (!x_tilized_dram) {
+            bytes += x_tilized.buffer()->size();
+        } else if (!x_decode_dram) {
+            bytes += x_decode.buffer()->size();
+        }
+        if (!weights_dram) bytes += weights_tiled.buffer()->size();
+        for (const auto& t : finish_decode) {
+            if (t.is_allocated() && t.buffer() != nullptr && t.buffer()->is_l1()) {
+                bytes += t.buffer()->size();
+            }
+        }
+        return bytes;
     }
 };
 
@@ -688,8 +731,13 @@ struct P150Dsv41Engine::Impl {
     uint32_t total_cores = 0;
     uint32_t k_splits_up = 12;
     uint32_t k_splits_down = 2;
+    uint32_t requested_hot_shards = kP150DefaultHotShards;
+    bool expanded_l1_demotion = false;
+    bool decode_l1_demotion = false;
+    bool weights_l1_demotion = false;
 
     std::unique_ptr<CoreWorkspace1> ws1;
+    bool x_rm_dram = false;                       // expanded >13 demotes this 5.0 MiB compact prefill arena to GDDR6
     std::optional<ttnn::Tensor> x_rm_l1;           // L1 replicated [1, 1, 512, 5120] BFLOAT16 TILE (5.0 MiB/card)
     std::optional<ttnn::Tensor> slot_meta_l1;      // L1 replicated [1, 1, 288, 32] UINT32 ROW_MAJOR (36 KiB/card)
     std::optional<ttnn::Tensor> l1_slot_lut;       // L1 replicated [1, 40, 256] UINT16 ROW_MAJOR (20 KiB/card O(1) hot LUT!)
@@ -750,9 +798,18 @@ struct P150Dsv41Engine::Impl {
     uint32_t dirty_mt0 = 0;
     bool programs_prewarmed = false;
 
-    Impl(const std::string& root, const std::string& kdir, bool trace, const std::string& ov_path)
+    Impl(const std::string& root, const std::string& kdir, bool trace, const std::string& ov_path,
+         uint32_t hot_l1_shards)
         : packed_root(root), kernels_dir(kdir), enable_trace(trace)
     {
+        requested_hot_shards = std::clamp<uint32_t>(hot_l1_shards, 1u, kP150MaxHotL1Shards);
+        expanded_l1_demotion = p150_requires_prefill_demotion(requested_hot_shards);
+        decode_l1_demotion   = p150_requires_decode_demotion(requested_hot_shards);
+        weights_l1_demotion  = p150_requires_weights_demotion(requested_hot_shards);
+        if (!p150_hot_shards_fit(requested_hot_shards)) {
+            throw std::runtime_error("P150 hot-shard request exceeds exact per-Tensix L1 byte budget");
+        }
+
         if (!ov_path.empty()) {
             rarebal_overlay_mmap = std::make_unique<SafetensorsMmap>(ov_path);
             std::printf("[P150_DSV41] Mmapped RAREBAL-LDLQ hot-expert overlay: %s (%zu tensors)\n",
@@ -765,7 +822,7 @@ struct P150Dsv41Engine::Impl {
         const auto dispatch = ttnn::device::create_cluster_aware_dispatch_config();
         trace_region_bytes = enable_trace ? (1536u << 20) : 0u;
         mesh = ttnn::distributed::open_mesh_device(
-            ttnn::MeshShape{1, 2}, 32768, trace_region_bytes, 1, dispatch, std::nullopt, {0, 1});
+            ttnn::MeshShape{1, 2}, kP150L1SmallSizeBytes, trace_region_bytes, 1, dispatch, std::nullopt, {0, 1});
 
         grid = mesh->compute_with_storage_grid_size();
         total_cores = static_cast<uint32_t>(grid.x * grid.y);
@@ -775,25 +832,33 @@ struct P150Dsv41Engine::Impl {
         k_splits_up   = (total_cores >= 90u) ? 10u : 8u;
         k_splits_down = (total_cores >= 120u) ? 3u : 2u;
 
-        ws1 = std::make_unique<CoreWorkspace1>(*mesh, k_splits_up, k_splits_down);
-        x_rm_l1 = alloc_l1(*mesh, Shape({1, 1, 512u, 5120u}), DataType::BFLOAT16, Layout::TILE, false);
-        slot_meta_l1 = alloc_l1(*mesh, Shape({1, 1, 288u, 32u}), DataType::UINT32, Layout::ROW_MAJOR, false);
+        ws1 = std::make_unique<CoreWorkspace1>(*mesh, k_splits_up, k_splits_down,
+                                                 expanded_l1_demotion, decode_l1_demotion, weights_l1_demotion);
+        x_rm_dram = expanded_l1_demotion;
+        x_rm_l1 = x_rm_dram
+            ? alloc_dram_replicated(*mesh, Shape({1, 1, 512u, 5120u}), DataType::BFLOAT16, Layout::TILE)
+            : alloc_l1(*mesh, Shape({1, 1, 512u, 5120u}), DataType::BFLOAT16, Layout::TILE, false);
+        slot_meta_l1 = expanded_l1_demotion
+            ? alloc_dram_replicated(*mesh, Shape({1, 1, 288u, 32u}), DataType::UINT32, Layout::ROW_MAJOR)
+            : alloc_l1(*mesh, Shape({1, 1, 288u, 32u}), DataType::UINT32, Layout::ROW_MAJOR, false);
         l1_slot_lut = alloc_l1(*mesh, Shape({1, DSV41_P150_NUM_LAYERS, 256u}), DataType::UINT16, Layout::ROW_MAJOR, false);
-        dummy_hot_l1 = alloc_l1(*mesh, Shape({1, 1u, 1088u}), DataType::UINT32, Layout::ROW_MAJOR, true);
+        dummy_hot_l1 = expanded_l1_demotion
+            ? alloc_dram_sharded0(*mesh, Shape({1, 1u, 1088u}), DataType::UINT32, Layout::ROW_MAJOR)
+            : alloc_l1(*mesh, Shape({1, 1u, 1088u}), DataType::UINT32, Layout::ROW_MAJOR, true);
 
-        // Dumitrescu MR vs MP block law: 512-row encoder y_accum_f32 + x_rm_l1 live in fast on-chip L1 MR,
-        // while 1-shot 128-row tail & streamed finish_tensors live in GDDR6 MP, preserving ALL 11 hot shards/card (22 TP2 shards)!
+        // Dumitrescu MR vs MP block law: Tier 1 (14..17) demotes M>32 prefill arenas + scalar combine weights
+        // while keeping x_decode [1,1,32,5120] BF16 + finish_decode 100% in L1 MR under FABRIC_1D!
         arena128 = std::make_unique<CompactPrefillArena>(*mesh, 128u, true);
-        arena512 = std::make_unique<CompactPrefillArena>(*mesh, 512u, false);
+        arena512 = std::make_unique<CompactPrefillArena>(*mesh, 512u, expanded_l1_demotion);
 
-        // Allocate maximum safe static L1 Hot-Expert Shard Arena at top of L1 while guaranteeing >= 260 KiB/core bottom CB headroom!
-        const uint32_t guard_pages = (total_cores * 260u * 1024u) / 4352u;
-        for (uint32_t k_try : {11u, 10u, 8u}) {
+        // Allocate maximum safe static L1 Hot-Expert Shard Arena at top of L1 while guaranteeing >= 256 KiB/core bottom CB headroom!
+        const uint32_t guard_pages = (total_cores * 256u * 1024u) / 4096u;
+        for (uint32_t k_try = requested_hot_shards; k_try >= 8u; --k_try) {
             try {
                 auto hg = alloc_l1(*mesh, Shape({1, k_try * 360u, 1088u}), DataType::UINT32, Layout::ROW_MAJOR, true);
                 auto hu = alloc_l1(*mesh, Shape({1, k_try * 360u, 1088u}), DataType::UINT32, Layout::ROW_MAJOR, true);
                 auto hd = alloc_l1(*mesh, Shape({1, k_try * 360u, 1088u}), DataType::UINT32, Layout::ROW_MAJOR, true);
-                auto cb_guard = alloc_l1(*mesh, Shape({1, guard_pages, 1088u}), DataType::UINT32, Layout::ROW_MAJOR, true);
+                auto cb_guard = alloc_l1(*mesh, Shape({1, guard_pages, 1024u}), DataType::UINT32, Layout::ROW_MAJOR, true);
                 (void)cb_guard;
                 hot_gate_l1 = std::move(hg);
                 hot_up_l1   = std::move(hu);
@@ -824,7 +889,7 @@ struct P150Dsv41Engine::Impl {
             ws1->finish_decode[0] = ttnn::typecast(ws1->combined_f32, DataType::BFLOAT16, ttnn::L1_MEMORY_CONFIG);
             ws1->finish_decode[1] = ttnn::all_reduce(
                 ws1->finish_decode[0], 1, std::nullopt, ttnn::L1_MEMORY_CONFIG, 1, tt::tt_fabric::Topology::Linear);
-            ws1->finish_decode[2] = ttnn::untilize(ws1->finish_decode[1], ttnn::L1_MEMORY_CONFIG);
+            ws1->finish_decode[2] = ttnn::untilize(ws1->finish_decode[1], ws1->finish_untilize_mem_cfg());
         };
         auto run_red_arena = [&](CompactPrefillArena& ar) {
             auto keep = ar.finish_tensors;
@@ -839,10 +904,12 @@ struct P150Dsv41Engine::Impl {
         run_red_arena(*arena512);
         cq.finish();
 
-        std::printf("[P150_DSV41] Opened 1x2 Blackhole P150A Mesh (grid=%ux%u=%u cores, FABRIC_1D, hot_shards=%u/card [%u TP2 shards = %.2f MiB L1], total_L1/card=%.2f MiB, trace=%d)\n",
+        p150_l1_geometry_report();
+        std::printf("[P150_DSV41] Opened 1x2 Blackhole P150A Mesh (grid=%ux%u=%u cores, FABRIC_1D, hot_shards=%u/card [%u TP2 shards = %.2f MiB L1], requested=%u, demotion=%d, total_L1/card=%.2f MiB, trace=%d)\n",
                     unsigned(grid.x), unsigned(grid.y), total_cores,
                     num_hot_shards, num_hot_shards * 2u,
                     double(pinned_hot_l1_bytes * 2ULL) / (1024.0 * 1024.0),
+                    unsigned(requested_hot_shards), int(expanded_l1_demotion),
                     double(workspace_l1_bytes_per_card()) / (1024.0 * 1024.0),
                     int(enable_trace));
         std::fflush(stdout);
@@ -877,14 +944,16 @@ struct P150Dsv41Engine::Impl {
     }
 
     size_t workspace_l1_bytes_per_card() const {
-        return ws1->l1_bytes_per_card() +
-               x_rm_l1->buffer()->size() +
-               slot_meta_l1->buffer()->size() +
-               l1_slot_lut->buffer()->size() +
-               dummy_hot_l1->buffer()->size() +
-               arena128->l1_bytes_per_card() +
-               arena512->l1_bytes_per_card() +
-               pinned_hot_l1_bytes;
+        size_t bytes = ws1->l1_bytes_per_card() +
+                       l1_slot_lut->buffer()->size() +
+                       arena128->l1_bytes_per_card() +
+                       arena512->l1_bytes_per_card() +
+                       pinned_hot_l1_bytes;
+        if (!expanded_l1_demotion) {
+            bytes += slot_meta_l1->buffer()->size() + dummy_hot_l1->buffer()->size();
+        }
+        if (!x_rm_dram) bytes += x_rm_l1->buffer()->size();
+        return bytes;
     }
 
     CoreCoord core_at(uint32_t idx) const {
@@ -1060,7 +1129,7 @@ struct P150Dsv41Engine::Impl {
             ws1->finish_decode[0] = ttnn::typecast(ws1->combined_f32, DataType::BFLOAT16, ttnn::L1_MEMORY_CONFIG);
             ws1->finish_decode[1] = ttnn::all_reduce(
                 ws1->finish_decode[0], 1, std::nullopt, ttnn::L1_MEMORY_CONFIG, 1, tt::tt_fabric::Topology::Linear);
-            ws1->finish_decode[2] = ttnn::untilize(ws1->finish_decode[1], ttnn::L1_MEMORY_CONFIG);
+            ws1->finish_decode[2] = ttnn::untilize(ws1->finish_decode[1], ws1->finish_untilize_mem_cfg());
             mesh->end_mesh_trace(cq, tid);
             reduce_traces[0].id = tid;
             reduce_traces[0].warmed = true;
@@ -1113,11 +1182,14 @@ struct P150Dsv41Engine::Impl {
         cq.enqueue_write_shard_to_sub_grid(ws1->slot_ids.mesh_buffer(), host_slot_ids.ptr, all_devs, false, BufferRegion(0, kSlotIdsBytes));
         cq.enqueue_write_shard_to_sub_grid(slot_meta_l1->mesh_buffer(), host_slot_meta.ptr, all_devs, false, BufferRegion(0, kBatchSlots * 128u));
         cq.enqueue_write_shard_to_sub_grid(ws1->weights_tiled.mesh_buffer(), host_weights.ptr, all_devs, false, BufferRegion(0, kBatchSlots * 4096u));
-        cq.enqueue_write_shard_to_sub_grid(ws1->x_tilized.mesh_buffer(), host_x_tilized.ptr, all_devs, false, BufferRegion(0, 160u * 2048u));
+        cq.enqueue_write_shard_to_sub_grid(ws1->x_decode.mesh_buffer(), host_x_tilized.ptr, all_devs, false, BufferRegion(0, 160u * 2048u));
+        if (ws1->x_decode.buffer()->address() != ws1->x_tilized.buffer()->address() || ws1->x_tilized_dram != ws1->x_decode_dram) {
+            cq.enqueue_write_shard_to_sub_grid(ws1->x_tilized.mesh_buffer(), host_x_tilized.ptr, all_devs, false, BufferRegion(0, 160u * 2048u));
+        }
 
         // Prewarm multi-slot (bcnt = 4, 8, 12, 16) decode + compact kernels before any trace capture!
         for (uint32_t bcnt : {4u, 8u, 12u, kBatchSlots}) {
-            enqueue_hlut2_projection(bank, ws1->x_tilized, bank.gate_pages, ws1->up_partials, 0u, bcnt, 0u, 3u);
+            enqueue_hlut2_projection(bank, ws1->x_decode, bank.gate_pages, ws1->up_partials, 0u, bcnt, 0u, 3u);
             enqueue_swiglu_wht128(bank, bcnt);
             enqueue_hlut2_projection(bank, ws1->z_rot_bf16, bank.down_pages, ws1->down_partials, 0u, bcnt, 36u, 2u);
             enqueue_ksplit_combine_decode(0u, bcnt);
@@ -1848,10 +1920,11 @@ struct P150Dsv41Engine::Impl {
         std::vector<TailExpertDesc> tail_descs;
         uint32_t total_tail_pairs = 0u;
         uint32_t p150_count = static_cast<uint32_t>(active_experts.size());
-        // Wave 6: Run all M <= 32 decode & M = 6 DSpark verify experts directly on 2x P150A via traced {4,8,12,16,20,24,32} buckets
-        // (zero CPU DDR4 AVX2 tail peeling stall!).
-        uint32_t target_cap = 0u;
-        if (target_cap > 0u) {
+        // Wave 7A: M=2..8 DSpark verify (M=6 chain & M=8 tree) keeps <= 32 experts inside P150A MeshTrace;
+        // only non-hot overflow (p150_count > 32) is peeled asynchronously to the singleton CpuTailPool so the
+        // 28-worker DDR4 peel overlaps P150A rather than stalls it. M=1 and M>8 stay 100% on-chip.
+        const uint32_t target_cap = (chunk_rows > 1u && chunk_rows <= 8u) ? 32u : 0u;
+        if (target_cap > 0u && p150_count > target_cap) {
             uint32_t need_peel = p150_count - target_cap;
             std::array<bool, DSV41_P150_NUM_EXPERTS> peeled{};
             tail_descs.reserve(need_peel);
@@ -1961,7 +2034,7 @@ struct P150Dsv41Engine::Impl {
         const size_t out_bytes = size_t(chunk_rows) * DSV41_P150_H * sizeof(uint16_t);
         auto& cq = mesh->mesh_command_queue();
         const distributed::MeshCoordinateRange all_devs(mesh->shape());
-        cq.enqueue_write_shard_to_sub_grid(ws1->x_tilized.mesh_buffer(), host_x_tilized.ptr, all_devs, false, BufferRegion(0, 160u * 2048u));
+        cq.enqueue_write_shard_to_sub_grid(ws1->x_decode.mesh_buffer(), host_x_tilized.ptr, all_devs, false, BufferRegion(0, 160u * 2048u));
         cq.enqueue_write_shard_to_sub_grid(ws1->slot_ids.mesh_buffer(), host_slot_ids.ptr, all_devs, false, BufferRegion(0, kSlotIdsBytes));
         cq.enqueue_write_shard_to_sub_grid(ws1->weights_tiled.mesh_buffer(), host_weights.ptr, all_devs, false, BufferRegion(0, weights_bytes));
 
@@ -1973,7 +2046,7 @@ struct P150Dsv41Engine::Impl {
             [&]() {
                 for (uint32_t s = 0; s < scheduled_slots; s += kBatchSlots) {
                     const uint32_t bcnt = std::min<uint32_t>(kBatchSlots, scheduled_slots - s);
-                    enqueue_hlut2_projection(bank, ws1->x_tilized, bank.gate_pages, ws1->up_partials, s, bcnt, 0u, 3u);
+                    enqueue_hlut2_projection(bank, ws1->x_decode, bank.gate_pages, ws1->up_partials, s, bcnt, 0u, 3u);
                     enqueue_swiglu_wht128(bank, bcnt);
                     enqueue_hlut2_projection(bank, ws1->z_rot_bf16, bank.down_pages, ws1->down_partials, s, bcnt, 36u, 2u);
                     enqueue_ksplit_combine_decode(s, bcnt);
@@ -1986,7 +2059,7 @@ struct P150Dsv41Engine::Impl {
                 ws1->finish_decode[0] = ttnn::typecast(ws1->combined_f32, DataType::BFLOAT16, ttnn::L1_MEMORY_CONFIG);
                 ws1->finish_decode[1] = ttnn::all_reduce(
                     ws1->finish_decode[0], 1, std::nullopt, ttnn::L1_MEMORY_CONFIG, 1, tt::tt_fabric::Topology::Linear);
-                ws1->finish_decode[2] = ttnn::untilize(ws1->finish_decode[1], ttnn::L1_MEMORY_CONFIG);
+                ws1->finish_decode[2] = ttnn::untilize(ws1->finish_decode[1], ws1->finish_untilize_mem_cfg());
             });
 
         const auto& out_rm = ws1->finish_decode[2];
@@ -2217,7 +2290,9 @@ struct P150Dsv41Engine::Impl {
             std::memset(w_f32 + size_t(active_slots) * 1024ULL, 0, size_t(scheduled_slots - active_slots) * 4096ULL);
         }
 
-        dirty_mt0 = 32u;  // gather_tilize overwrites ws1->x_tilized
+        if (!ws1->x_tilized_dram || ws1->x_decode_dram) {
+            dirty_mt0 = 32u;  // gather_tilize overwrites ws1->x_tilized only when x_decode aliases it
+        }
 
         auto& cq = mesh->mesh_command_queue();
         const distributed::MeshCoordinateRange all_devs(mesh->shape());
@@ -2275,8 +2350,9 @@ P150Dsv41Engine::P150Dsv41Engine(
     const std::string& packed_p150_root,
     const std::string& kernels_dir,
     bool enable_trace,
-    const std::string& rarebal_overlay_path)
-    : impl_(std::make_unique<Impl>(packed_p150_root, kernels_dir, enable_trace, rarebal_overlay_path))
+    const std::string& rarebal_overlay_path,
+    uint32_t hot_l1_shards)
+    : impl_(std::make_unique<Impl>(packed_p150_root, kernels_dir, enable_trace, rarebal_overlay_path, hot_l1_shards))
 {}
 
 P150Dsv41Engine::~P150Dsv41Engine() = default;
@@ -2419,7 +2495,7 @@ bool P150Dsv41Engine::selfcheck_layer(uint32_t layer) {
     SafetensorsMmap st0(bank.tp0_path);
     SafetensorsMmap st1(bank.tp1_path);
 
-    const uint32_t test_batches[] = {1u, 6u, 64u, 512u, 1024u};
+    const uint32_t test_batches[] = {1u, 6u, 8u, 64u, 512u, 1024u};
     bool all_ok = true;
 
     for (uint32_t M : test_batches) {

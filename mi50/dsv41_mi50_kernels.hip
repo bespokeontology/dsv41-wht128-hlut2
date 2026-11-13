@@ -10,6 +10,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace dsv41 {
@@ -2097,7 +2098,9 @@ void k_split_qkv_norm_rope_quant(
     bool use_comp_yarn,
     uint16_t*       __restrict__ out_qr_bf16,  // [M, 1280]
     uint16_t*       __restrict__ out_kv_bf16,  // [M, 512]
-    int pos_base, float eps)
+    int pos_base, float eps,
+    uint64_t tree_anc_mask64,
+    uint32_t tree_depth_nibbles)
 {
     __shared__ float    s_wave[4];
     __shared__ uint16_t s_kv[512];
@@ -2136,9 +2139,11 @@ void k_split_qkv_norm_rope_quant(
         s_kv[256 + tid] = d_f32_to_bf16_rne(v1 * rstd * d_bf16_to_f32(kv_norm_bf16[256 + tid]));
         __syncthreads();
 
-        // 2. Exact FP64-angle Tail-64 RoPE at pos = pos_base + m
+        // 2. Exact FP64-angle Tail-64 RoPE at pos = pos_base + (tree ? depth[m] : m)
         if (tid < 32) {
-            const int pos = pos_base + m;
+            const int pos = tree_anc_mask64
+                ? (pos_base + int((tree_depth_nibbles >> (4 * m)) & 0xFu))
+                : (pos_base + m);
             float s, c;
             d_rope_sincos_f64(pos, tid, use_comp_yarn, s, c);
             const float x0 = d_bf16_to_f32(s_kv[448 + 2 * tid + 0]);
@@ -2169,12 +2174,20 @@ __global__ __launch_bounds__(32)
 void k_rope_tail64_bf16(
     uint16_t* __restrict__ x_bf16,
     bool use_comp_yarn,
-    int H, int D, int pos_base, int pos_stride, bool inverse)
+    int H, int D, int pos_base, int pos_stride, bool inverse,
+    uint64_t tree_anc_mask64,
+    uint32_t tree_depth_nibbles)
 {
     const int pair = int(threadIdx.x);  // 0..31
     const int h = int(blockIdx.x);      // 0..H-1
     const int m = int(blockIdx.y);      // 0..M-1
-    const int pos = pos_base + m * pos_stride;
+    int pos;
+    if (tree_anc_mask64) {
+        const int raw_pos = pos_base + int((tree_depth_nibbles >> (4 * m)) & 0xFu);
+        pos = (pos_stride == 2) ? (raw_pos & ~1) : raw_pos;
+    } else {
+        pos = pos_base + m * pos_stride;
+    }
 
     float s_raw, c;
     d_rope_sincos_f64(pos, pair, use_comp_yarn, s_raw, c);
@@ -2287,6 +2300,50 @@ void k_compressor_r2_pool(
     kv_state[512 + d] = k1;
     score_state[d] = s0;
     score_state[512 + d] = s1;
+}
+
+__global__ __launch_bounds__(256)
+void k_compressor_r2_tree_pool(
+    const float* __restrict__ kv_f32,
+    const float* __restrict__ score_f32,
+    const float* __restrict__ kv_state,
+    const float* __restrict__ score_state,
+    uint16_t*    __restrict__ out_pool_bf16,
+    int start_pos, int M,
+    uint32_t tree_depth_nibbles,
+    uint32_t tree_parent_nibbles)
+{
+    const int d = int(blockIdx.x) * 256 + int(threadIdx.x);
+    if (d >= 512) return;
+
+    const float init_k0 = kv_state[d];
+    const float init_s0 = score_state[d];
+
+    for (int m = 0; m < M; ++m) {
+        const int depth_m = int((tree_depth_nibbles >> (4 * m)) & 0xFu);
+        const int pos_m = start_pos + depth_m;
+        if ((pos_m & 1) == 1) {
+            float k0, s0;
+            if (m == 0) {
+                k0 = init_k0;
+                s0 = init_s0;
+            } else {
+                const int p = int((tree_parent_nibbles >> (4 * m)) & 0xFu);
+                k0 = kv_f32[size_t(p) * 512u + size_t(d)];
+                s0 = score_f32[size_t(p) * 512u + size_t(d)];
+            }
+            const float k1 = kv_f32[size_t(m) * 512u + size_t(d)];
+            const float s1 = score_f32[size_t(m) * 512u + size_t(d)];
+            const float smax = fmaxf(s0, s1);
+            const float e0 = __expf(s0 - smax);
+            const float e1 = __expf(s1 - smax);
+            const float inv = 1.0f / (e0 + e1);
+            const float pooled = k0 * (e0 * inv) + k1 * (e1 * inv);
+            out_pool_bf16[size_t(m) * 512u + size_t(d)] = d_f32_to_bf16_rne(pooled);
+        } else {
+            out_pool_bf16[size_t(m) * 512u + size_t(d)] = 0u;
+        }
+    }
 }
 
 // Exact compressed KV quantization: block_size=16, scale_dtype=FP8_E4M3 (kernel.py:160-163)
@@ -2603,7 +2660,10 @@ void k_indexer_candidates_and_topk(
     int cand_block_stride,
     int32_t* __restrict__ out_comp_idxs,
     int T_comp, int start_pos, int ratio, int mode, int K_out,
-    float* __restrict__ block_scores_scratch) // [M, ceil(T_comp/8)] when mode==1
+    float* __restrict__ block_scores_scratch, // [M, ceil(T_comp/8)] when mode==1
+    uint64_t tree_anc_mask64,
+    uint32_t tree_depth_nibbles,
+    int q_row_offset)
 {
     __shared__ uint32_t s_hist[256];
     __shared__ uint32_t s_scalar[4];
@@ -2612,13 +2672,51 @@ void k_indexer_candidates_and_topk(
     const int m = int(blockIdx.x);
     const int tid = int(threadIdx.x);
     float* row = score_f32 + size_t(m) * size_t(T_comp);
-    const int compress_len = (start_pos + m + 1) / ratio;
     const float neg_inf = -INFINITY;
     const float pos_inf = INFINITY;
 
-    // 1. Causal mask: t >= compress_len -> -inf
-    for (int t = tid; t < T_comp; t += 256) {
-        if (t >= compress_len) row[t] = neg_inf;
+    int scan_len = 0;
+    int valid_cnt = 0;
+    int last_blk0 = -1;
+    int last_blk1 = -1;
+
+    if (tree_anc_mask64 != 0ULL) {
+        const int gm = q_row_offset + m;
+        const uint32_t anc_row = uint32_t((tree_anc_mask64 >> (8 * gm)) & 0xFFULL);
+        const int base_comp = start_pos / ratio;
+        const int tree_M = max(0, T_comp - base_comp);
+        int valid_tree = 0;
+        for (int j = 0; j < tree_M; ++j) {
+            bool ok = (((anc_row >> j) & 1u) != 0u);
+            if (ok && ratio == 2) {
+                ok = (((start_pos + int((tree_depth_nibbles >> (4 * j)) & 0xFu)) & 1) == 1);
+            }
+            if (ok) ++valid_tree;
+        }
+        scan_len = T_comp;
+        valid_cnt = base_comp + valid_tree;
+        if (valid_cnt > 0) {
+            last_blk0 = (base_comp > 0 && valid_tree == 0) ? ((base_comp - 1) >> 3) : (base_comp >> 3);
+            last_blk1 = (valid_tree > 0) ? ((base_comp + gm) >> 3) : last_blk0;
+        }
+        for (int t = base_comp + tid; t < T_comp; t += 256) {
+            const int j = t - base_comp;
+            bool ok = (j >= 0 && j < tree_M) && (((anc_row >> j) & 1u) != 0u);
+            if (ok && ratio == 2) {
+                ok = (((start_pos + int((tree_depth_nibbles >> (4 * j)) & 0xFu)) & 1) == 1);
+            }
+            if (!ok) row[t] = neg_inf;
+        }
+    } else {
+        const int compress_len = (start_pos + m + 1) / ratio;
+        scan_len = compress_len;
+        valid_cnt = compress_len;
+        last_blk0 = (compress_len > 0) ? ((compress_len - 1) >> 3) : -1;
+        last_blk1 = last_blk0;
+        // 1. Causal mask: t >= compress_len -> -inf
+        for (int t = tid; t < T_comp; t += 256) {
+            if (t >= compress_len) row[t] = neg_inf;
+        }
     }
     __syncthreads();
 
@@ -2626,10 +2724,9 @@ void k_indexer_candidates_and_topk(
     if (mode == 1) {
         const int num_blocks = (T_comp + 7) >> 3;
         float* bscores = block_scores_scratch + size_t(m) * size_t(num_blocks);
-        const int last_blk = (compress_len > 0) ? ((compress_len - 1) >> 3) : -1;
 
         for (int b = tid; b < num_blocks; b += 256) {
-            if (b == last_blk) {
+            if (last_blk0 >= 0 && b >= last_blk0 && b <= last_blk1) {
                 bscores[b] = pos_inf;
             } else {
                 float mx = neg_inf;
@@ -2688,16 +2785,16 @@ void k_indexer_candidates_and_topk(
         __syncthreads();
     }
 
-    // 3. Top-K (K_out = min(512, T_comp)) over row[0..T_comp-1] + sort indices ascending!
+    // 3. Top-K (K_out = min(512, T_comp)) over row[0..scan_len-1] + sort indices ascending!
     if (K_out <= 0) return;
-    const int valid_k = min(K_out, compress_len);
+    const int valid_k = min(K_out, valid_cnt);
     s_sel[tid] = 0x7FFFFFFF;
     s_sel[256 + tid] = 0x7FFFFFFF;
     __syncthreads();
 
     if (valid_k > 0) {
         const uint32_t neg_inf_u = d_float_to_ordered_u32(neg_inf);
-        const uint32_t kth_u = d_radix_kth_largest(row, compress_len, valid_k, s_hist, s_scalar);
+        const uint32_t kth_u = d_radix_kth_largest(row, scan_len, valid_k, s_hist, s_scalar);
 
         if (tid == 0) {
             s_scalar[0] = 0u;  // write cursor
@@ -2705,7 +2802,7 @@ void k_indexer_candidates_and_topk(
         }
         __syncthreads();
 
-        for (int t = tid; t < compress_len; t += 256) {
+        for (int t = tid; t < scan_len; t += 256) {
             const uint32_t u = d_float_to_ordered_u32(row[t]);
             if (u > kth_u && u > neg_inf_u) {
                 const uint32_t pos = atomicAdd(&s_scalar[0], 1u);
@@ -2721,7 +2818,7 @@ void k_indexer_candidates_and_topk(
         __syncthreads();
 
         if (s_scalar[2] > 0u) {
-            for (int t = tid; t < compress_len; t += 256) {
+            for (int t = tid; t < scan_len; t += 256) {
                 const uint32_t u = d_float_to_ordered_u32(row[t]);
                 if (u == kth_u && u > neg_inf_u) {
                     const uint32_t rem = atomicAdd(&s_scalar[2], 0xFFFFFFFFu);
@@ -2766,7 +2863,7 @@ void k_indexer_candidates_and_topk(
     int32_t* dst = out_comp_idxs + size_t(m) * size_t(K_out);
     for (int k = tid; k < K_out; k += 256) {
         const int32_t v = s_sel[k];
-        dst[k] = (v < compress_len) ? v : -1;
+        dst[k] = (v < scan_len) ? v : -1;
     }
 }
 
@@ -2841,7 +2938,7 @@ __device__ __forceinline__ void d_sparse_attn_step_kv_pak(
     }
 }
 
-// Zero-Staging In-Place Ring Sparse Attention (M <= 16 / DSpark):
+// Zero-Staging In-Place Ring Sparse Attention (M <= 16 / DSpark / Causal Tree):
 // Conflict-free 8 KiB packed-BF16 LDS + 1-expf lazy online-softmax -> 3 CTAs/CU (12 waves/CU), ScratchSize == 0!
 __global__ __launch_bounds__(256, 3)
 void k_sparse_attn(
@@ -2857,7 +2954,9 @@ void k_sparse_attn(
     const int32_t*  __restrict__ comp_idxs,
     int n_comp,
     uint16_t*       __restrict__ out_o_bf16,
-    int M, int h_cnt)
+    int M, int h_cnt,
+    uint64_t tree_anc_mask64,
+    uint32_t tree_depth_nibbles)
 {
     __shared__ uint16_t s_lut[256];
     __shared__ uint32_t s_kv_pak[8][256];
@@ -2885,10 +2984,17 @@ void k_sparse_attn(
     float l_sum = 0.0f;
 
     int win_first = 0, hist_valid = 0, n_win_m = 0;
+    uint32_t anc_row = 0u;
     if (dspark_bidir) {
         win_first = max(swa_floor_pos, max(0, start_pos - 128));
         hist_valid = max(0, start_pos - win_first);
         n_win_m = hist_valid + M;
+    } else if (tree_anc_mask64 != 0ULL) {
+        const int q_pos = start_pos + int((tree_depth_nibbles >> (4 * m)) & 0xFu);
+        win_first = max(swa_floor_pos, max(0, q_pos - 127));
+        hist_valid = max(0, start_pos - win_first);
+        n_win_m = hist_valid + M;
+        anc_row = uint32_t((tree_anc_mask64 >> (8 * m)) & 0xFFULL);
     } else {
         const int q_pos = start_pos + m;
         win_first = max(swa_floor_pos, max(0, q_pos - 127));
@@ -2898,11 +3004,16 @@ void k_sparse_attn(
     for (int base = 0; base < n_win_m; base += 8) {
         const int slot = h_local;
         const int kv_ord = base + slot;
-        const int valid = (kv_ord < n_win_m) ? 1 : -1;
+        int valid = (kv_ord < n_win_m) ? 1 : -1;
+        if (valid >= 0 && !dspark_bidir && tree_anc_mask64 != 0ULL && kv_ord >= hist_valid) {
+            const int j = kv_ord - hist_valid;
+            const int j_pos = start_pos + int((tree_depth_nibbles >> (4 * j)) & 0xFu);
+            if (((anc_row >> j) & 1u) == 0u || j_pos < win_first) valid = -1;
+        }
         if (d_lane == 0) s_valid[slot] = valid;
         if (valid >= 0) {
             const uint16_t* src = nullptr;
-            if (dspark_bidir) {
+            if (dspark_bidir || tree_anc_mask64 != 0ULL) {
                 src = (kv_ord < hist_valid)
                     ? (win_kv_ring + size_t((win_first + kv_ord) & 127) * 512u + d_lane * 16)
                     : (cur_kv_bf16 + size_t(kv_ord - hist_valid) * 512u + d_lane * 16);
@@ -3142,13 +3253,16 @@ void k_sparse_attn_splitk(
     const int32_t*  __restrict__ comp_idxs,
     int n_comp,
     float*          __restrict__ split_scratch, // [M, 8, h_cnt, 514]
-    int h_cnt)
+    int h_cnt,
+    uint64_t tree_anc_mask64,
+    uint32_t tree_depth_nibbles)
 {
     __shared__ uint16_t s_lut[256];
     __shared__ uint32_t s_kv_pak[8][256];
     __shared__ int32_t  s_valid[8];
 
     const int m       = int(blockIdx.x);
+    const int M_rows  = int(gridDim.x);
     const int h_base  = int(blockIdx.y) * 8;
     const int split   = int(blockIdx.z); // 0..7
     const int tid     = int(threadIdx.x);
@@ -3167,9 +3281,13 @@ void k_sparse_attn_splitk(
         q_reg[j] = (h < h_cnt) ? d_bf16_to_f32(q_bf16[(size_t(m) * size_t(h_cnt) + size_t(h)) * 512u + d_lane * 16 + j]) : 0.0f;
     }
 
-    const int q_pos = start_pos + m;
+    const int q_pos = tree_anc_mask64
+        ? (start_pos + int((tree_depth_nibbles >> (4 * m)) & 0xFu))
+        : (start_pos + m);
     const int win_first = max(swa_floor_pos, max(0, q_pos - 127));
-    const int n_win_m = max(0, q_pos - win_first + 1);
+    const int hist_valid = max(0, start_pos - win_first);
+    const int n_win_m = tree_anc_mask64 ? (hist_valid + M_rows) : max(0, q_pos - win_first + 1);
+    const uint32_t anc_row = tree_anc_mask64 ? uint32_t((tree_anc_mask64 >> (8 * m)) & 0xFFULL) : 0u;
     const int win_groups = (n_win_m + 7) >> 3;
     const int comp_groups = (n_comp > 0 && comp_fp4 && comp_e4m3 && comp_idxs) ? ((n_comp + 7) >> 3) : 0;
     const int total_groups = win_groups + comp_groups;
@@ -3185,13 +3303,25 @@ void k_sparse_attn_splitk(
         const int slot = h_local;
         if (g_idx < win_groups) {
             const int kv_ord = g_idx * 8 + slot;
-            const int valid = (kv_ord < n_win_m) ? 1 : -1;
+            int valid = (kv_ord < n_win_m) ? 1 : -1;
+            if (valid >= 0 && tree_anc_mask64 != 0ULL && kv_ord >= hist_valid) {
+                const int j = kv_ord - hist_valid;
+                const int j_pos = start_pos + int((tree_depth_nibbles >> (4 * j)) & 0xFu);
+                if (((anc_row >> j) & 1u) == 0u || j_pos < win_first) valid = -1;
+            }
             if (d_lane == 0) s_valid[slot] = valid;
             if (valid >= 0) {
-                const int p = win_first + kv_ord;
-                const uint16_t* src = (p < start_pos)
-                    ? (win_kv_ring + size_t(p & 127) * 512u + d_lane * 16)
-                    : (cur_kv_bf16 + size_t(p - start_pos) * 512u + d_lane * 16);
+                const uint16_t* src = nullptr;
+                if (tree_anc_mask64 != 0ULL) {
+                    src = (kv_ord < hist_valid)
+                        ? (win_kv_ring + size_t((win_first + kv_ord) & 127) * 512u + d_lane * 16)
+                        : (cur_kv_bf16 + size_t(kv_ord - hist_valid) * 512u + d_lane * 16);
+                } else {
+                    const int p = win_first + kv_ord;
+                    src = (p < start_pos)
+                        ? (win_kv_ring + size_t(p & 127) * 512u + d_lane * 16)
+                        : (cur_kv_bf16 + size_t(p - start_pos) * 512u + d_lane * 16);
+                }
                 d_load_win_kv_pak(src, d_lane, s_kv_pak[slot]);
             }
         } else {
@@ -4106,6 +4236,218 @@ void k_hlut2_grouped_down8(
     }
 }
 
+// Expert-bucketed BM=32 WHT128-HLUT2 down_proj (192 threads = 3 wave64, ScratchSize == 0 on gfx906):
+// 48 KiB swizzled uint4 LDS + register-resident pd_reg[8], 32-row tile reuse.
+__global__ __launch_bounds__(192, 1)
+void k_hlut2_grouped_down32(
+    const uint32_t* __restrict__ inter_rot_f16x2,
+    const int32_t*  __restrict__ active_experts,
+    const int32_t*  __restrict__ csr_offsets,
+    const Mi50RoutedPair* __restrict__ sorted_pairs,
+    const uint32_t* __restrict__ down_codes,
+    const uint16_t* __restrict__ down_scales,
+    const float*    __restrict__ down_cent,
+    float*          __restrict__ out_accum_f32)
+{
+    union SharedDown32 {
+        uint4 inter4[32][96]; // 48 KiB LDS
+        float red[6][32][32]; // 24 KiB LDS
+    };
+    __shared__ SharedDown32 sh;
+
+    const int rb = int(blockIdx.x);       // 0..159
+    const int ae_idx = int(blockIdx.y);   // 0..num_active-1
+    const int tid = int(threadIdx.x);     // 0..191
+    const int r = tid & 31;
+    const int g = tid >> 5;               // 0..5
+
+    const int p_begin = csr_offsets[ae_idx];
+    const int p_end = csr_offsets[ae_idx + 1];
+    if (p_begin >= p_end) return;
+
+    const size_t e = size_t(active_experts[ae_idx]);
+    uint32_t d_h0, d_dh;
+    d_make_hlut2_lut_x2(down_cent + e * 2u, d_h0, d_dh);
+
+    const uint32_t* dc = down_codes + e * 245760u + (size_t(rb) * 48u + size_t(g * 8)) * 32u + r;
+    const float sig_d = d_fp16_bits_to_f32(down_scales[e * 30720u + (size_t(rb) * 6u + size_t(g)) * 32u + r]);
+
+    uint32_t pd_reg[8];
+    #pragma unroll
+    for (int w = 0; w < 8; ++w) pd_reg[w] = dc[w * 32];
+
+    const int ld_t_off = (tid >= 96) ? 1 : 0;
+    const int ld_col4  = (tid >= 96) ? (tid - 96) : tid;
+    const int ld_sw4   = d_hlut2_swiz4(ld_col4);
+
+    for (int p0 = p_begin; p0 < p_end; p0 += 32) {
+        const int cnt = min(32, p_end - p0);
+        const int bm  = (cnt <= 4) ? 4 : ((cnt <= 8) ? 8 : ((cnt <= 16) ? 16 : 32));
+
+        for (int tb = 0; tb < bm; tb += 2) {
+            const int t = tb + ld_t_off;
+            uint4 vi = {0u, 0u, 0u, 0u};
+            if (t < cnt) {
+                vi = *reinterpret_cast<const uint4*>(inter_rot_f16x2 + size_t(p0 + t) * 384u + size_t(ld_col4 * 4));
+            }
+            sh.inter4[t][ld_sw4] = vi;
+        }
+        __syncthreads();
+
+        float grp[32] = {0.0f};
+        auto accum_bm = [&](auto bm_tag) __attribute__((always_inline)) {
+            constexpr int BM = decltype(bm_tag)::value;
+            #pragma unroll 1
+            for (int w = 0; w < 8; ++w) {
+                const uint32_t pd = pd_reg[w];
+                #pragma unroll 1
+                for (int kh = 0; kh < 2; ++kh) {
+                    const uint32_t pdh = pd >> (16 * kh);
+                    const f16x2_t wd[4] = {
+                        d_unpack_hlut2_pair(pdh >> 0,  d_h0, d_dh),
+                        d_unpack_hlut2_pair(pdh >> 4,  d_h0, d_dh),
+                        d_unpack_hlut2_pair(pdh >> 8,  d_h0, d_dh),
+                        d_unpack_hlut2_pair(pdh >> 12, d_h0, d_dh)};
+                    const int sw4 = d_hlut2_swiz4(g * 16 + w * 2 + kh);
+                    #pragma unroll
+                    for (int t = 0; t < BM; ++t) {
+                        const uint4 vi = sh.inter4[t][sw4];
+                        const uint32_t words[4] = {vi.x, vi.y, vi.z, vi.w};
+                        #pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            f16x2_t xv;
+                            __builtin_memcpy(&xv, &words[i], 4);
+                            grp[t] = __builtin_amdgcn_fdot2(wd[i], xv, grp[t], false);
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+            #pragma unroll
+            for (int t = 0; t < BM; ++t) {
+                sh.red[g][t][r] = grp[t] * sig_d;
+            }
+        };
+        if (cnt <= 4) {
+            accum_bm(std::integral_constant<int, 4>{});
+        } else if (cnt <= 8) {
+            accum_bm(std::integral_constant<int, 8>{});
+        } else if (cnt <= 16) {
+            accum_bm(std::integral_constant<int, 16>{});
+        } else {
+            accum_bm(std::integral_constant<int, 32>{});
+        }
+        __syncthreads();
+
+        for (int t = g; t < cnt; t += 6) {
+            const Mi50RoutedPair pr = sorted_pairs[p0 + t];
+            const float sum = (sh.red[0][t][r] + sh.red[1][t][r] + sh.red[2][t][r] +
+                               sh.red[3][t][r] + sh.red[4][t][r] + sh.red[5][t][r]) * pr.weight;
+            atomicAdd(&out_accum_f32[size_t(pr.row) * 5120u + rb * 32 + r], sum);
+        }
+        __syncthreads();
+    }
+}
+
+__global__ __launch_bounds__(256)
+void k_commit_tree_win_kv_and_hidden(
+    uint16_t*       __restrict__ win_kv_slab,      // [43, 128, 512]
+    const uint16_t* __restrict__ last_win_kv_slab, // [40, 8, 512]
+    uint16_t*       __restrict__ target_mean_bf16, // [>=16, 5120]
+    int start_pos,
+    uint32_t acc_nodes_nibbles)
+{
+    const int bx  = int(blockIdx.x);  // 0..39 = layer win_kv, 40..59 = target_mean_bf16 cols
+    const int d   = int(blockIdx.y);  // 0..accepted_A-1
+    const int tid = int(threadIdx.x); // 0..255
+    const int src_node = int((acc_nodes_nibbles >> (4 * d)) & 0xFu);
+
+    if (bx < 40) {
+        const uint16_t* src = last_win_kv_slab + (size_t(bx) * 8u + size_t(src_node)) * 512u;
+        uint16_t* dst = win_kv_slab + (size_t(bx) * 128u + size_t((start_pos + d) & 127)) * 512u;
+        dst[tid]       = src[tid];
+        dst[256 + tid] = src[256 + tid];
+    } else {
+        const int col = (bx - 40) * 256 + tid;
+        if (col < 5120) {
+            target_mean_bf16[size_t(8 + d) * 5120u + size_t(col)] =
+                target_mean_bf16[size_t(src_node) * 5120u + size_t(col)];
+        }
+    }
+}
+
+__global__ __launch_bounds__(256)
+void k_commit_tree_global_kv_and_r2(
+    uint8_t* __restrict__ comp_fp4_0, uint8_t* __restrict__ comp_e4m3_0, uint8_t* __restrict__ idx_fp4_0, uint8_t* __restrict__ idx_ue8_0,
+    uint8_t* __restrict__ comp_fp4_1, uint8_t* __restrict__ comp_e4m3_1, uint8_t* __restrict__ idx_fp4_1, uint8_t* __restrict__ idx_ue8_1,
+    uint8_t* __restrict__ comp_fp4_2, uint8_t* __restrict__ comp_e4m3_2, uint8_t* __restrict__ idx_fp4_2, uint8_t* __restrict__ idx_ue8_2,
+    uint8_t* __restrict__ comp_fp4_3, uint8_t* __restrict__ comp_e4m3_3, uint8_t* __restrict__ idx_fp4_3, uint8_t* __restrict__ idx_ue8_3,
+    float* __restrict__ kv_state_0, float* __restrict__ sc_state_0, const float* __restrict__ kv_last_0, const float* __restrict__ sc_last_0,
+    float* __restrict__ kv_state_1, float* __restrict__ sc_state_1, const float* __restrict__ kv_last_1, const float* __restrict__ sc_last_1,
+    float* __restrict__ kv_state_2, float* __restrict__ sc_state_2, const float* __restrict__ kv_last_2, const float* __restrict__ sc_last_2,
+    int start_pos,
+    int accepted_A,
+    uint32_t acc_nodes_nibbles)
+{
+    const int slot = int(blockIdx.x); // 0..3
+    const int tid  = int(threadIdx.x);
+
+    uint8_t* c_fp4  = (slot == 0) ? comp_fp4_0  : ((slot == 1) ? comp_fp4_1  : ((slot == 2) ? comp_fp4_2  : comp_fp4_3));
+    uint8_t* c_e4m3 = (slot == 0) ? comp_e4m3_0 : ((slot == 1) ? comp_e4m3_1 : ((slot == 2) ? comp_e4m3_2 : comp_e4m3_3));
+    uint8_t* i_fp4  = (slot == 0) ? idx_fp4_0   : ((slot == 1) ? idx_fp4_1   : ((slot == 2) ? idx_fp4_2   : idx_fp4_3));
+    uint8_t* i_ue8  = (slot == 0) ? idx_ue8_0   : ((slot == 1) ? idx_ue8_1   : ((slot == 2) ? idx_ue8_2   : idx_ue8_3));
+
+    uint8_t r_cfp4[8];
+    uint8_t r_ce4[8];
+    uint8_t r_ifp4[8];
+    uint8_t r_iue8[8];
+    int count = 0;
+    const int base = (slot == 3) ? start_pos : (start_pos / 2);
+
+    if (slot == 3) {
+        count = accepted_A;
+        for (int d = 0; d < accepted_A; ++d) {
+            const size_t s_idx = size_t(base + int((acc_nodes_nibbles >> (4 * d)) & 0xFu));
+            r_cfp4[d] = c_fp4[s_idx * 256u + size_t(tid)];
+            r_ce4[d]  = (tid < 32) ? c_e4m3[s_idx * 32u + size_t(tid)] : 0u;
+            r_ifp4[d] = (tid < 64) ? i_fp4[s_idx * 64u + size_t(tid)] : 0u;
+            r_iue8[d] = (tid < 4)  ? i_ue8[s_idx * 4u  + size_t(tid)] : 0u;
+        }
+    } else {
+        for (int d = 0; d < accepted_A; ++d) {
+            if (((start_pos + d) & 1) == 1) {
+                const size_t s_idx = size_t(base + int((acc_nodes_nibbles >> (4 * d)) & 0xFu));
+                r_cfp4[count] = c_fp4[s_idx * 256u + size_t(tid)];
+                r_ce4[count]  = (tid < 32) ? c_e4m3[s_idx * 32u + size_t(tid)] : 0u;
+                r_ifp4[count] = (tid < 64) ? i_fp4[s_idx * 64u + size_t(tid)] : 0u;
+                r_iue8[count] = (tid < 4)  ? i_ue8[s_idx * 4u  + size_t(tid)] : 0u;
+                ++count;
+            }
+        }
+    }
+    __syncthreads();
+
+    for (int k = 0; k < count; ++k) {
+        const size_t d_idx = size_t(base + k);
+        c_fp4[d_idx * 256u + size_t(tid)] = r_cfp4[k];
+        if (tid < 32) c_e4m3[d_idx * 32u + size_t(tid)] = r_ce4[k];
+        if (tid < 64) i_fp4[d_idx * 64u + size_t(tid)]  = r_ifp4[k];
+        if (tid < 4)  i_ue8[d_idx * 4u  + size_t(tid)]  = r_iue8[k];
+    }
+
+    if (slot < 3 && (((start_pos + accepted_A) & 1) == 1)) {
+        const int last_node = int((acc_nodes_nibbles >> (4 * (accepted_A - 1))) & 0xFu);
+        float* kv_st = (slot == 0) ? kv_state_0 : ((slot == 1) ? kv_state_1 : kv_state_2);
+        float* sc_st = (slot == 0) ? sc_state_0 : ((slot == 1) ? sc_state_1 : sc_state_2);
+        const float* kv_ls = (slot == 0) ? kv_last_0 : ((slot == 1) ? kv_last_1 : kv_last_2);
+        const float* sc_ls = (slot == 0) ? sc_last_0 : ((slot == 1) ? sc_last_1 : sc_last_2);
+        kv_st[tid]       = kv_ls[size_t(last_node) * 512u + size_t(tid)];
+        kv_st[256 + tid] = kv_ls[size_t(last_node) * 512u + 256u + size_t(tid)];
+        sc_st[tid]       = sc_ls[size_t(last_node) * 512u + size_t(tid)];
+        sc_st[256 + tid] = sc_ls[size_t(last_node) * 512u + 256u + size_t(tid)];
+    }
+}
+
 }  // namespace
 
 // =============================================================================
@@ -4448,7 +4790,118 @@ void k_host_ring_allreduce_f32_hc_post(
         v[p2]   = __uint_as_float(__hip_atomic_load(&slot->payload[p2][idx], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM));
         float xv = (v[0] + v[1]) + v[2];
         if (d_p150_bf16 != nullptr) {
-            xv += d_bf16_to_f32(d_p150_bf16[idx]);
+            const uint32_t w32 = __hip_atomic_load(
+                &reinterpret_cast<const uint32_t*>(d_p150_bf16)[idx >> 1],
+                __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            const uint32_t bf_u32 = (idx & 1u) ? (w32 & 0xFFFF0000u) : (w32 << 16);
+            xv += __uint_as_float(bf_u32);
+        }
+
+        const uint16_t* rs = d_res_bf16 + size_t(m) * 20480u + size_t(d);
+        const float r0 = d_bf16_to_f32(rs[0]);
+        const float r1 = d_bf16_to_f32(rs[5120]);
+        const float r2 = d_bf16_to_f32(rs[10240]);
+        const float r3 = d_bf16_to_f32(rs[15360]);
+
+        const float* ps = d_post_f32 + m * 4;
+        const float* cb = d_comb_f32 + m * 16;
+        uint16_t* dst = d_out_h_bf16 + size_t(m) * 20480u + size_t(d);
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float h_val = ps[j] * xv + cb[0 * 4 + j] * r0 + cb[1 * 4 + j] * r1 +
+                                cb[2 * 4 + j] * r2 + cb[3 * 4 + j] * r3;
+            dst[j * 5120] = d_f32_to_bf16_rne(h_val);
+        }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        const uint32_t prev = __hip_atomic_fetch_add(&slot->read_ctas[rank][0], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_SYSTEM);
+        if (prev + 1u == uint32_t(gridDim.x)) {
+            __hip_atomic_store(&slot->read_ctas[rank][0], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            __hip_atomic_store(&slot->done_seq[rank][0], seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        }
+    }
+}
+
+__global__ __launch_bounds__(256, 4)
+void k_host_ring_upload_f32(
+    const float* __restrict__ d_src_f32,
+    HostRingAllReduceSlot* __restrict__ slot,
+    int rank,
+    uint64_t seq,
+    int M)
+{
+    const int tid = int(threadIdx.x);
+    const int d   = int(blockIdx.x) * 256 + tid;  // 20 CTAs * 256 = 5120 columns
+    const int p1  = (rank + 1) % 3;
+    const int p2  = (rank + 2) % 3;
+
+    if (seq > kHostArRingSlots && tid == 0) {
+        const uint64_t min_done = seq - kHostArRingSlots;
+        while (__hip_atomic_load(&slot->done_seq[p1][0], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < min_done ||
+               __hip_atomic_load(&slot->done_seq[p2][0], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < min_done) {
+            __builtin_amdgcn_s_sleep(1);
+        }
+    }
+    __syncthreads();
+
+    for (int m = 0; m < M; ++m) {
+        const size_t idx = size_t(m) * 5120u + size_t(d);
+        const uint32_t bits = __float_as_uint(d_src_f32[idx]);
+        __hip_atomic_store(&slot->payload[rank][idx], bits, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        __threadfence_system();
+        const uint32_t prev = __hip_atomic_fetch_add(&slot->write_ctas[rank][0], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_SYSTEM);
+        if (prev + 1u == uint32_t(gridDim.x)) {
+            __hip_atomic_store(&slot->write_ctas[rank][0], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            __hip_atomic_store(&slot->ready_seq[rank][0], seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        }
+    }
+}
+
+__global__ __launch_bounds__(256, 4)
+void k_host_ring_finish_f32_hc_post(
+    const float*    __restrict__ d_src_f32,
+    const uint16_t* __restrict__ d_p150_bf16,
+    const uint16_t* __restrict__ d_res_bf16,
+    const float*    __restrict__ d_post_f32,
+    const float*    __restrict__ d_comb_f32,
+    uint16_t*       __restrict__ d_out_h_bf16,
+    HostRingAllReduceSlot* __restrict__ slot,
+    int rank,
+    uint64_t seq,
+    int M)
+{
+    const int tid = int(threadIdx.x);
+    const int d   = int(blockIdx.x) * 256 + tid;
+    const int p1  = (rank + 1) % 3;
+    const int p2  = (rank + 2) % 3;
+
+    if (tid == 0) {
+        while (__hip_atomic_load(&slot->ready_seq[p1][0], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq ||
+               __hip_atomic_load(&slot->ready_seq[p2][0], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq) {
+            __builtin_amdgcn_s_sleep(1);
+        }
+    }
+    __syncthreads();
+
+    for (int m = 0; m < M; ++m) {
+        const size_t idx = size_t(m) * 5120u + size_t(d);
+        float v[3];
+        v[rank] = d_src_f32[idx];
+        v[p1]   = __uint_as_float(__hip_atomic_load(&slot->payload[p1][idx], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM));
+        v[p2]   = __uint_as_float(__hip_atomic_load(&slot->payload[p2][idx], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM));
+        float xv = (v[0] + v[1]) + v[2];
+        if (d_p150_bf16 != nullptr) {
+            const uint32_t w32 = __hip_atomic_load(
+                &reinterpret_cast<const uint32_t*>(d_p150_bf16)[idx >> 1],
+                __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            const uint32_t bf_u32 = (idx & 1u) ? (w32 & 0xFFFF0000u) : (w32 << 16);
+            xv += __uint_as_float(bf_u32);
         }
 
         const uint16_t* rs = d_res_bf16 + size_t(m) * 20480u + size_t(d);
@@ -4496,6 +4949,27 @@ void launch_host_ring_allreduce_f32_hc_post(
 {
     if (M <= 0) return;
     hipLaunchKernelGGL(k_host_ring_allreduce_f32_hc_post, dim3(20), dim3(256), 0, stream,
+                       d_src_f32, d_p150_bf16, d_res_bf16, d_post_f32, d_comb_f32,
+                       d_out_h_bf16, d_mapped_slot, rank, seq, M);
+}
+
+void launch_host_ring_upload_f32(
+    const float* d_src_f32, HostRingAllReduceSlot* d_mapped_slot,
+    int rank, uint64_t seq, int M, hipStream_t stream)
+{
+    if (M <= 0) return;
+    hipLaunchKernelGGL(k_host_ring_upload_f32, dim3(20), dim3(256), 0, stream,
+                       d_src_f32, d_mapped_slot, rank, seq, M);
+}
+
+void launch_host_ring_finish_f32_hc_post(
+    const float* d_src_f32, const uint16_t* d_p150_bf16,
+    const uint16_t* d_res_bf16, const float* d_post_f32, const float* d_comb_f32,
+    uint16_t* d_out_h_bf16, HostRingAllReduceSlot* d_mapped_slot,
+    int rank, uint64_t seq, int M, hipStream_t stream)
+{
+    if (M <= 0) return;
+    hipLaunchKernelGGL(k_host_ring_finish_f32_hc_post, dim3(20), dim3(256), 0, stream,
                        d_src_f32, d_p150_bf16, d_res_bf16, d_post_f32, d_comb_f32,
                        d_out_h_bf16, d_mapped_slot, rank, seq, M);
 }
@@ -4734,12 +5208,14 @@ void launch_split_qkv_norm_rope_quant(
     const uint16_t* d_qkv_bf16, const uint16_t* d_q_norm_bf16, const uint16_t* d_kv_norm_bf16,
     bool use_comp_yarn,
     uint16_t* d_out_qr_bf16, uint16_t* d_out_kv_bf16,
-    int M, int pos_base, float eps, hipStream_t stream)
+    int M, int pos_base, float eps, hipStream_t stream,
+    uint64_t tree_anc_mask64, uint32_t tree_depth_nibbles)
 {
     if (M <= 0) return;
     hipLaunchKernelGGL(k_split_qkv_norm_rope_quant, dim3(2, M), dim3(256), 0, stream,
                        d_qkv_bf16, d_q_norm_bf16, d_kv_norm_bf16, use_comp_yarn,
-                       d_out_qr_bf16, d_out_kv_bf16, pos_base, eps);
+                       d_out_qr_bf16, d_out_kv_bf16, pos_base, eps,
+                       tree_anc_mask64, tree_depth_nibbles);
 }
 
 void init_rope_inv_freq_gpu()
@@ -4807,15 +5283,17 @@ void init_rope_inv_freq_gpu()
 
 void launch_rope_tail64_bf16(
     uint16_t* d_x_bf16, bool use_comp_yarn,
-    int M, int H, int D, int pos_base, int pos_stride, bool inverse, hipStream_t stream)
+    int M, int H, int D, int pos_base, int pos_stride, bool inverse, hipStream_t stream,
+    uint64_t tree_anc_mask64, uint32_t tree_depth_nibbles)
 {
     if (M <= 0 || H <= 0) return;
-    if (M >= 16 && pos_stride == 1) {
+    if (M >= 16 && pos_stride == 1 && tree_anc_mask64 == 0ULL) {
         hipLaunchKernelGGL(k_rope_tail64_givens_bf16, dim3((H + 3) / 4, (M + 63) / 64), dim3(256), 0, stream,
                            d_x_bf16, use_comp_yarn, M, H, D, pos_base, inverse);
     } else {
         hipLaunchKernelGGL(k_rope_tail64_bf16, dim3(H, M), dim3(32), 0, stream,
-                           d_x_bf16, use_comp_yarn, H, D, pos_base, pos_stride, inverse);
+                           d_x_bf16, use_comp_yarn, H, D, pos_base, pos_stride, inverse,
+                           tree_anc_mask64, tree_depth_nibbles);
     }
 }
 
@@ -4828,6 +5306,18 @@ int launch_compressor_r2_pool(
     hipLaunchKernelGGL(k_compressor_r2_pool, dim3(2), dim3(256), 0, stream,
                        d_kv_f32, d_score_f32, d_kv_state_f32, d_score_state_f32, d_out_pool_bf16, start_pos, M);
     return ((start_pos + M) / 2) - (start_pos / 2);
+}
+
+void launch_compressor_r2_tree_pool(
+    const float* d_kv_f32, const float* d_score_f32,
+    const float* d_kv_state_f32, const float* d_score_state_f32,
+    uint16_t* d_out_pool_bf16, int start_pos, int M,
+    uint32_t tree_depth_nibbles, uint32_t tree_parent_nibbles, hipStream_t stream)
+{
+    if (M <= 0) return;
+    hipLaunchKernelGGL(k_compressor_r2_tree_pool, dim3(2), dim3(256), 0, stream,
+                       d_kv_f32, d_score_f32, d_kv_state_f32, d_score_state_f32,
+                       d_out_pool_bf16, start_pos, M, tree_depth_nibbles, tree_parent_nibbles);
 }
 
 void launch_pack_compress_kv_fp4_e4m3_16(
@@ -4872,6 +5362,12 @@ void launch_indexer_score(
     } else if (M <= 4) {
         hipLaunchKernelGGL((k_indexer_score_msplit<4>), dim3(tx, 1), dim3(256), 0, stream,
                            d_q_bf16, d_k_fp4, d_k_ue8m0, d_weights_bf16, d_out_score_f32, M, ih_cnt, T_comp);
+    } else if (M <= 6) {
+        hipLaunchKernelGGL((k_indexer_score_msplit<6>), dim3(tx, 1), dim3(256), 0, stream,
+                           d_q_bf16, d_k_fp4, d_k_ue8m0, d_weights_bf16, d_out_score_f32, M, ih_cnt, T_comp);
+    } else if (M <= 8) {
+        hipLaunchKernelGGL((k_indexer_score_msplit<4>), dim3(tx, 2), dim3(256), 0, stream,
+                           d_q_bf16, d_k_fp4, d_k_ue8m0, d_weights_bf16, d_out_score_f32, M, ih_cnt, T_comp);
     } else {
         hipLaunchKernelGGL((k_indexer_score_msplit<6>), dim3(tx, (M + 5) / 6), dim3(256), 0, stream,
                            d_q_bf16, d_k_fp4, d_k_ue8m0, d_weights_bf16, d_out_score_f32, M, ih_cnt, T_comp);
@@ -4881,13 +5377,15 @@ void launch_indexer_score(
 void launch_indexer_candidates_and_topk(
     float* d_score_f32, uint8_t* d_cand_block_mask, int cand_block_stride,
     int32_t* d_out_comp_idxs,
-    int M, int T_comp, int start_pos, int ratio, int mode, int K_out, hipStream_t stream)
+    int M, int T_comp, int start_pos, int ratio, int mode, int K_out, hipStream_t stream,
+    uint64_t tree_anc_mask64, uint32_t tree_depth_nibbles, int q_row_offset)
 {
     if (M <= 0 || T_comp <= 0 || K_out <= 0) return;
     float* block_scratch = d_score_f32 + size_t(M) * size_t(T_comp);
     hipLaunchKernelGGL(k_indexer_candidates_and_topk, dim3(M), dim3(256), 0, stream,
                        d_score_f32, d_cand_block_mask, cand_block_stride,
-                       d_out_comp_idxs, T_comp, start_pos, ratio, mode, K_out, block_scratch);
+                       d_out_comp_idxs, T_comp, start_pos, ratio, mode, K_out, block_scratch,
+                       tree_anc_mask64, tree_depth_nibbles, q_row_offset);
 }
 
 void launch_sparse_attn(
@@ -4896,7 +5394,8 @@ void launch_sparse_attn(
     int start_pos, int swa_floor_pos, bool dspark_bidir,
     const uint8_t* d_comp_fp4, const uint8_t* d_comp_e4m3, const int32_t* d_comp_idxs, int n_comp,
     float* d_splitk_scratch,
-    uint16_t* d_out_o_bf16, int M, int h_cnt, hipStream_t stream)
+    uint16_t* d_out_o_bf16, int M, int h_cnt, hipStream_t stream,
+    uint64_t tree_anc_mask64, uint32_t tree_depth_nibbles)
 {
     if (M <= 0 || h_cnt <= 0) return;
     const int max_win = std::min(128, std::max(0, start_pos + M - swa_floor_pos));
@@ -4904,10 +5403,10 @@ void launch_sparse_attn(
         hipLaunchKernelGGL(k_sparse_attn_splitk, dim3(M, (h_cnt + 7) / 8, 8), dim3(256), 0, stream,
                            d_q_bf16, d_win_kv_ring, d_cur_kv_bf16, start_pos, swa_floor_pos,
                            d_comp_fp4, d_comp_e4m3, d_comp_idxs, n_comp,
-                           d_splitk_scratch, h_cnt);
+                           d_splitk_scratch, h_cnt, tree_anc_mask64, tree_depth_nibbles);
         hipLaunchKernelGGL(k_sparse_attn_reduce_splits, dim3(M, h_cnt), dim3(256), 0, stream,
                            d_splitk_scratch, d_attn_sink_f32, d_out_o_bf16, h_cnt);
-    } else if (M > 16 && !dspark_bidir && h_cnt >= 8) {
+    } else if (M > 16 && !dspark_bidir && tree_anc_mask64 == 0ULL && h_cnt >= 8) {
         hipLaunchKernelGGL(k_sparse_attn_allheads, dim3(M, (h_cnt + 7) / 8), dim3(256), 0, stream,
                            d_q_bf16, d_attn_sink_f32,
                            d_win_kv_ring, d_cur_kv_bf16, start_pos, swa_floor_pos,
@@ -4918,8 +5417,39 @@ void launch_sparse_attn(
                            d_q_bf16, d_attn_sink_f32,
                            d_win_kv_ring, d_cur_kv_bf16, start_pos, swa_floor_pos, dspark_bidir,
                            d_comp_fp4, d_comp_e4m3, d_comp_idxs, n_comp,
-                           d_out_o_bf16, M, h_cnt);
+                           d_out_o_bf16, M, h_cnt, tree_anc_mask64, tree_depth_nibbles);
     }
+}
+
+void launch_commit_tree_win_kv_and_hidden(
+    uint16_t* d_win_kv_slab, const uint16_t* d_last_win_kv_slab, uint16_t* d_target_mean_bf16,
+    int start_pos, int accepted_A, uint32_t acc_nodes_nibbles, hipStream_t stream)
+{
+    if (accepted_A <= 0) return;
+    hipLaunchKernelGGL(k_commit_tree_win_kv_and_hidden, dim3(60, accepted_A), dim3(256), 0, stream,
+                       d_win_kv_slab, d_last_win_kv_slab, d_target_mean_bf16, start_pos, acc_nodes_nibbles);
+}
+
+void launch_commit_tree_global_kv_and_r2(
+    uint8_t* d_comp_fp4_0, uint8_t* d_comp_e4m3_0, uint8_t* d_idx_fp4_0, uint8_t* d_idx_ue8_0,
+    uint8_t* d_comp_fp4_1, uint8_t* d_comp_e4m3_1, uint8_t* d_idx_fp4_1, uint8_t* d_idx_ue8_1,
+    uint8_t* d_comp_fp4_2, uint8_t* d_comp_e4m3_2, uint8_t* d_idx_fp4_2, uint8_t* d_idx_ue8_2,
+    uint8_t* d_comp_fp4_3, uint8_t* d_comp_e4m3_3, uint8_t* d_idx_fp4_3, uint8_t* d_idx_ue8_3,
+    float* d_kv_state_0, float* d_sc_state_0, const float* d_kv_last_0, const float* d_sc_last_0,
+    float* d_kv_state_1, float* d_sc_state_1, const float* d_kv_last_1, const float* d_sc_last_1,
+    float* d_kv_state_2, float* d_sc_state_2, const float* d_kv_last_2, const float* d_sc_last_2,
+    int start_pos, int accepted_A, uint32_t acc_nodes_nibbles, hipStream_t stream)
+{
+    if (accepted_A <= 0) return;
+    hipLaunchKernelGGL(k_commit_tree_global_kv_and_r2, dim3(4), dim3(256), 0, stream,
+                       d_comp_fp4_0, d_comp_e4m3_0, d_idx_fp4_0, d_idx_ue8_0,
+                       d_comp_fp4_1, d_comp_e4m3_1, d_idx_fp4_1, d_idx_ue8_1,
+                       d_comp_fp4_2, d_comp_e4m3_2, d_idx_fp4_2, d_idx_ue8_2,
+                       d_comp_fp4_3, d_comp_e4m3_3, d_idx_fp4_3, d_idx_ue8_3,
+                       d_kv_state_0, d_sc_state_0, d_kv_last_0, d_sc_last_0,
+                       d_kv_state_1, d_sc_state_1, d_kv_last_1, d_sc_last_1,
+                       d_kv_state_2, d_sc_state_2, d_kv_last_2, d_sc_last_2,
+                       start_pos, accepted_A, acc_nodes_nibbles);
 }
 
 void launch_moe_gate(
@@ -4997,7 +5527,7 @@ void launch_mi50_routed_hlut2_pairs(
 void launch_mi50_routed_hlut2_grouped(
     const uint16_t* d_x_rot_f16,
     const int32_t* d_active_experts, const int32_t* d_csr_offsets, const Mi50RoutedPair* d_sorted_pairs,
-    int num_active, int P,
+    int M, int num_active, int P,
     const uint32_t* d_gate_codes, const uint16_t* d_gate_scales, const float* d_gate_centroids,
     const uint32_t* d_up_codes, const uint16_t* d_up_scales, const float* d_up_centroids,
     const uint32_t* d_down_codes, const uint16_t* d_down_scales, const float* d_down_centroids,
@@ -5006,6 +5536,26 @@ void launch_mi50_routed_hlut2_grouped(
     float* d_out_accum_f32, hipStream_t stream)
 {
     if (num_active <= 0 || P <= 0) return;
+    // Wave 7B: M >= 64 CED prefill forces the expert-major BM=16 grouped SwiGLU path.
+    // Each active expert block unpacks one 272 B HLUT2 superblock tile and reuses it
+    // across 16 routed token rows in v_dot2_f32_f16 (FP32 accumulation, single RNE round),
+    // eliminating the BM=8 re-read that Wave 6C used whenever P <= 640.
+    if (M >= 64) {
+        hipLaunchKernelGGL(
+            k_hlut2_grouped_swiglu16, dim3(6, num_active), dim3(256), 0, stream,
+            reinterpret_cast<const uint32_t*>(d_x_rot_f16),
+            d_active_experts, d_csr_offsets, d_sorted_pairs,
+            d_gate_codes, d_gate_scales, d_gate_centroids,
+            d_up_codes, d_up_scales, d_up_centroids,
+            d_signs_i, d_inter_bf16_scratch, d_inter_rot_f16_scratch);
+        hipLaunchKernelGGL(
+            k_hlut2_grouped_down32, dim3(160, num_active), dim3(192), 0, stream,
+            reinterpret_cast<const uint32_t*>(d_inter_rot_f16_scratch),
+            d_active_experts, d_csr_offsets, d_sorted_pairs,
+            d_down_codes, d_down_scales, d_down_centroids,
+            d_out_accum_f32);
+        return;
+    }
     if (P <= 640) {
         hipLaunchKernelGGL(
             k_hlut2_grouped_swiglu8, dim3(6, num_active), dim3(256), 0, stream,
@@ -5367,6 +5917,9 @@ void k_dspark_step_sample_tp3(
 
     const double sum_exp = ctrl->rank_sum_exp[step_idx][0] + ctrl->rank_sum_exp[step_idx][1] + ctrl->rank_sum_exp[step_idx][2];
     const float inv_sum = float(1.0 / fmax(sum_exp, 1e-30));
+    if (step_idx == 0 && rank == 0 && tid == 0) {
+        ctrl->out_root_top1_prob = inv_sum;
+    }
 
     auto run_cand_tier = [&](float tau, uint64_t cand_tag, bool wait_all) {
         if (tid == 0) {
@@ -5551,6 +6104,186 @@ void k_dspark_pack_conf_in(
     conf_in_bf16[size_t(row) * 5376u + size_t(col)] = v;
 }
 
+__global__ __launch_bounds__(256)
+void k_dspark_prepare_tree_markov_emb(
+    DsparkGpuSampleSlot* __restrict__ ctrl,
+    const uint16_t*      __restrict__ mapped_markov_embed_bf16,
+    uint16_t*            __restrict__ out_markov_emb_bf16,
+    uint64_t seq,
+    int wait_stage,
+    int num_rows)
+{
+    const int tid = int(threadIdx.x);
+    if (tid == 0) {
+        while (__hip_atomic_load(&ctrl->ready_tree_stage_seq[wait_stage], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq) {
+            __builtin_amdgcn_s_sleep(1);
+        }
+    }
+    __syncthreads();
+
+    if (wait_stage == 0) {
+        const int32_t t1 = ctrl->tree_tokens[1];
+        out_markov_emb_bf16[tid] = mapped_markov_embed_bf16[size_t(t1) * 256u + size_t(tid)];
+        if (num_rows >= 2) {
+            const int32_t t2 = ctrl->tree_tokens[2];
+            out_markov_emb_bf16[256 + tid] = mapped_markov_embed_bf16[size_t(t2) * 256u + size_t(tid)];
+        }
+    } else {
+        const int32_t t4 = ctrl->tree_tokens[4];
+        out_markov_emb_bf16[tid] = mapped_markov_embed_bf16[size_t(t4) * 256u + size_t(tid)];
+    }
+}
+
+__global__ __launch_bounds__(256)
+void k_dspark_tree_topk_tp3(
+    DsparkGpuSampleSlot* __restrict__ ctrl,
+    const float*         __restrict__ base_logits_f32,
+    const float*         __restrict__ markov_logits_f32,
+    uint64_t seq,
+    int tree_stage,
+    int out_slot,
+    int B_out,
+    int anc_slot1,
+    int anc_slot2,
+    int rank,
+    int vocab_offset,
+    int vocab_rows)
+{
+    union SharedTreeTopk {
+        uint32_t seen[1352];
+        struct {
+            float   val[256][3];
+            int32_t id[256][3];
+        } top;
+    };
+    __shared__ SharedTreeTopk sh;
+
+    const int tid = int(threadIdx.x);
+    const float penalty = ctrl->rep_penalty;
+    const bool do_rep = (markov_logits_f32 != nullptr && penalty > 1.0001f);
+
+    if (do_rep) {
+        for (int i = tid; i < 1352; i += 256) sh.seen[i] = 0u;
+        __syncthreads();
+
+        const int R = ctrl->recent_len;
+        const int depth_extra = (anc_slot2 >= 0) ? 3 : 2;
+        const int hist_start = max(0, (R + depth_extra) - 1024);
+        for (int k = hist_start + tid; k < R; k += 256) {
+            const int32_t t = ctrl->recent_hist[k];
+            if (t >= vocab_offset && t < vocab_offset + vocab_rows) {
+                const int lt = t - vocab_offset;
+                atomicOr(&sh.seen[lt >> 5], 1u << (lt & 31));
+            }
+        }
+        if (tid < 3) {
+            int32_t t = -1;
+            if (tid == 0) t = ctrl->anchor_token;
+            else if (tid == 1 && anc_slot1 >= 0) t = ctrl->tree_tokens[anc_slot1];
+            else if (tid == 2 && anc_slot2 >= 0) t = ctrl->tree_tokens[anc_slot2];
+            if (t >= vocab_offset && t < vocab_offset + vocab_rows) {
+                const int lt = t - vocab_offset;
+                atomicOr(&sh.seen[lt >> 5], 1u << (lt & 31));
+            }
+        }
+        __syncthreads();
+    }
+
+    float b0 = -1.0e38f, b1 = -1.0e38f, b2 = -1.0e38f;
+    int32_t i0 = 0x7FFFFFFF, i1 = 0x7FFFFFFF, i2 = 0x7FFFFFFF;
+
+    for (int v = tid; v < vocab_rows; v += 256) {
+        float lg = base_logits_f32[v];
+        if (markov_logits_f32 != nullptr) {
+            lg += markov_logits_f32[v];
+            if (do_rep && ((sh.seen[v >> 5] >> (v & 31)) & 1u)) {
+                lg = (lg > 0.0f) ? (lg / penalty) : (lg * penalty);
+            }
+        }
+        const int32_t gid = vocab_offset + v;
+        if (lg > b0 || (lg == b0 && gid < i0)) {
+            b2 = b1; i2 = i1;
+            b1 = b0; i1 = i0;
+            b0 = lg; i0 = gid;
+        } else if (lg > b1 || (lg == b1 && gid < i1)) {
+            b2 = b1; i2 = i1;
+            b1 = lg; i1 = gid;
+        } else if (lg > b2 || (lg == b2 && gid < i2)) {
+            b2 = lg; i2 = gid;
+        }
+    }
+    __syncthreads();
+
+    sh.top.val[tid][0] = b0; sh.top.id[tid][0] = i0;
+    sh.top.val[tid][1] = b1; sh.top.id[tid][1] = i1;
+    sh.top.val[tid][2] = b2; sh.top.id[tid][2] = i2;
+    __syncthreads();
+
+    for (int half = 128; half > 0; half >>= 1) {
+        if (tid < half) {
+            float m_val[3];
+            int32_t m_id[3];
+            int ca = 0, cb = 0;
+            #pragma unroll
+            for (int k = 0; k < 3; ++k) {
+                const float va = sh.top.val[tid][ca];
+                const int32_t ia = sh.top.id[tid][ca];
+                const float vb = sh.top.val[tid + half][cb];
+                const int32_t ib = sh.top.id[tid + half][cb];
+                if (vb > va || (vb == va && ib < ia)) {
+                    m_val[k] = vb; m_id[k] = ib; ++cb;
+                } else {
+                    m_val[k] = va; m_id[k] = ia; ++ca;
+                }
+            }
+            #pragma unroll
+            for (int k = 0; k < 3; ++k) {
+                sh.top.val[tid][k] = m_val[k];
+                sh.top.id[tid][k]  = m_id[k];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        for (int k = 0; k < 3; ++k) {
+            ctrl->tree_rank_val[tree_stage][rank][k] = sh.top.val[0][k];
+            ctrl->tree_rank_id[tree_stage][rank][k]  = sh.top.id[0][k];
+        }
+        __threadfence_system();
+        __hip_atomic_store(&ctrl->ready_tree_rank_seq[tree_stage][rank], seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+
+        if (rank == 0) {
+            while (__hip_atomic_load(&ctrl->ready_tree_rank_seq[tree_stage][0], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq ||
+                   __hip_atomic_load(&ctrl->ready_tree_rank_seq[tree_stage][1], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq ||
+                   __hip_atomic_load(&ctrl->ready_tree_rank_seq[tree_stage][2], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq) {
+                __builtin_amdgcn_s_sleep(1);
+            }
+            int cur[3] = {0, 0, 0};
+            for (int k = 0; k < B_out; ++k) {
+                int best_r = 0;
+                float best_v = -1.0e38f;
+                int32_t best_i = 0x7FFFFFFF;
+                for (int r = 0; r < 3; ++r) {
+                    if (cur[r] < 3) {
+                        const float rv = ctrl->tree_rank_val[tree_stage][r][cur[r]];
+                        const int32_t ri = ctrl->tree_rank_id[tree_stage][r][cur[r]];
+                        if (rv > best_v || (rv == best_v && ri < best_i)) {
+                            best_v = rv;
+                            best_i = ri;
+                            best_r = r;
+                        }
+                    }
+                }
+                ++cur[best_r];
+                ctrl->tree_tokens[out_slot + k] = (best_i < 0x7FFFFFFF) ? best_i : 0;
+            }
+            __threadfence_system();
+            __hip_atomic_store(&ctrl->ready_tree_stage_seq[tree_stage], seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        }
+    }
+}
+
 }  // namespace
 
 void launch_dspark_prepare_markov_emb(
@@ -5576,6 +6309,25 @@ void launch_dspark_pack_conf_in(
 {
     hipLaunchKernelGGL(k_dspark_pack_conf_in, dim3(21, 5), dim3(256), 0, stream,
                        d_ctrl, d_sub_bf16, d_markov_sum_bf16, d_conf_in_bf16);
+}
+
+void launch_dspark_prepare_tree_markov_emb(
+    DsparkGpuSampleSlot* d_ctrl, const uint16_t* d_mapped_markov_embed_bf16,
+    uint16_t* d_out_markov_emb_bf16, uint64_t seq, int wait_stage, int num_rows, hipStream_t stream)
+{
+    hipLaunchKernelGGL(k_dspark_prepare_tree_markov_emb, dim3(1), dim3(256), 0, stream,
+                       d_ctrl, d_mapped_markov_embed_bf16, d_out_markov_emb_bf16, seq, wait_stage, num_rows);
+}
+
+void launch_dspark_tree_topk_tp3(
+    DsparkGpuSampleSlot* d_ctrl, const float* d_base_logits_row_f32, const float* d_markov_logits_row_f32,
+    uint64_t seq, int tree_stage, int out_slot, int B_out, int anc_slot1, int anc_slot2,
+    int rank, int vocab_offset, int vocab_rows, hipStream_t stream)
+{
+    hipLaunchKernelGGL(k_dspark_tree_topk_tp3, dim3(1), dim3(256), 0, stream,
+                       d_ctrl, d_base_logits_row_f32, d_markov_logits_row_f32,
+                       seq, tree_stage, out_slot, B_out, anc_slot1, anc_slot2,
+                       rank, vocab_offset, vocab_rows);
 }
 
 }  // namespace dsv41

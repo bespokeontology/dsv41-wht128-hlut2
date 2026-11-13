@@ -1,6 +1,6 @@
 #pragma once
 // Pure C++17/20 Lock-Free POSIX /dev/shm IPC Channel between 3x MI50 (dsv41_fe) and 2x Blackhole P150A (p150_dsv41_worker)
-// Zero Python anywhere. Supports M = 1 .. 512 token rows (M=1 decode, M=6 DSpark verify, M=64..512 chunked prefill).
+// Zero Python anywhere. Supports M = 1 .. 1024 token rows (M=1 decode, M=6 DSpark chain, M=8 DSpark causal tree, M=64..1024 chunked prefill).
 
 #include <atomic>
 #include <cstdint>
@@ -42,7 +42,7 @@ struct alignas(64) Dsv41P150ShmChannel {
     alignas(64) std::atomic<uint32_t> req_seq;
     uint32_t op;                     // Dsv41P150Op
     uint32_t layer;                  // 0..39
-    uint32_t rows;                   // 1..512
+    uint32_t rows;                   // 1..1024
     uint32_t input_is_wht_rotated;   // 1 if x_in_bf16 already has WHT128(signs_h) applied, 0 if raw BF16
 
     alignas(64) std::atomic<uint32_t> resp_seq;

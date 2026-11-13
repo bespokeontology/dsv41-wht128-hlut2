@@ -34,7 +34,7 @@ $(BUILD_DIR)/dsv41_engram_cpu.o: $(HERE)/dsv41_engram_cpu.cpp $(HERE)/dsv41_engr
 $(BUILD_DIR)/dsv41_mi50_kernels.o: $(HERE)/dsv41_mi50_kernels.hip $(HERE)/dsv41_mi50_kernels.hpp | $(BUILD_DIR)
 	$(HIPCC) $(HIPFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/dsv41_runtime.o: $(HERE)/dsv41_runtime.cpp $(HERE)/dsv41_runtime.hpp $(HERE)/dsv41_think_loop_guard.hpp $(ROOT)/src/dsv41_rarebal.hpp $(HERE)/dsv41_mi50_kernels.hpp $(HERE)/dsv41_engram_cpu.hpp $(HERE)/dsv41_tokenizer_dsml.hpp $(ROOT)/p150/dsv41_p150_shm.hpp | $(BUILD_DIR)
+$(BUILD_DIR)/dsv41_runtime.o: $(HERE)/dsv41_runtime.cpp $(HERE)/dsv41_runtime.hpp $(HERE)/dsv41_kolmogorov_tree_verifier.hpp $(HERE)/dsv41_tree_spec.hpp $(HERE)/dsv41_think_loop_guard.hpp $(ROOT)/src/dsv41_rarebal.hpp $(HERE)/dsv41_mi50_kernels.hpp $(HERE)/dsv41_engram_cpu.hpp $(HERE)/dsv41_tokenizer_dsml.hpp $(ROOT)/p150/dsv41_p150_shm.hpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/dsv41_fe.o: $(HERE)/dsv41_fe.cpp $(HERE)/dsv41_runtime.hpp $(HERE)/dsv41_think_loop_guard.hpp $(HERE)/dsv41_live_progress.hpp $(HERE)/dsv41_tokenizer_dsml.hpp $(HERE)/dsv41_json.hpp | $(BUILD_DIR)

@@ -54,6 +54,8 @@ struct Dsv41GenStats {
     uint64_t dspark_steps = 0;
     uint64_t dspark_drafted = 0;
     uint64_t dspark_accepted = 0;
+    uint64_t dspark_tree_steps = 0;
+    uint64_t dspark_tree_accepted = 0;
     bool think_guard_triggered = false;
     uint32_t think_guard_period = 0;
     uint32_t think_guard_rewound = 0;

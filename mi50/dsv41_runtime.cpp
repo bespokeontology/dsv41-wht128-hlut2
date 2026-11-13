@@ -1,13 +1,15 @@
-// Pure-C++17 Heterogeneous Runtime for DeepSeek-V4.1-Flash-1017 (Speed Wave 3)
+// Pure-C++17 Heterogeneous Runtime for DeepSeek-V4.1-Flash-1017 (Wave 7B Canonical)
+//   - 2x Tenstorrent Blackhole P150A (64 GiB GDDR6 + 247.82 MiB pure active L1, TP2 via zero-SDMA /dsv41_p150_ipc): HLUT2 Routed Experts [216..383]
 //   - 3x AMD Instinct MI50 (96 GiB HBM2, TP3): CSA2 Sparse Attention, Strict 20L CED Prefill,
-//     mHC Sinkhorn, Shared Experts, HLUT2 Routed Experts [0..215] + MTP [0..127], 3-Stage DSpark (M=6)
-//   - 2x Tenstorrent Blackhole P150A (64 GiB GDDR6, TP2 via /dsv41_p150_ipc): HLUT2 Routed Experts [216..383]
+//     mHC Sinkhorn, Shared Experts, HLUT2 Routed Experts [0..215] + MTP [0..127], 3-Stage DSpark (M=6 Chain / M=8 Dirac Causal Tree)
 //   - EPYC 384 GiB DDR4 + Dual-NVMe: Pre-Faulted 189 GiB Engram + RewindBank + 128-tok RadixBlockCache + SWA Replay
 // Zero Python anywhere.
 
 #include "dsv41_runtime.hpp"
 #include "../src/dsv41_rarebal.hpp"
+#include "dsv41_kolmogorov_tree_verifier.hpp"
 #include "dsv41_think_loop_guard.hpp"
+#include "dsv41_tree_spec.hpp"
 
 #include <immintrin.h>
 #include <sys/stat.h>
@@ -62,7 +64,14 @@ static constexpr int kMi50BackboneExp   = 216;   // [0..215] on 3x MI50 TP3, [21
 static constexpr int kMtpExperts        = 128;
 static constexpr int kMtpTopk           = 3;
 static constexpr float kRouteScale      = 1.5f;
-static constexpr int kDSparkBlockSize   = 5;     // M = 1 + 5 = 6 verify tokens!
+static constexpr int kDSparkBlockSize   = 5;     // M = 1 + 5 = 6 chain verify tokens!
+static constexpr int kTree8NumNodes     = 8;     // Width-[3,2,1,1] causal draft tree (M = 8 verify nodes)
+static constexpr uint64_t kTree8AncMask64     = 0x9345231309050301ULL;
+static constexpr uint32_t kTree8DepthNibbles  = 0x32221110u;
+static constexpr uint32_t kTree8ParentNibbles = 0x4211000Fu;
+static constexpr float    kTree8Top1ConfThresh = 0.72f;
+static constexpr std::array<int32_t, kTree8NumNodes>  kTree8Parents = {-1, 0, 0, 0, 1, 1, 2, 4};
+static constexpr std::array<uint32_t, kTree8NumNodes> kTree8Depths  = {0u, 1u, 1u, 1u, 2u, 2u, 2u, 3u};
 static constexpr int32_t kDSparkNoiseId = 128799;
 static constexpr int kMarkovRank        = 256;
 static constexpr int kMaxChunkM         = 512;   // Dumitrescu MR vs MP block law: M=512 fits P150A L1 MR!
@@ -451,6 +460,7 @@ struct Dsv41Runtime::Impl {
     Dsv41EngramEngine engram_cpu;
     Dsv41P150ShmMapping p150_shm;
     bool p150_shm_pinned = false;
+    std::array<uint16_t*, kTpSize> d_p150_shm_y_out_bf16{nullptr, nullptr, nullptr};
     uint32_t p150_seq_counter = 0u;
     HostRingAllReduceSlot* h_ar_ring = nullptr;
     uint64_t host_ar_seq = 0u;
@@ -503,7 +513,8 @@ struct Dsv41Runtime::Impl {
     std::vector<Mi50RoutedPair> mi50_sorted_pairs_buf;
     std::vector<int32_t> mi50_active_exp_buf;
     std::vector<int32_t> mi50_csr_buf;
-    std::array<float, 6 * kVocabSize> host_full_logits{};
+    std::array<float, 8 * kVocabSize> host_full_logits{};
+    std::vector<double> host_tree_probs_f64;
     std::array<std::vector<float>, kDSparkBlockSize> draft_q_probs;
     std::array<float, kDSparkBlockSize> draft_q_selected{};
     std::array<bool, kDSparkBlockSize> draft_q_materialized{};
@@ -598,6 +609,7 @@ struct Dsv41Runtime::Impl {
             }
         }
         if (p150_shm_pinned && p150_shm.ptr) {
+            d_p150_shm_y_out_bf16.fill(nullptr);
             (void)hipHostUnregister(p150_shm.ptr);
             p150_shm_pinned = false;
         }
@@ -1188,13 +1200,18 @@ struct Dsv41Runtime::Impl {
         int chunk_swa_floor,
         bool commit_window_immediately,
         bool skip_global_kv_write,
-        int& io_shared_k_comp)
+        int& io_shared_k_comp,
+        uint64_t tree_anc_mask64 = 0ULL,
+        uint32_t tree_depth_nibbles = 0u,
+        uint32_t tree_parent_nibbles = 0u)
     {
         const int ratio = kCompressRatios[l];
         const int kv_slot = kv_source_slot_for_layer(l);
         int n_lat = 0;
         const int lat_slot_base = (ratio > 0) ? (start_pos / ratio) : 0;
-        const int T_comp = (ratio > 0) ? ((start_pos + M) / ratio) : 0;
+        const int T_comp = (ratio > 0)
+            ? ((tree_anc_mask64 != 0ULL) ? (lat_slot_base + M) : ((start_pos + M) / ratio))
+            : 0;
         const int K_comp = (ratio > 0) ? std::min(kIndexTopk, T_comp) : 0;
         const int swa_floor = std::max(chunk_swa_floor, (l >= 20) ? win_valid_from_20_39 : 0);
         sync_tp0_if_profiling();
@@ -1212,13 +1229,15 @@ struct Dsv41Runtime::Impl {
             launch_fp8_gemm(c.d_fp8_act, c.d_fp8_scale, b.d_wqkv_w, b.d_wqkv_s, c.d_qkv_bf16, nullptr,
                             M, kQkvConcatRows, kDim, false, false, c.stream);
             launch_split_qkv_norm_rope_quant(c.d_qkv_bf16, b.d_q_norm, b.d_kv_norm, use_comp_yarn,
-                                             c.d_qr_bf16, c.d_kv_cur_bf16, M, start_pos, kNormEps, c.stream);
+                                             c.d_qr_bf16, c.d_kv_cur_bf16, M, start_pos, kNormEps, c.stream,
+                                             tree_anc_mask64, tree_depth_nibbles);
 
             // Quantize qr [M, 1280] (reused by wq_b AND indexer.wq_b!)
             launch_act_quant_ue8m0_32(c.d_qr_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr, M, kQLoraRank, false, c.stream);
             launch_fp8_gemm(c.d_fp8_act, c.d_fp8_scale, b.d_wq_b_w, b.d_wq_b_s, c.d_q_bf16, nullptr,
                             M, b.h_cnt * kHeadDim, kQLoraRank, false, false, c.stream);
-            launch_rope_tail64_bf16(c.d_q_bf16, use_comp_yarn, M, b.h_cnt, kHeadDim, start_pos, 1, false, c.stream);
+            launch_rope_tail64_bf16(c.d_q_bf16, use_comp_yarn, M, b.h_cnt, kHeadDim, start_pos, 1, false, c.stream,
+                                    tree_anc_mask64, tree_depth_nibbles);
 
             // Compressor pre-RoPE latent (skipped during SWA Bounded Replay when Global KV already restored!)
             if (b.is_kv_source && !skip_global_kv_write) {
@@ -1238,9 +1257,17 @@ struct Dsv41Runtime::Impl {
                                                        size_t(M) * kHeadDim * sizeof(float),
                                                        hipMemcpyDeviceToDevice, c.stream));
                     }
-                    n_lat = launch_compressor_r2_pool(c.d_comp_kv_tmp_f32, c.d_comp_score_tmp_f32,
-                                                      c.d_comp_kv_state[r2_idx], c.d_comp_score_state[r2_idx],
-                                                      c.d_latent_bf16, start_pos, M, c.stream);
+                    if (tree_anc_mask64 != 0ULL) {
+                        launch_compressor_r2_tree_pool(c.d_comp_kv_tmp_f32, c.d_comp_score_tmp_f32,
+                                                       c.d_comp_kv_state[r2_idx], c.d_comp_score_state[r2_idx],
+                                                       c.d_latent_bf16, start_pos, M,
+                                                       tree_depth_nibbles, tree_parent_nibbles, c.stream);
+                        n_lat = M;
+                    } else {
+                        n_lat = launch_compressor_r2_pool(c.d_comp_kv_tmp_f32, c.d_comp_score_tmp_f32,
+                                                          c.d_comp_kv_state[r2_idx], c.d_comp_score_state[r2_idx],
+                                                          c.d_latent_bf16, start_pos, M, c.stream);
+                    }
                     if (n_lat > 0) {
                         launch_rmsnorm_bf16(c.d_latent_bf16, b.d_comp_norm, c.d_latent_bf16, n_lat, kHeadDim, kNormEps, c.stream);
                     }
@@ -1255,7 +1282,9 @@ struct Dsv41Runtime::Impl {
                     launch_rmsnorm_bf16(c.d_idx_k_tmp_bf16, b.d_idx_k_norm, c.d_idx_k_tmp_bf16,
                                         n_lat, kIndexHeadDim, kNormEps, c.stream);
                     launch_rope_tail64_bf16(c.d_idx_k_tmp_bf16, true,
-                                            n_lat, 1, kIndexHeadDim, lat_slot_base * ratio, ratio, false, c.stream);
+                                            n_lat, 1, kIndexHeadDim,
+                                            (tree_anc_mask64 != 0ULL) ? start_pos : (lat_slot_base * ratio),
+                                            ratio, false, c.stream, tree_anc_mask64, tree_depth_nibbles);
                     launch_pack_index_k_fp4_ue8m0_32(c.d_idx_k_tmp_bf16,
                                                      c.d_index_k_fp4[kv_slot], c.d_index_k_ue8m0[kv_slot],
                                                      lat_slot_base, n_lat, c.stream);
@@ -1264,7 +1293,8 @@ struct Dsv41Runtime::Impl {
                     launch_fp8_gemm(c.d_fp8_act, c.d_fp8_scale, b.d_idx_wq_b_w, b.d_idx_wq_b_s, c.d_idx_q_bf16, nullptr,
                                     M, b.ih_cnt * kIndexHeadDim, kQLoraRank, false, false, c.stream);
                     launch_rope_tail64_bf16(c.d_idx_q_bf16, true,
-                                            M, b.ih_cnt, kIndexHeadDim, start_pos, 1, false, c.stream);
+                                            M, b.ih_cnt, kIndexHeadDim, start_pos, 1, false, c.stream,
+                                            tree_anc_mask64, tree_depth_nibbles);
                     launch_fp4_quant_dequant_ue8m0_32_inplace(c.d_idx_q_bf16, M * b.ih_cnt, kIndexHeadDim, c.stream);
                     launch_bf16_gemm(c.d_x_bf16, b.d_idx_weights_proj, c.d_idx_weights_bf16, nullptr,
                                      M, b.ih_cnt, kDim, false, c.stream);
@@ -1314,7 +1344,10 @@ struct Dsv41Runtime::Impl {
                             cand_ptr,
                             c.cand_block_stride,
                             c.d_comp_topk_idxs + size_t(m0) * size_t(K_comp),
-                            sub_m, T_comp, start_pos + m0, ratio, mode, K_comp, c.stream);
+                            sub_m, T_comp,
+                            (tree_anc_mask64 != 0ULL) ? start_pos : (start_pos + m0),
+                            ratio, mode, K_comp, c.stream,
+                            tree_anc_mask64, tree_depth_nibbles, m0);
                     }
                 }
                 sync_tp0_if_profiling();
@@ -1333,7 +1366,9 @@ struct Dsv41Runtime::Impl {
 
             if (b.is_kv_source && !skip_global_kv_write && n_lat > 0) {
                 launch_rope_tail64_bf16(c.d_latent_bf16, true,
-                                        n_lat, 1, kHeadDim, lat_slot_base * ratio, ratio, false, c.stream);
+                                        n_lat, 1, kHeadDim,
+                                        (tree_anc_mask64 != 0ULL) ? start_pos : (lat_slot_base * ratio),
+                                        ratio, false, c.stream, tree_anc_mask64, tree_depth_nibbles);
                 launch_pack_compress_kv_fp4_e4m3_16(c.d_latent_bf16, c.d_comp_kv_fp4[kv_slot], c.d_comp_kv_e4m3[kv_slot],
                                                     lat_slot_base, n_lat, c.stream);
             }
@@ -1349,7 +1384,8 @@ struct Dsv41Runtime::Impl {
                 (active_k_comp > 0) ? c.d_comp_topk_idxs : nullptr,
                 active_k_comp,
                 (M <= 8) ? c.d_part_f32 : nullptr,
-                c.d_o_bf16, M, b.h_cnt, c.stream);
+                c.d_o_bf16, M, b.h_cnt, c.stream,
+                tree_anc_mask64, tree_depth_nibbles);
 
             if (commit_window_immediately) {
                 write_ring_window_gpu(tp, l, c.d_kv_cur_bf16, start_pos, M);
@@ -1371,7 +1407,8 @@ struct Dsv41Runtime::Impl {
             const bool use_comp_yarn = (ratio > 0);
 
             // Inverse RoPE on tail 64 dims of o + grouped wo_a + wo_b
-            launch_rope_tail64_bf16(c.d_o_bf16, use_comp_yarn, M, b.h_cnt, kHeadDim, start_pos, 1, true, c.stream);
+            launch_rope_tail64_bf16(c.d_o_bf16, use_comp_yarn, M, b.h_cnt, kHeadDim, start_pos, 1, true, c.stream,
+                                    tree_anc_mask64, tree_depth_nibbles);
             launch_act_quant_ue8m0_32(c.d_o_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr,
                                       M, b.g_cnt * 4096, false, c.stream);
             launch_fp8_grouped_wo_a(c.d_fp8_act, c.d_fp8_scale, b.d_wo_a_w, b.d_wo_a_s,
@@ -1474,7 +1511,7 @@ struct Dsv41Runtime::Impl {
                 } else {
                     launch_mi50_routed_hlut2_grouped(
                         c.d_x_rot_f16, c.d_active_experts, c.d_csr_offsets, c.d_routed_pairs,
-                        b.n_routed_experts, P,
+                        M, b.n_routed_experts, P,
                         b.d_hlut2_gate_codes, b.d_hlut2_gate_sc, b.d_hlut2_gate_cent,
                         b.d_hlut2_up_codes,   b.d_hlut2_up_sc,   b.d_hlut2_up_cent,
                         b.d_hlut2_down_codes, b.d_hlut2_down_sc, b.d_hlut2_down_cent,
@@ -1502,8 +1539,8 @@ struct Dsv41Runtime::Impl {
             return;
         }
 
-        // Backbone MoE: give tp=0 router_stream 100% CU exclusivity first (while tp=1,2 start shared_experts),
-        // wake P150A immediately upon ev_router_done with pre-rotated BF16 from c0.d_part_bf16!
+        // Wave 7A Backbone MoE: tp=0 router_stream gets 100% CU exclusivity first; NO MI50 shared/routed
+        // starts until the P150A [216..383] doorbell is armed strictly after ev_router_done.
         {
             DSV41_HIP_CHECK(hipSetDevice(0));
             auto& c0 = ctx[0];
@@ -1530,19 +1567,6 @@ struct Dsv41Runtime::Impl {
                                                hipMemcpyDeviceToHost, c0.router_stream));
             }
             DSV41_HIP_CHECK(hipEventRecord(c0.ev_router_done, c0.router_stream));
-        }
-
-        for (int tp = 1; tp < 3; ++tp) {
-            DSV41_HIP_CHECK(hipSetDevice(tp));
-            auto& c = ctx[tp];
-            const auto& b = c.blocks[block_id];
-            launch_act_quant_ue8m0_32(c.d_x_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr, M, kDim, false, c.stream);
-            launch_fp8_gemm(c.d_fp8_act, c.d_fp8_scale, b.d_sh_w13_w, b.d_sh_w13_s, c.d_sh_gateup_bf16, nullptr,
-                            M, 2 * kSharedInterTp, kDim, false, false, c.stream);
-            launch_swiglu10_split_quant_ue8m0_32(c.d_sh_gateup_bf16, c.d_fp8_act, c.d_fp8_scale,
-                                                 M, kSharedInterTp, c.stream);
-            launch_fp8_gemm(c.d_fp8_act, c.d_fp8_scale, b.d_sh_w2_w, b.d_sh_w2_s, nullptr, c.d_moe_part_f32,
-                            M, kDim, kSharedInterTp, true, false, c.stream);
         }
 
         // Wait ONLY on tp=0's exclusive router_stream event so we immediately post to P150A!
@@ -1582,7 +1606,8 @@ struct Dsv41Runtime::Impl {
             }
         }
 
-        // Kick off 2x Blackhole P150A asynchronously over /dev/shm BEFORE launching tp=0 shared_experts!
+        // Wave 7A: Kick off P150A [216..383] doorbell FIRST over /dev/shm, strictly BEFORE
+        // ANY MI50 shared SwiGLU, routed [0..215] HLUT2, or CpuTailPool singleton peel.
         if (any_p150 && shm) {
             if (!p150_shm_pinned) {
                 std::memcpy(shm->x_in_bf16, ctx[0].h_x_moe_bf16, size_t(M) * kDim * sizeof(uint16_t));
@@ -1595,26 +1620,28 @@ struct Dsv41Runtime::Impl {
             shm->req_seq.store(posted_p150_seq, std::memory_order_release);
         }
 
-        // Now launch tp=0 shared_experts while P150A and tp=1,2 are already running (WHT128 already fused in ffn_norm)!
-        {
-            DSV41_HIP_CHECK(hipSetDevice(0));
-            auto& c0 = ctx[0];
-            const auto& bm0 = c0.blocks[block_id];
-            launch_act_quant_ue8m0_32(c0.d_x_bf16, c0.d_fp8_act, c0.d_fp8_scale, nullptr, M, kDim, false, c0.stream);
-            launch_fp8_gemm(c0.d_fp8_act, c0.d_fp8_scale, bm0.d_sh_w13_w, bm0.d_sh_w13_s, c0.d_sh_gateup_bf16, nullptr,
-                            M, 2 * kSharedInterTp, kDim, false, false, c0.stream);
-            launch_swiglu10_split_quant_ue8m0_32(c0.d_sh_gateup_bf16, c0.d_fp8_act, c0.d_fp8_scale,
-                                                 M, kSharedInterTp, c0.stream);
-            launch_fp8_gemm(c0.d_fp8_act, c0.d_fp8_scale, bm0.d_sh_w2_w, bm0.d_sh_w2_s, nullptr, c0.d_moe_part_f32,
-                            M, kDim, kSharedInterTp, true, false, c0.stream);
+        // Wave 7A: P150A doorbell is armed!
+        // 1. Launch MI50 shared SwiGLU FIRST (`accumulate_f32 = false`) to initialize `c.d_moe_part_f32`
+        //    on all 3 ranks BEFORE `[0..215]` HLUT2 `atomicAdd`s onto `c.d_moe_part_f32`!
+        for (int tp = 0; tp < 3; ++tp) {
+            DSV41_HIP_CHECK(hipSetDevice(tp));
+            auto& c = ctx[tp];
+            const auto& b = c.blocks[block_id];
+            launch_act_quant_ue8m0_32(c.d_x_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr, M, kDim, false, c.stream);
+            launch_fp8_gemm(c.d_fp8_act, c.d_fp8_scale, b.d_sh_w13_w, b.d_sh_w13_s, c.d_sh_gateup_bf16, nullptr,
+                            M, 2 * kSharedInterTp, kDim, false, false, c.stream);
+            launch_swiglu10_split_quant_ue8m0_32(c.d_sh_gateup_bf16, c.d_fp8_act, c.d_fp8_scale,
+                                                 M, kSharedInterTp, c.stream);
+            launch_fp8_gemm(c.d_fp8_act, c.d_fp8_scale, b.d_sh_w2_w, b.d_sh_w2_s, nullptr, c.d_moe_part_f32,
+                            M, kDim, kSharedInterTp, true, false, c.stream);
         }
         if (sync_timers) {
             sync_tp0_if_profiling();
             sub_moe_sh_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_moe0).count();
         }
 
+        // 2. Launch MI50 HLUT2 routed experts [0..215] (`atomicAdd` onto `c.d_moe_part_f32`) overlapping P150A!
         const auto t_hlut0 = std::chrono::steady_clock::now();
-        // Launch MI50 HLUT2 routed experts [0..215] on all 3 MI50s concurrently with P150A!
         const int P = static_cast<int>(mi50_pairs_buf.size());
         if (P > 0) {
             std::array<int, 256> counts{};
@@ -1669,7 +1696,7 @@ struct Dsv41Runtime::Impl {
                                                    hipMemcpyHostToDevice, c.stream));
                     launch_mi50_routed_hlut2_grouped(
                         c.d_x_rot_f16, c.d_active_experts, c.d_csr_offsets, c.d_routed_pairs,
-                        num_act, P,
+                        M, num_act, P,
                         b.d_hlut2_gate_codes, b.d_hlut2_gate_sc, b.d_hlut2_gate_cent,
                         b.d_hlut2_up_codes,   b.d_hlut2_up_sc,   b.d_hlut2_up_cent,
                         b.d_hlut2_down_codes, b.d_hlut2_down_sc, b.d_hlut2_down_cent,
@@ -1685,8 +1712,16 @@ struct Dsv41Runtime::Impl {
                 sync_tp0_if_profiling();
                 sub_moe_hlut_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_hlut0).count();
             }
-            const uint16_t* p150_ptrs[3] = {nullptr, nullptr, nullptr};
-            if (any_p150 && shm) {
+            if (any_p150 && shm && d_p150_shm_y_out_bf16[0] != nullptr) {
+                // Wave 7A Zero-SDMA Split HostRing: upload MI50 FP32 partials into coherent DDR4 WHILE P150A finishes,
+                // then once shm->resp_seq completes, read mapped shm->y_out_bf16 directly via system-scope atomic loads!
+                const uint64_t ar_seq = ++host_ar_seq;
+                HostRingAllReduceSlot* ar_slot = &h_ar_ring[(ar_seq - 1ULL) & (kHostArRingSlots - 1ULL)];
+                for (int tp = 0; tp < 3; ++tp) {
+                    DSV41_HIP_CHECK(hipSetDevice(tp));
+                    launch_host_ring_upload_f32(ctx[tp].d_moe_part_f32, ar_slot, tp, ar_seq, M, ctx[tp].stream);
+                }
+
                 const auto tw0 = std::chrono::steady_clock::now();
                 while (shm->resp_seq.load(std::memory_order_acquire) != posted_p150_seq) {
                     dsv41_cpu_relax();
@@ -1697,21 +1732,51 @@ struct Dsv41Runtime::Impl {
                     throw std::runtime_error("p150_dsv41_worker returned error status " + std::to_string(shm->status));
                 }
                 accum_p150_dev_ms += double(shm->last_device_ns) * 1e-6;
+
+                const auto t_mar0 = std::chrono::steady_clock::now();
                 for (int tp = 0; tp < 3; ++tp) {
                     DSV41_HIP_CHECK(hipSetDevice(tp));
                     auto& c = ctx[tp];
-                    DSV41_HIP_CHECK(hipMemcpyAsync(c.d_p150_out_bf16, shm->y_out_bf16,
-                                                   moe_elems * sizeof(uint16_t),
-                                                   hipMemcpyHostToDevice, c.stream));
-                    p150_ptrs[tp] = c.d_p150_out_bf16;
+                    launch_host_ring_finish_f32_hc_post(
+                        c.d_moe_part_f32, d_p150_shm_y_out_bf16[tp],
+                        c.d_h_bf16[in_h_slot], c.d_post_mix_f32, c.d_comb_mix_f32, c.d_h_bf16[out_h_slot],
+                        ar_slot, tp, ar_seq, M, c.stream);
                 }
-            }
-            const auto t_mar0 = std::chrono::steady_clock::now();
-            all_reduce_tp3_f32_hc_post(ctx[0].d_moe_part_f32, ctx[1].d_moe_part_f32, ctx[2].d_moe_part_f32,
-                                       p150_ptrs[0], p150_ptrs[1], p150_ptrs[2],
-                                       in_h_slot, out_h_slot, M);
-            if (sync_timers) {
-                sub_moe_ar_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_mar0).count();
+                sync_tp0_if_profiling();
+                const double ar_dt = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_mar0).count();
+                accum_allreduce_ms += ar_dt;
+                if (sync_timers) {
+                    sub_moe_ar_ms += ar_dt;
+                }
+            } else {
+                const uint16_t* p150_ptrs[3] = {nullptr, nullptr, nullptr};
+                if (any_p150 && shm) {
+                    const auto tw0 = std::chrono::steady_clock::now();
+                    while (shm->resp_seq.load(std::memory_order_acquire) != posted_p150_seq) {
+                        dsv41_cpu_relax();
+                    }
+                    p150_wait_this_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw0).count();
+                    accum_p150_wait_ms += p150_wait_this_ms;
+                    if (shm->status != 0) {
+                        throw std::runtime_error("p150_dsv41_worker returned error status " + std::to_string(shm->status));
+                    }
+                    accum_p150_dev_ms += double(shm->last_device_ns) * 1e-6;
+                    for (int tp = 0; tp < 3; ++tp) {
+                        DSV41_HIP_CHECK(hipSetDevice(tp));
+                        auto& c = ctx[tp];
+                        DSV41_HIP_CHECK(hipMemcpyAsync(c.d_p150_out_bf16, shm->y_out_bf16,
+                                                       moe_elems * sizeof(uint16_t),
+                                                       hipMemcpyHostToDevice, c.stream));
+                        p150_ptrs[tp] = c.d_p150_out_bf16;
+                    }
+                }
+                const auto t_mar0 = std::chrono::steady_clock::now();
+                all_reduce_tp3_f32_hc_post(ctx[0].d_moe_part_f32, ctx[1].d_moe_part_f32, ctx[2].d_moe_part_f32,
+                                           p150_ptrs[0], p150_ptrs[1], p150_ptrs[2],
+                                           in_h_slot, out_h_slot, M);
+                if (sync_timers) {
+                    sub_moe_ar_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_mar0).count();
+                }
             }
         } else {
             for (int tp = 0; tp < 3; ++tp) {
@@ -1830,7 +1895,12 @@ struct Dsv41Runtime::Impl {
         bool commit_window_immediately,
         bool capture_dspark_hidden,
         int chunk_swa_floor = 0,
-        bool skip_global_kv_write = false)
+        bool skip_global_kv_write = false,
+        uint64_t tree_anc_mask64 = 0ULL,
+        uint32_t tree_depth_nibbles = 0u,
+        uint32_t tree_parent_nibbles = 0u,
+        const int32_t* tree_parents = nullptr,
+        const uint32_t* tree_depths = nullptr)
     {
         if (!skip_global_kv_write && M > 0) {
             const int b_first = start_pos / kRadixBlockTokens;
@@ -1841,7 +1911,11 @@ struct Dsv41Runtime::Impl {
         }
 
         // 1. Compute CPU Engram 4-gram hashes & kick off async DDR4 gather + PCIe H2D for BOTH L1 and L14!
-        engram_cpu.compute_hashes(token_ids, M, start_pos, nullptr, engram_hashes_buf);
+        if (tree_anc_mask64 != 0ULL && tree_parents != nullptr && tree_depths != nullptr) {
+            engram_cpu.compute_hashes_tree(token_ids, tree_parents, tree_depths, M, start_pos, engram_hashes_buf);
+        } else {
+            engram_cpu.compute_hashes(token_ids, M, start_pos, nullptr, engram_hashes_buf);
+        }
         enqueue_engram_prefetch(0, 0, M);
         enqueue_engram_prefetch(1, 1, M);
 
@@ -1899,7 +1973,8 @@ struct Dsv41Runtime::Impl {
             }
 
             forward_backbone_attention(l, start_pos, M, h_slot, next_slot, chunk_swa_floor,
-                                       commit_window_immediately, skip_global_kv_write, shared_k_comp);
+                                       commit_window_immediately, skip_global_kv_write, shared_k_comp,
+                                       tree_anc_mask64, tree_depth_nibbles, tree_parent_nibbles);
 
             // hc_mixes & fused hc_pre_rmsnorm + register WHT128 before MoE
             for (int tp = 0; tp < 3; ++tp) {
@@ -1990,6 +2065,173 @@ struct Dsv41Runtime::Impl {
         for (int tp = 0; tp < 3; ++tp) {
             DSV41_HIP_CHECK(hipSetDevice(tp));
             DSV41_HIP_CHECK(hipStreamSynchronize(ctx[tp].stream));
+        }
+    }
+
+    // Alias-free two-kernel GPU commit of ONLY the verified root-to-leaf path `accepted_nodes[0..accepted_A-1]`
+    // across all 40 SWA rings, Global FP4/UE8M0 KV + Indexer K (slots 0..3), r=2 compressor state,
+    // DSpark target hidden rows [8..8+accepted_A-1], and CPU Engram `seq_cache_`!
+    void commit_verified_tree_backbone_state(
+        int start_pos,
+        int accepted_A,
+        const uint32_t* accepted_nodes,
+        const int32_t* accepted_tokens)
+    {
+        uint32_t acc_nodes_nibbles = 0u;
+        for (int d = 0; d < accepted_A; ++d) {
+            acc_nodes_nibbles |= ((accepted_nodes[d] & 0xFu) << (4 * d));
+        }
+        for (int tp = 0; tp < 3; ++tp) {
+            DSV41_HIP_CHECK(hipSetDevice(tp));
+            auto& c = ctx[tp];
+            launch_commit_tree_win_kv_and_hidden(
+                c.d_win_kv_slab, c.d_last_win_kv_slab, c.d_target_mean_bf16,
+                start_pos, accepted_A, acc_nodes_nibbles, c.stream);
+            launch_commit_tree_global_kv_and_r2(
+                c.d_comp_kv_fp4[0], c.d_comp_kv_e4m3[0], c.d_index_k_fp4[0], c.d_index_k_ue8m0[0],
+                c.d_comp_kv_fp4[1], c.d_comp_kv_e4m3[1], c.d_index_k_fp4[1], c.d_index_k_ue8m0[1],
+                c.d_comp_kv_fp4[2], c.d_comp_kv_e4m3[2], c.d_index_k_fp4[2], c.d_index_k_ue8m0[2],
+                c.d_comp_kv_fp4[3], c.d_comp_kv_e4m3[3], c.d_index_k_fp4[3], c.d_index_k_ue8m0[3],
+                c.d_comp_kv_state[0], c.d_comp_score_state[0], c.d_comp_kv_last[0], c.d_comp_score_last[0],
+                c.d_comp_kv_state[1], c.d_comp_score_state[1], c.d_comp_kv_last[1], c.d_comp_score_last[1],
+                c.d_comp_kv_state[2], c.d_comp_score_state[2], c.d_comp_kv_last[2], c.d_comp_score_last[2],
+                start_pos, accepted_A, acc_nodes_nibbles, c.stream);
+        }
+        engram_cpu.commit_accepted_tokens(accepted_tokens, accepted_A, start_pos);
+        for (int tp = 0; tp < 3; ++tp) {
+            DSV41_HIP_CHECK(hipSetDevice(tp));
+            DSV41_HIP_CHECK(hipStreamSynchronize(ctx[tp].stream));
+        }
+    }
+
+    // Fast AVX2 exact temperature + top-p Borel support filter writing IEEE FP64 target distribution (sum == 1.0)
+    static void build_probs_f64_fast(
+        const float* logits,
+        float temperature,
+        float top_p,
+        double* __restrict__ p_out)
+    {
+        if (temperature <= 1e-5f) {
+            int32_t best_id = 0;
+            float best_val = logits[0];
+            for (int i = 1; i < kVocabSize; ++i) {
+                if (logits[i] > best_val) {
+                    best_val = logits[i];
+                    best_id = i;
+                }
+            }
+            std::memset(p_out, 0, size_t(kVocabSize) * sizeof(double));
+            p_out[best_id] = 1.0;
+            return;
+        }
+
+        thread_local std::vector<float> probs_f32(kVocabSize);
+        float* __restrict__ probs = probs_f32.data();
+        const float inv_t = 1.0f / temperature;
+        float max_l = logits[0];
+        for (int i = 1; i < kVocabSize; ++i) {
+            if (logits[i] > max_l) max_l = logits[i];
+        }
+
+        double sum_exp = 0.0;
+        {
+            const __m256 v_max   = _mm256_set1_ps(max_l);
+            const __m256 v_inv_t = _mm256_set1_ps(inv_t);
+            const __m256 v_lo    = _mm256_set1_ps(-88.0f);
+            const __m256 v_hi    = _mm256_set1_ps(88.0f);
+            const __m256 v_l2e   = _mm256_set1_ps(1.4426950408889634f);
+            const __m256 v_c1    = _mm256_set1_ps(-0.693145751953125f);
+            const __m256 v_c2    = _mm256_set1_ps(-1.428606765330187045e-6f);
+            const __m256 v_p0    = _mm256_set1_ps(1.9875691500E-4f);
+            const __m256 v_p1    = _mm256_set1_ps(1.3981999507E-3f);
+            const __m256 v_p2    = _mm256_set1_ps(8.3334519073E-3f);
+            const __m256 v_p3    = _mm256_set1_ps(4.1665795894E-2f);
+            const __m256 v_p4    = _mm256_set1_ps(1.6666665459E-1f);
+            const __m256 v_p5    = _mm256_set1_ps(5.0000001201E-1f);
+            const __m256 v_one   = _mm256_set1_ps(1.0f);
+            const __m256i v_127  = _mm256_set1_epi32(127);
+
+            __m256d acc0 = _mm256_setzero_pd();
+            __m256d acc1 = _mm256_setzero_pd();
+            for (int i = 0; i < kVocabSize; i += 8) {
+                const __m256 vx_raw = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(logits + i), v_max), v_inv_t);
+                const __m256 mask   = _mm256_cmp_ps(vx_raw, v_lo, _CMP_GT_OQ);
+                const __m256 vx     = _mm256_min_ps(_mm256_max_ps(vx_raw, v_lo), v_hi);
+                const __m256 vn     = _mm256_round_ps(_mm256_mul_ps(vx, v_l2e), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                const __m256 vr     = _mm256_fmadd_ps(vn, v_c2, _mm256_fmadd_ps(vn, v_c1, vx));
+                __m256 vy = _mm256_fmadd_ps(v_p0, vr, v_p1);
+                vy = _mm256_fmadd_ps(vy, vr, v_p2);
+                vy = _mm256_fmadd_ps(vy, vr, v_p3);
+                vy = _mm256_fmadd_ps(vy, vr, v_p4);
+                vy = _mm256_fmadd_ps(vy, vr, v_p5);
+                vy = _mm256_fmadd_ps(vy, _mm256_mul_ps(vr, vr), _mm256_add_ps(vr, v_one));
+                const __m256i pow2n = _mm256_slli_epi32(_mm256_add_epi32(_mm256_cvtps_epi32(vn), v_127), 23);
+                const __m256 vp     = _mm256_and_ps(_mm256_mul_ps(vy, _mm256_castsi256_ps(pow2n)), mask);
+                _mm256_storeu_ps(probs + i, vp);
+                acc0 = _mm256_add_pd(acc0, _mm256_cvtps_pd(_mm256_castps256_ps128(vp)));
+                acc1 = _mm256_add_pd(acc1, _mm256_cvtps_pd(_mm256_extractf128_ps(vp, 1)));
+            }
+            alignas(32) double sbuf[4];
+            _mm256_store_pd(sbuf, _mm256_add_pd(acc0, acc1));
+            sum_exp = (sbuf[0] + sbuf[1]) + (sbuf[2] + sbuf[3]);
+        }
+        const double inv_sum_f64 = 1.0 / std::max(sum_exp, 1e-30);
+
+        if (top_p > 0.0f && top_p < 1.0f) {
+            thread_local std::vector<int32_t> cand;
+            cand.clear();
+            double cand_mass = 0.0;
+            for (int i = 0; i < kVocabSize; ++i) {
+                const double p = double(probs[i]) * inv_sum_f64;
+                probs[i] = float(p);
+                if (p > 1e-7) {
+                    cand.push_back(i);
+                    cand_mass += p;
+                }
+            }
+            if (cand_mass < double(top_p) || cand.empty()) {
+                cand.resize(kVocabSize);
+                std::iota(cand.begin(), cand.end(), 0);
+            }
+            std::sort(cand.begin(), cand.end(), [&](int32_t a, int32_t b) {
+                return (probs[a] != probs[b]) ? (probs[a] > probs[b]) : (a < b);
+            });
+
+            double cum = 0.0;
+            size_t keep_n = 0;
+            for (; keep_n < cand.size(); ++keep_n) {
+                cum += double(probs[cand[keep_n]]);
+                if (cum >= double(top_p)) {
+                    ++keep_n;
+                    break;
+                }
+            }
+            if (keep_n == 0 && !cand.empty()) {
+                keep_n = 1;
+                cum = double(probs[cand[0]]);
+            }
+
+            std::memset(p_out, 0, size_t(kVocabSize) * sizeof(double));
+            double exact_kept = 0.0;
+            for (size_t j = 0; j < keep_n; ++j) {
+                exact_kept += double(probs[cand[j]]);
+            }
+            const double renorm = 1.0 / std::max(exact_kept, 1e-30);
+            for (size_t j = 0; j < keep_n; ++j) {
+                p_out[cand[j]] = double(probs[cand[j]]) * renorm;
+            }
+            return;
+        }
+
+        double exact_sum = 0.0;
+        for (int i = 0; i < kVocabSize; ++i) {
+            const double p = double(probs[i]) * inv_sum_f64;
+            p_out[i] = p;
+            exact_sum += p;
+        }
+        const double renorm = 1.0 / std::max(exact_sum, 1e-30);
+        for (int i = 0; i < kVocabSize; ++i) {
+            p_out[i] *= renorm;
         }
     }
 
@@ -2356,7 +2598,8 @@ struct Dsv41Runtime::Impl {
         reset_kv();
     }
 
-    // Run 3-stage DSpark draft blocks (mtp_0..2) from `anchor_token` at `cur_pos` (zero staging, zero MoE host sync!)
+    // Run 3-stage DSpark draft blocks (mtp_0..2) from `anchor_token` at `cur_pos` (zero staging, zero MoE host sync!),
+    // with confidence-gated GPU-resident deterministic M=8 width-[3,2,1,1] causal-tree expansion when p_top1 < 0.72!
     int forward_dspark_draft(
         int32_t anchor_token,
         int cur_pos,
@@ -2364,8 +2607,13 @@ struct Dsv41Runtime::Impl {
         float top_p,
         float rep_penalty,
         std::mt19937_64& rng,
-        std::array<int32_t, kDSparkBlockSize>& out_drafts)
+        std::array<int32_t, kDSparkBlockSize>& out_drafts,
+        bool allow_tree8 = false,
+        int rem_budget = 0,
+        bool* out_used_tree8 = nullptr,
+        std::array<int32_t, kTree8NumNodes>* out_tree_tokens = nullptr)
     {
+        if (out_used_tree8) *out_used_tree8 = false;
         constexpr int B = kDSparkBlockSize;  // 5
         int32_t draft_in[B] = {anchor_token, kDSparkNoiseId, kDSparkNoiseId, kDSparkNoiseId, kDSparkNoiseId};
 
@@ -2447,7 +2695,8 @@ struct Dsv41Runtime::Impl {
             forward_block_moe(bid, B, next_slot, h_slot);
         }
 
-        // Base MTP head logits [5, vocab_rows] on GPU (also saves raw hc_pre in tp=0 d_sub_bf16 for ConfidenceHead!)
+        // Base MTP head logits [5, vocab_rows] on GPU (also saves raw hc_pre in tp=0 d_sub_bf16 for ConfidenceHead
+        // and preserves unmutated rows [1..2] at offset +8*vocab_rows for zero-alloc M=8 causal-tree top-B expansion!)
         for (int tp = 0; tp < 3; ++tp) {
             DSV41_HIP_CHECK(hipSetDevice(tp));
             auto& c = ctx[tp];
@@ -2456,6 +2705,12 @@ struct Dsv41Runtime::Impl {
                                        c.d_x_bf16, (tp == 0) ? c.d_sub_bf16 : nullptr, B, kNormEps, c.stream);
             launch_bf16_gemm(c.d_x_bf16, c.d_head_w, nullptr, c.d_logits_part_f32,
                              B, c.vocab_rows, kDim, true, c.stream);
+            if (allow_tree8 && rem_budget >= 4) {
+                DSV41_HIP_CHECK(hipMemcpyAsync(c.d_logits_part_f32 + 8u * size_t(c.vocab_rows),
+                                               c.d_logits_part_f32 + 1u * size_t(c.vocab_rows),
+                                               2u * size_t(c.vocab_rows) * sizeof(float),
+                                               hipMemcpyDeviceToDevice, c.stream));
+            }
         }
 
         // GPU-Resident 5-step DSparkMarkovHead + Sliding-1024 RepPenalty + Borel Two-Tier Top-p/Greedy Sampler + GPU ConfidenceHead
@@ -2486,6 +2741,7 @@ struct Dsv41Runtime::Impl {
         }
         ctrl->out_drafted_cnt = 0;
         ctrl->out_fallback_step = -1;
+        ctrl->out_root_top1_prob = -1.0f;
         std::atomic_thread_fence(std::memory_order_release);
 
         for (int i = 0; i < B; ++i) {
@@ -2525,6 +2781,63 @@ struct Dsv41Runtime::Impl {
         int drafted_cnt = 0;
         const int fb_step = ctrl->out_fallback_step;
         if (fb_step < 0) {
+            const float p_root_top1 = (ctrl->out_root_top1_prob >= 0.0f)
+                ? ctrl->out_root_top1_prob
+                : (1.0f / (1.0f + std::exp(-ctrl->out_conf_logits[0])));
+            if (allow_tree8 && out_used_tree8 && out_tree_tokens &&
+                rem_budget >= 4 &&
+                p_root_top1 < kTree8Top1ConfThresh &&
+                ctrl->out_drafts[0] != Dsv41SpecialTokens::kEos)
+            {
+                // High-entropy confidence gate fired (p_root_top1 < 0.72): extract GPU-resident deterministic
+                // width-[3,2,1,1] M=8 causal tree across all 3 MI50 ranks with 1 single stream sync (32 B D2H)!
+                ctrl->tree_tokens[0] = anchor_token;
+                std::atomic_thread_fence(std::memory_order_release);
+                for (int tp = 0; tp < 3; ++tp) {
+                    DSV41_HIP_CHECK(hipSetDevice(tp));
+                    auto& c = ctx[tp];
+                    const auto& m2 = c.blocks[kNumLayers + 2];
+                    const size_t vr = size_t(c.vocab_rows);
+
+                    // Stage 0: root top-3 {t1, t2, t3} from row 0 (already contains base_0 + markov_0 + rep_penalty)
+                    launch_dspark_tree_topk_tp3(
+                        ctrl, c.d_logits_part_f32, nullptr,
+                        dseq, 0, 1, 3, -1, -1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+
+                    // Markov GEMM (M=2) for t1 and t2 -> Stages 1 & 2 ({t4, t5} under t1, {t6} under t2)
+                    uint16_t* emb_t12 = c.d_markov_sum_bf16 + 8u * kMarkovRank;
+                    launch_dspark_prepare_tree_markov_emb(
+                        ctrl, h_markov_embed_mapped, emb_t12, dseq, 0, 2, c.stream);
+                    launch_bf16_gemm(emb_t12, m2.d_markov_head_w,
+                                     nullptr, c.d_markov_logits_f32,
+                                     2, c.vocab_rows, kMarkovRank, true, c.stream);
+                    launch_dspark_tree_topk_tp3(
+                        ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32,
+                        dseq, 1, 4, 2, 1, -1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                    launch_dspark_tree_topk_tp3(
+                        ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32 + vr,
+                        dseq, 2, 6, 1, 2, -1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+
+                    // Markov GEMM (M=1) for t4 -> Stage 3 ({t7} under t4)
+                    uint16_t* emb_t4 = c.d_markov_sum_bf16 + 10u * kMarkovRank;
+                    launch_dspark_prepare_tree_markov_emb(
+                        ctrl, h_markov_embed_mapped, emb_t4, dseq, 1, 1, c.stream);
+                    launch_bf16_gemm(emb_t4, m2.d_markov_head_w,
+                                     nullptr, c.d_markov_logits_f32 + 2u * vr,
+                                     1, c.vocab_rows, kMarkovRank, true, c.stream);
+                    launch_dspark_tree_topk_tp3(
+                        ctrl, c.d_logits_part_f32 + 9u * vr, c.d_markov_logits_f32 + 2u * vr,
+                        dseq, 3, 7, 1, 1, 4, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                }
+                DSV41_HIP_CHECK(hipSetDevice(0));
+                DSV41_HIP_CHECK(hipStreamSynchronize(ctx[0].stream));
+                for (int m = 0; m < kTree8NumNodes; ++m) {
+                    (*out_tree_tokens)[size_t(m)] = ctrl->tree_tokens[m];
+                }
+                *out_used_tree8 = true;
+                return kTree8NumNodes - 1;  // 7 drafted tree candidates (M = 8 verify nodes)
+            }
+
             drafted_cnt = std::max(1, std::min(B, int(ctrl->out_drafted_cnt)));
             if (temperature > 1e-5f) {
                 std::uniform_real_distribution<float> dist(0.0f, 1.0f);
@@ -3038,6 +3351,7 @@ void Dsv41Runtime::init(
     impl_->h_dspark_ctrl = static_cast<DsparkGpuSampleSlot*>(dspark_ctrl_ptr);
 
     impl_->gpu_slot_radix_keys.assign(size_t(max_seq_len / kRadixBlockTokens + 16), RadixKey128{});
+    impl_->host_tree_probs_f64.assign(size_t(kTree8NumNodes) * size_t(kVocabSize), 0.0);
     for (int b = 0; b < kDSparkBlockSize; ++b) {
         impl_->draft_q_probs[b].assign(kVocabSize, 0.0f);
     }
@@ -3129,9 +3443,16 @@ void Dsv41Runtime::init(
         throw std::runtime_error("Failed to attach to ready 40-layer p150_dsv41_worker on " + p150_shm_name);
     }
     impl_->p150_seq_counter = impl_->p150_shm.ptr->req_seq.load(std::memory_order_relaxed);
-    if (hipHostRegister(impl_->p150_shm.ptr, sizeof(*impl_->p150_shm.ptr), hipHostRegisterDefault) == hipSuccess) {
+    if (hipHostRegister(impl_->p150_shm.ptr, sizeof(*impl_->p150_shm.ptr), hipHostRegisterMapped) == hipSuccess) {
         impl_->p150_shm_pinned = true;
-        std::printf("[DSV41_RT] Pinned /dev/shm P150A mailbox (%zu KiB) for zero-copy SDMA!\n",
+        for (int tp = 0; tp < 3; ++tp) {
+            DSV41_HIP_CHECK(hipSetDevice(tp));
+            void* dp = nullptr;
+            DSV41_HIP_CHECK(hipHostGetDevicePointer(&dp, impl_->p150_shm.ptr, 0));
+            impl_->d_p150_shm_y_out_bf16[tp] = static_cast<decltype(impl_->p150_shm.ptr)>(dp)->y_out_bf16;
+        }
+        DSV41_HIP_CHECK(hipSetDevice(0));
+        std::printf("[DSV41_RT] Pinned & mapped /dev/shm P150A mailbox (%zu KiB) across 3x MI50 (zero-SDMA ring enabled)!\n",
                     sizeof(*impl_->p150_shm.ptr) / 1024u);
     } else {
         (void)hipGetLastError();
@@ -3596,8 +3917,9 @@ std::vector<int32_t> Dsv41Runtime::generate(
         return true;
     };
 
-    // 3. Decode Loop: 3-Stage DSpark Speculative Decoding (M <= 6) or Standard M=1 Fallback
+    // 3. Decode Loop: 3-Stage DSpark Speculative Decoding (M <= 6 Chain / M = 8 Causal Tree) or Standard M=1 Fallback
     std::uniform_real_distribution<float> uni01(0.0f, 1.0f);
+    std::uniform_real_distribution<double> uni01_f64(0.0, 1.0);
     std::vector<float> residual_probs(kVocabSize);
 
     while (keep_going && static_cast<int>(generated.size()) < params.max_new_tokens) {
@@ -3636,14 +3958,159 @@ std::vector<int32_t> Dsv41Runtime::generate(
             continue;
         }
 
-        // A. Draft B (1..5) candidate tokens using 3-stage DSpark on 3x MI50!
+        // A. Draft B (1..5) linear chain OR high-entropy M=8 width-[3,2,1,1] causal tree using 3-stage DSpark on 3x MI50!
+        bool used_tree8 = false;
+        std::array<int32_t, kTree8NumNodes> tree_verify_tokens{};
         const auto td0 = std::chrono::steady_clock::now();
         std::array<int32_t, kDSparkBlockSize> drafts{};
         int B = impl_->forward_dspark_draft(
-            cur_anchor, cur_pos, params.temperature, params.top_p, params.repetition_penalty, rng, drafts);
-        B = std::min(B, std::max(1, rem_budget - 1));
+            cur_anchor, cur_pos, params.temperature, params.top_p, params.repetition_penalty, rng, drafts,
+            /*allow_tree8=*/true, rem_budget, &used_tree8, &tree_verify_tokens);
         const auto td1 = std::chrono::steady_clock::now();
         out_stats.dec_dspark_ms += std::chrono::duration<double, std::milli>(td1 - td0).count();
+
+        if (used_tree8) {
+            out_stats.dspark_steps += 1;
+            out_stats.dspark_tree_steps += 1;
+            out_stats.dspark_drafted += 3;  // max root-to-leaf sequential draft depth = 3 (L in [1, 4])
+
+            // B_tree. Verify all M=8 causal-tree nodes in ONE backbone pass across 3x MI50 + 2x P150A!
+            const auto tb0 = std::chrono::steady_clock::now();
+            impl_->forward_backbone_chunk(
+                tree_verify_tokens.data(),
+                cur_pos,
+                kTree8NumNodes,
+                false,
+                kTree8NumNodes,
+                false,  // commit_window_immediately = false -> deferred alias-free tree commit!
+                true,   // capture_dspark_hidden = true -> rows [0..7] captured in d_target_mean_bf16!
+                0,
+                false,
+                kTree8AncMask64,
+                kTree8DepthNibbles,
+                kTree8ParentNibbles,
+                kTree8Parents.data(),
+                kTree8Depths.data()
+            );
+            const auto tb1 = std::chrono::steady_clock::now();
+            out_stats.dec_backbone_ms += std::chrono::duration<double, std::milli>(tb1 - tb0).count();
+
+            // C_tree. Lossless Kolmogorov Dirac causal-tree verification (TV <= 2e-16, strictly ancestor-only rep penalty!)
+            Dsv41SpecTree8 topo{};
+            (void)build_spec_tree_topology(
+                uint32_t(kTree8NumNodes),
+                uint32_t(cur_pos),
+                kTree8Parents.data(),
+                tree_verify_tokens.data(),
+                &topo
+            );
+
+            for (int u = 0; u < kTree8NumNodes; ++u) {
+                int32_t anc_toks[4]{};
+                int p = u;
+                while (p >= 0) {
+                    anc_toks[kTree8Depths[size_t(p)]] = tree_verify_tokens[size_t(p)];
+                    p = kTree8Parents[size_t(p)];
+                }
+                const size_t anc_len = size_t(kTree8Depths[size_t(u)] + 1u);
+                float* u_logits = impl_->host_full_logits.data() + size_t(u) * size_t(kVocabSize);
+                Impl::apply_rep_penalty_span(u_logits, impl_->cached_tokens, anc_toks, anc_len, params.repetition_penalty);
+                Impl::build_probs_f64_fast(
+                    u_logits,
+                    params.temperature,
+                    params.top_p,
+                    impl_->host_tree_probs_f64.data() + size_t(u) * size_t(kVocabSize)
+                );
+            }
+
+            std::array<double, kTree8NumNodes> u_draws{};
+            for (int d = 0; d < 4; ++d) {
+                u_draws[size_t(d)] = (params.temperature > 1e-5f) ? uni01_f64(rng) : 0.0;
+            }
+            const Dsv41TreeVerifyResult vr = verify_deterministic_tree_u01(
+                topo,
+                impl_->host_tree_probs_f64.data(),
+                size_t(kVocabSize),
+                u_draws.data()
+            );
+
+            int k_acc = 0;
+            bool hit_stop = false;
+            bool force_closed_in_burst = false;
+            ThinkGuardDecision burst_guard_dec{};
+            const int n_draft_acc = std::max(0, int(vr.num_emitted) - 1);
+
+            for (int d = 0; d < n_draft_acc; ++d) {
+                const int32_t d_tok = vr.emitted_tokens[size_t(d)];
+                ++k_acc;
+                out_stats.dspark_accepted += 1;
+                out_stats.dspark_tree_accepted += 1;
+                generated.push_back(d_tok);
+                if (d_tok == Dsv41SpecialTokens::kEos || (on_token && !on_token(d_tok))) {
+                    hit_stop = true;
+                    break;
+                }
+                const auto gd = observe_tok_with_guard(d_tok);
+                if (gd.action == ThinkGuardAction::kForceCloseThink) {
+                    force_closed_in_burst = true;
+                    burst_guard_dec = gd;
+                    break;
+                }
+            }
+
+            if (force_closed_in_burst) {
+                if (!execute_force_close_think(burst_guard_dec)) {
+                    break;
+                }
+                continue;
+            }
+
+            // D_tree. Commit exact `accepted_A = 1 + k_acc` verified root-to-leaf nodes to Backbone + MTP + Engram caches!
+            const auto tc0 = std::chrono::steady_clock::now();
+            out_stats.dec_sample_ms += std::chrono::duration<double, std::milli>(tc0 - tb1).count();
+            const int accepted_A = 1 + k_acc;
+            int32_t accepted_prefix_toks[4]{};
+            accepted_prefix_toks[0] = cur_anchor;
+            for (int d = 0; d < k_acc; ++d) {
+                accepted_prefix_toks[1 + d] = vr.emitted_tokens[size_t(d)];
+            }
+            impl_->commit_verified_tree_backbone_state(
+                cur_pos, accepted_A, vr.accepted_nodes.data(), accepted_prefix_toks);
+            impl_->update_mtp_window_from_target_hidden(cur_pos, accepted_A, 8);
+            const double commit_dt = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tc0).count();
+            impl_->sub_commit_ms += commit_dt;
+            out_stats.dec_backbone_ms += commit_dt;
+            for (int s = 0; s < accepted_A; ++s) {
+                impl_->cached_tokens.push_back(accepted_prefix_toks[s]);
+            }
+
+            if (hit_stop) {
+                out_stats.completion_tokens = static_cast<int>(generated.size());
+                break;
+            }
+
+            const int32_t bonus_or_resampled = vr.emitted_tokens[size_t(vr.num_emitted - 1u)];
+            if (bonus_or_resampled >= 0 && static_cast<int>(generated.size()) < params.max_new_tokens) {
+                generated.push_back(bonus_or_resampled);
+                out_stats.completion_tokens = static_cast<int>(generated.size());
+                cur_anchor = bonus_or_resampled;
+                if (bonus_or_resampled == Dsv41SpecialTokens::kEos || (on_token && !on_token(bonus_or_resampled))) {
+                    break;
+                }
+                const auto gd = observe_tok_with_guard(bonus_or_resampled);
+                if (gd.action == ThinkGuardAction::kForceCloseThink) {
+                    if (!execute_force_close_think(gd)) {
+                        break;
+                    }
+                }
+            } else {
+                out_stats.completion_tokens = static_cast<int>(generated.size());
+                break;
+            }
+            continue;
+        }
+
+        B = std::min(B, std::max(1, rem_budget - 1));
 
         std::array<int32_t, 1 + kDSparkBlockSize> verify_tokens{};
         verify_tokens[0] = cur_anchor;

@@ -3,6 +3,7 @@
 // Zero Python anywhere. Executes routed experts [216..383] (168 experts/layer x 40 layers, I=1152/card)
 // using Two-Phase cb_w_b8 SFPU Pre-Unpack + FP32 Dest Matmul + L1 SwiGLU(10.0) + L1 WHT128 + FABRIC_1D TP2 AllReduce.
 
+#include "dsv41_p150_l1.hpp"
 #include "dsv41_p150_shm.hpp"
 #include <cstdint>
 #include <memory>
@@ -16,7 +17,8 @@ public:
         const std::string& packed_p150_root,
         const std::string& kernels_dir,
         bool enable_trace = true,
-        const std::string& rarebal_overlay_path = "");
+        const std::string& rarebal_overlay_path = "",
+        uint32_t hot_l1_shards = P150_MAX_HOT_L1_SHARDS);
     ~P150Dsv41Engine();
 
     P150Dsv41Engine(const P150Dsv41Engine&) = delete;
