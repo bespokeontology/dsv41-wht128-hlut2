@@ -1,0 +1,61 @@
+{
+  "schema": "dsv41.canonical-engine.v1",
+  "id": "CANONICAL-DSV41-HLUT2-WAVE6C",
+  "releaseTag": "v1.0.0-wave6c",
+  "maintainer": "bespokeontology",
+  "coEngineeredWith": "Gemini (Google DeepMind)",
+  "repository": "https://github.com/bespokeontology/dsv41-wht128-hlut2",
+  "whitepaperPdf": "docs/WHT128_HLUT2_Blackhole_P150A_Whitepaper.pdf",
+  "releasedAt": "2026-11-12T00:00:00Z",
+  "status": "CANONICAL_PRODUCTION",
+  "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+  "totalParameters": "748.6B (559.7B Transformer MoE + 188.83 GiB External Engram N-Gram Memory)",
+  "leadHardware": "2x Tenstorrent Blackhole P150A (220 Tensix compute cores, 64 GiB GDDR6 MP + 2x 180 MB = 360 MB on-die Tensix L1 SRAM [234.48 MiB active MR], 4x 800G QSFP-DD FABRIC_1D TP2, 1x PCIe x4 host riser)",
+  "secondaryHardware": "3x AMD Instinct MI50 (96 GiB HBM2, Vega20 gfx906 TP3) + AMD EPYC (384 GiB DDR4 + Dual NVMe)",
+  "quantization": "WHT128-HLUT2 (2.125 bpw, 272 B/tile, 4352 B 16-subtile UInt32 superblocks) + Wave 6B 56-Expert TARQ RAREBAL-LDLQ Overlay + 8.01 bpw INT8 CSA2/Shared/DSpark + BF16/FP32 Embeddings/RMSNorm/mHC/Routers/LMHead + Bitwise-Exact 8.25 bpw FP8 E4M3 Engram",
+  "runtimePaths": {
+    "rootEnv": "$DSV41_ROOT",
+    "p150PackedShards": "$DSV41_ROOT/packed_p150",
+    "mi50PackedShards": "$DSV41_ROOT/packed_mi50",
+    "rarebalOverlayAsset": "hot_experts_rarebal.safetensors"
+  },
+  "rarebalOverlaySummary": {
+    "emittedTotalExperts": 56,
+    "emittedP150aExperts": 24,
+    "emittedP150aL1PinnedExperts": 8,
+    "untouchedBaseP150aL1PinnedHIdentity": 3,
+    "emittedMi50Experts": 20,
+    "emittedDsparkMtpExperts": 12,
+    "dualReceiptPassRate": "56/56 (100.0%)",
+    "snrGainDbRange": "+2.90090 to +6.14006 dB",
+    "extraMi50Hbm2Bytes": 0,
+    "overlayFileSizeBytes": 527197384
+  },
+  "wave6cThinkGuardSummary": {
+    "observerCpuNsPerToken": 45.94,
+    "logitOrRngMutation": false,
+    "statefulEvenAlignedReplay": "replay_start = max(0, (target_pos - 128) & ~1)",
+    "resetsR2CompressorState": true,
+    "reseedsMtpRingsRows": 128,
+    "inlineThinkEndStreamGuard": true,
+    "deepAuditTokensZeroFalsePositives": 26072
+  },
+  "verifiedTelemetry": {
+    "longContextPeakDsparkTokPerSec": "47.54 - 52.20 (tau = 5.66, 96.7% DSpark acc)",
+    "dsmlToolDecodeTokPerSec": "38.93 - 43.57 (tau = 4.40 - 5.08)",
+    "sustained10kThinkTokPerSec": "36.95 - 37.10 (+37.6% over H=I)",
+    "p150Moe40LayerMsPerStep": "53.64 - 62.31",
+    "p150TracedM1Ms": 0.78,
+    "p150SelfcheckParityCos": 1.0,
+    "hotLcpTokPerSec": "2.44B",
+    "crossSession144kSwitchMs": 72.26,
+    "warmRadixCacheTokPerSec": "107,556 - 184,914",
+    "warmEngramHydrationGBps": 248.98,
+    "contextWindow": 524288,
+    "maxOutputTokens": 131072,
+    "gfx906ZeroScratchKernels": "80/80",
+    "pcieBarPeerReads": 0,
+    "deviceTrigInstructions": 0,
+    "pythonFiles": 0
+  }
+}

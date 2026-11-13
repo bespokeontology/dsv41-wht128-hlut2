@@ -1,0 +1,25 @@
+# Model weights, binary shards, & overlays (distributed via GitHub Releases)
+*.safetensors
+*.bin
+*.gguf
+*.rblk
+
+# Build & compiler outputs
+build/
+bin/
+*.o
+*.s
+*.so
+*.a
+
+# Runtime logs, session dumps, & local configs
+*.log
+*.jsonl
+*.jsonl.zstd
+*.zip
+.env
+settings.yaml
+AGENTS.md
+logs/
+radix_cache_nvme0/
+radix_cache_nvme1/
