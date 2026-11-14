@@ -3,6 +3,7 @@
 // Zero Python anywhere. Supports /health, /v1/models, /v1/tokenize, and /v1/chat/completions
 // with streaming reasoning_content, content, DSML -> OpenAI tool_calls, and client disconnect abort.
 
+#include "dsv41_anthropic_messages.hpp"
 #include "dsv41_live_progress.hpp"
 #include "dsv41_runtime.hpp"
 
@@ -157,7 +158,7 @@ void send_json_response(int fd, int status, const std::string& status_text, cons
     oss << "HTTP/1.1 " << status << " " << status_text << "\r\n"
         << "Content-Type: application/json; charset=utf-8\r\n"
         << "Access-Control-Allow-Origin: *\r\n"
-        << "Access-Control-Allow-Headers: *\r\n"
+        << "Access-Control-Allow-Headers: Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access\r\n"
         << "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
         << "Connection: close\r\n"
         << "Content-Length: " << json_body.size() << "\r\n\r\n"
@@ -231,7 +232,60 @@ dsv41::JsonValue make_usage_json(int64_t prompt_toks, int64_t completion_toks, i
     return u;
 }
 
-void handle_connection(int fd, dsv41::Dsv41Runtime* rt, const std::string& default_model_id) {
+void log_fe_turn_telemetry(
+    uint64_t req_num,
+    const char* tag,
+    const dsv41::Dsv41GenStats& stats,
+    size_t tool_count,
+    int server_search_reqs = 0)
+{
+    const double reuse_tps = (stats.cached_prefix_tokens > 0)
+                                 ? (1000.0 * stats.cached_prefix_tokens / std::max(stats.prefix_reuse_ms, 0.01))
+                                 : 0.0;
+    const double fresh_tps = (stats.fresh_prefill_ms > 0.0 && stats.prefilled_tokens > 0)
+                                 ? (1000.0 * stats.prefilled_tokens / stats.fresh_prefill_ms)
+                                 : 0.0;
+    const double dec_tps = (stats.decode_ms > 0.0) ? (1000.0 * stats.completion_tokens / stats.decode_ms) : 0.0;
+    const double acc_pct = (stats.dspark_drafted > 0)
+                               ? (100.0 * double(stats.dspark_accepted) / double(stats.dspark_drafted))
+                               : 0.0;
+    const double tau = (stats.dspark_steps > 0)
+                           ? (1.0 + double(stats.dspark_accepted) / double(stats.dspark_steps))
+                           : 1.0;
+    char extra_note[128] = "";
+    int off = 0;
+    if (server_search_reqs > 0) {
+        off += std::snprintf(extra_note + off, sizeof(extra_note) - size_t(off), " | srv_search=%d", server_search_reqs);
+    }
+    if (stats.think_guard_triggered && size_t(off) < sizeof(extra_note)) {
+        std::snprintf(extra_note + off, sizeof(extra_note) - size_t(off), " | ThinkGuard(rew=%u,p=%u)",
+                      stats.think_guard_rewound, stats.think_guard_period);
+    }
+    std::printf("[DSV41_FE] #%llu %s OK | prompt=%d (reuse=%d [radix=%d] in %.2fms=%.0f tok/s | fresh=%d in %.1fms=%.1f tok/s) | "
+                "gen=%d in %.1fms=%.2f tok/s [bb=%.0fms p150=%.0fms dsp=%.0fms smp=%.0fms steps=%llu tau=%.2f] | "
+                "stages[attn=%.0fms hsi=%.0fms moe=%.0fms p150w=%.0fms ovlp=%.0fms ar=%.0fms egw=%.1fms] | "
+                "DSpark acc=%llu/%llu (%.1f%%, tree=%llu/%llu, tree16=%llu/%llu) | tools=%zu%s\n",
+                static_cast<unsigned long long>(req_num), tag,
+                stats.prompt_tokens,
+                stats.cached_prefix_tokens, stats.radix_hit_tokens, stats.prefix_reuse_ms, reuse_tps,
+                stats.prefilled_tokens, stats.fresh_prefill_ms, fresh_tps,
+                stats.completion_tokens, stats.decode_ms, dec_tps,
+                stats.dec_backbone_ms, stats.dec_p150_dev_ms, stats.dec_dspark_ms, stats.dec_sample_ms,
+                static_cast<unsigned long long>(stats.dspark_steps), tau,
+                stats.t_attn_ms, stats.t_hsi_index_ms, stats.t_mi50_moe_ms, stats.t_p150_wait_ms,
+                stats.overlap_saved_ms, stats.t_allreduce_ms, stats.t_engram_wait_ms,
+                static_cast<unsigned long long>(stats.dspark_accepted),
+                static_cast<unsigned long long>(stats.dspark_drafted),
+                acc_pct,
+                static_cast<unsigned long long>(stats.dspark_tree_accepted),
+                static_cast<unsigned long long>(stats.dspark_tree_steps),
+                static_cast<unsigned long long>(stats.dspark_tree16_accepted),
+                static_cast<unsigned long long>(stats.dspark_tree16_steps),
+                tool_count, extra_note);
+    std::fflush(stdout);
+}
+
+void handle_connection(int fd, dsv41::Dsv41Runtime* rt, const std::string& default_model_id, const std::string& search_url) {
     int one = 1;
     (void)::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
@@ -447,7 +501,9 @@ void handle_connection(int fd, dsv41::Dsv41Runtime* rt, const std::string& defau
                     "Content-Type: text/event-stream; charset=utf-8\r\n"
                     "Cache-Control: no-cache\r\n"
                     "Connection: close\r\n"
-                    "Access-Control-Allow-Origin: *\r\n\r\n";
+                    "Access-Control-Allow-Origin: *\r\n"
+                    "Access-Control-Allow-Headers: Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access\r\n"
+                    "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\r\n";
                 if (!send_str(fd, sse_hdr)) {
                     ::close(fd);
                     return;
@@ -741,44 +797,9 @@ void handle_connection(int fd, dsv41::Dsv41Runtime* rt, const std::string& defau
                     }
                     (void)sse_write("data: [DONE]\n\n");
 
-                    const double reuse_tps = (stats.cached_prefix_tokens > 0)
-                                                 ? (1000.0 * stats.cached_prefix_tokens / std::max(stats.prefix_reuse_ms, 0.01))
-                                                 : 0.0;
-                    const double fresh_tps = (stats.fresh_prefill_ms > 0.0 && stats.prefilled_tokens > 0)
-                                                 ? (1000.0 * stats.prefilled_tokens / stats.fresh_prefill_ms)
-                                                 : 0.0;
-                    const double dec_tps = (stats.decode_ms > 0.0) ? (1000.0 * stats.completion_tokens / stats.decode_ms) : 0.0;
-                    const double acc_pct = (stats.dspark_drafted > 0)
-                                               ? (100.0 * double(stats.dspark_accepted) / double(stats.dspark_drafted))
-                                               : 0.0;
-                    const double tau = (stats.dspark_steps > 0)
-                                           ? (1.0 + double(stats.dspark_accepted) / double(stats.dspark_steps))
-                                           : 1.0;
-                    char tg_note[64] = "";
-                    if (stats.think_guard_triggered) {
-                        std::snprintf(tg_note, sizeof(tg_note), " | ThinkGuard(rew=%u,p=%u)",
-                                      stats.think_guard_rewound, stats.think_guard_period);
-                    }
-                    std::printf("[DSV41_FE] #%llu stream OK | prompt=%d (reuse=%d [radix=%d] in %.2fms=%.0f tok/s | fresh=%d in %.1fms=%.1f tok/s) | "
-                                "gen=%d in %.1fms=%.2f tok/s [bb=%.0fms p150=%.0fms dsp=%.0fms smp=%.0fms steps=%llu tau=%.2f] | "
-                                "stages[attn=%.0fms hsi=%.0fms moe=%.0fms p150w=%.0fms ar=%.0fms egw=%.1fms] | "
-                                "DSpark acc=%llu/%llu (%.1f%%, tree=%llu/%llu) | tools=%zu%s\n",
-                                static_cast<unsigned long long>(req_num),
-                                stats.prompt_tokens,
-                                stats.cached_prefix_tokens, stats.radix_hit_tokens, stats.prefix_reuse_ms, reuse_tps,
-                                stats.prefilled_tokens, stats.fresh_prefill_ms, fresh_tps,
-                                stats.completion_tokens, stats.decode_ms, dec_tps,
-                                stats.dec_backbone_ms, stats.dec_p150_dev_ms, stats.dec_dspark_ms, stats.dec_sample_ms,
-                                static_cast<unsigned long long>(stats.dspark_steps), tau,
-                                stats.t_attn_ms, stats.t_hsi_index_ms, stats.t_mi50_moe_ms, stats.t_p150_wait_ms,
-                                stats.t_allreduce_ms, stats.t_engram_wait_ms,
-                                static_cast<unsigned long long>(stats.dspark_accepted),
-                                static_cast<unsigned long long>(stats.dspark_drafted),
-                                acc_pct,
-                                static_cast<unsigned long long>(stats.dspark_tree_accepted),
-                                static_cast<unsigned long long>(stats.dspark_tree_steps),
-                                std::max(parsed_final.tool_calls.size(), streamed_tool_cnt), tg_note);
-                    std::fflush(stdout);
+                    log_fe_turn_telemetry(
+                        req_num, "stream", stats,
+                        std::max(parsed_final.tool_calls.size(), streamed_tool_cnt));
                 } else {
                     std::printf("[DSV41_FE] #%llu stream aborted by client disconnect after %d tokens\n",
                                 static_cast<unsigned long long>(req_num), stats.completion_tokens);
@@ -844,45 +865,7 @@ void handle_connection(int fd, dsv41::Dsv41Runtime* rt, const std::string& defau
                                           int64_t(stats.cached_prefix_tokens)));
 
                 send_json_response(fd, 200, "OK", root.dumps_compact());
-
-                const double reuse_tps = (stats.cached_prefix_tokens > 0)
-                                             ? (1000.0 * stats.cached_prefix_tokens / std::max(stats.prefix_reuse_ms, 0.01))
-                                             : 0.0;
-                const double fresh_tps = (stats.fresh_prefill_ms > 0.0 && stats.prefilled_tokens > 0)
-                                             ? (1000.0 * stats.prefilled_tokens / stats.fresh_prefill_ms)
-                                             : 0.0;
-                const double dec_tps = (stats.decode_ms > 0.0) ? (1000.0 * stats.completion_tokens / stats.decode_ms) : 0.0;
-                const double acc_pct = (stats.dspark_drafted > 0)
-                                           ? (100.0 * double(stats.dspark_accepted) / double(stats.dspark_drafted))
-                                           : 0.0;
-                const double tau = (stats.dspark_steps > 0)
-                                       ? (1.0 + double(stats.dspark_accepted) / double(stats.dspark_steps))
-                                       : 1.0;
-                char tg_note[64] = "";
-                if (stats.think_guard_triggered) {
-                    std::snprintf(tg_note, sizeof(tg_note), " | ThinkGuard(rew=%u,p=%u)",
-                                  stats.think_guard_rewound, stats.think_guard_period);
-                }
-                std::printf("[DSV41_FE] #%llu sync OK | prompt=%d (reuse=%d [radix=%d] in %.2fms=%.0f tok/s | fresh=%d in %.1fms=%.1f tok/s) | "
-                            "gen=%d in %.1fms=%.2f tok/s [bb=%.0fms p150=%.0fms dsp=%.0fms smp=%.0fms steps=%llu tau=%.2f] | "
-                            "stages[attn=%.0fms hsi=%.0fms moe=%.0fms p150w=%.0fms ar=%.0fms egw=%.1fms] | "
-                            "DSpark acc=%llu/%llu (%.1f%%, tree=%llu/%llu) | tools=%zu%s\n",
-                            static_cast<unsigned long long>(req_num),
-                            stats.prompt_tokens,
-                            stats.cached_prefix_tokens, stats.radix_hit_tokens, stats.prefix_reuse_ms, reuse_tps,
-                            stats.prefilled_tokens, stats.fresh_prefill_ms, fresh_tps,
-                            stats.completion_tokens, stats.decode_ms, dec_tps,
-                            stats.dec_backbone_ms, stats.dec_p150_dev_ms, stats.dec_dspark_ms, stats.dec_sample_ms,
-                            static_cast<unsigned long long>(stats.dspark_steps), tau,
-                            stats.t_attn_ms, stats.t_hsi_index_ms, stats.t_mi50_moe_ms, stats.t_p150_wait_ms,
-                            stats.t_allreduce_ms, stats.t_engram_wait_ms,
-                            static_cast<unsigned long long>(stats.dspark_accepted),
-                            static_cast<unsigned long long>(stats.dspark_drafted),
-                            acc_pct,
-                            static_cast<unsigned long long>(stats.dspark_tree_accepted),
-                            static_cast<unsigned long long>(stats.dspark_tree_steps),
-                            parsed.tool_calls.size(), tg_note);
-                std::fflush(stdout);
+                log_fe_turn_telemetry(req_num, "sync", stats, parsed.tool_calls.size());
             }
         } catch (const std::exception& e) {
             std::fprintf(stderr, "[DSV41_FE] Request error: %s\n", e.what());
@@ -892,6 +875,109 @@ void handle_connection(int fd, dsv41::Dsv41Runtime* rt, const std::string& defau
             dsv41::JsonValue err = dsv41::JsonValue::make_object();
             err.set_key("error", std::move(err_inner));
             send_json_response(fd, 500, "Internal Server Error", err.dumps_compact());
+        }
+        ::close(fd);
+        return;
+    }
+
+    if ((req.path == "/anthropic/v1/messages" || req.path == "/v1/messages" || req.path == "/messages") &&
+        req.method == "POST")
+    {
+        try {
+            const uint64_t req_num = g_req_counter.fetch_add(1);
+            const std::string msg_id = "msg_dsv41_" + boot_nonce_hex() + "_" + std::to_string(req_num);
+            const uint64_t call_seed = boot_call_seed() + req_num * 100ULL + 1ULL;
+
+            const dsv41::JsonValue body = dsv41::parse_json(req.body);
+            if (!body.contains("messages") || !body.at("messages").is_array()) {
+                throw std::runtime_error("Missing 'messages' array in Anthropic messages request");
+            }
+            const dsv41::AnthropicTranslatedRequest treq = dsv41::translate_anthropic_to_dsv41(body, default_model_id);
+
+            if (treq.stream) {
+                const std::string sse_hdr =
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: text/event-stream; charset=utf-8\r\n"
+                    "Cache-Control: no-cache\r\n"
+                    "Connection: close\r\n"
+                    "Access-Control-Allow-Origin: *\r\n"
+                    "Access-Control-Allow-Headers: Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access\r\n"
+                    "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\r\n";
+                if (!send_str(fd, sse_hdr)) {
+                    ::close(fd);
+                    return;
+                }
+            }
+
+            std::mutex sse_mtx;
+            std::atomic<bool> aborted{false};
+            auto sse_send = [&](const std::string& payload) -> bool {
+                std::lock_guard<std::mutex> lk(sse_mtx);
+                if (aborted.load(std::memory_order_relaxed)) return false;
+                if (!send_str(fd, payload)) {
+                    aborted.store(true, std::memory_order_release);
+                    return false;
+                }
+                return true;
+            };
+
+            std::string sync_json;
+            dsv41::Dsv41GenStats agg_stats{};
+            int srv_search_reqs = 0;
+            size_t total_tools = 0;
+
+            const bool ok = dsv41::run_anthropic_messages_turn(
+                treq,
+                rt->tokenizer(),
+                search_url,
+                msg_id,
+                call_seed,
+                [&](const std::vector<int32_t>& prompt_ids,
+                    int max_new_tokens,
+                    dsv41::TokenStreamCallback on_tok,
+                    dsv41::Dsv41GenStats& out_stats) -> std::vector<int32_t> {
+                    dsv41::Dsv41GenParams params;
+                    params.max_new_tokens = std::clamp(max_new_tokens, 1, 131072);
+                    params.temperature = treq.has_explicit_temperature ? std::max(0.0f, treq.temperature) : 0.95f;
+                    params.top_p = std::clamp(treq.top_p, 0.01f, 1.0f);
+                    params.seed = treq.seed;
+                    params.enable_dspark = true;
+                    return rt->generate(prompt_ids, params, std::move(on_tok), out_stats);
+                },
+                [&]() -> bool {
+                    if (aborted.load(std::memory_order_relaxed) || client_disconnected(fd)) {
+                        aborted.store(true, std::memory_order_release);
+                        return true;
+                    }
+                    return false;
+                },
+                sse_send,
+                sync_json,
+                agg_stats,
+                srv_search_reqs,
+                total_tools);
+
+            if (ok && !aborted.load(std::memory_order_acquire)) {
+                if (!treq.stream) {
+                    send_json_response(fd, 200, "OK", sync_json);
+                }
+                log_fe_turn_telemetry(
+                    req_num, treq.stream ? "anthropic-stream" : "anthropic-sync",
+                    agg_stats, total_tools, srv_search_reqs);
+            } else {
+                std::printf("[DSV41_FE] #%llu anthropic turn aborted after %d tokens\n",
+                            static_cast<unsigned long long>(req_num), agg_stats.completion_tokens);
+                std::fflush(stdout);
+            }
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[DSV41_FE] Anthropic request error: %s\n", e.what());
+            dsv41::JsonValue err_inner = dsv41::JsonValue::make_object();
+            err_inner.set_key("type", "invalid_request_error");
+            err_inner.set_key("message", std::string(e.what()));
+            dsv41::JsonValue err = dsv41::JsonValue::make_object();
+            err.set_key("type", "error");
+            err.set_key("error", std::move(err_inner));
+            send_json_response(fd, 400, "Bad Request", err.dumps_compact());
         }
         ::close(fd);
         return;
@@ -917,7 +1003,10 @@ int main(int argc, char** argv) {
         std::string model_id  = "DeepSeek-V4.1-Flash-1017";
         std::string rarebal_overlay;
         std::string capture_rarebal_dir;
-        int max_seq_len       = 524288;
+        std::string search_url;
+        int max_seq_len        = 1048576;
+        bool dual_overlap      = true;
+        int dspark_tree_width  = 0;  // 0 = auto, 8 = fixed M=8, 16 = fixed M=16
 
         for (int i = 1; i < argc; ++i) {
             const std::string arg(argv[i]);
@@ -948,6 +1037,17 @@ int main(int argc, char** argv) {
                 rarebal_overlay.clear();
             } else if (arg == "--capture-rarebal" && i + 1 < argc) {
                 capture_rarebal_dir = argv[++i];
+            } else if (arg == "--dual-stream-overlap") {
+                dual_overlap = true;
+            } else if (arg == "--no-dual-stream-overlap") {
+                dual_overlap = false;
+            } else if (arg == "--dspark-tree-width" && i + 1 < argc) {
+                const std::string w(argv[++i]);
+                if (w == "8") dspark_tree_width = 8;
+                else if (w == "16") dspark_tree_width = 16;
+                else dspark_tree_width = 0;
+            } else if (arg == "--search-url" && i + 1 < argc) {
+                search_url = argv[++i];
             }
         }
 
@@ -957,6 +1057,8 @@ int main(int argc, char** argv) {
 
         dsv41::Dsv41Runtime runtime;
         runtime.init(mi50_root, tok_path, p150_shm, max_seq_len, rarebal_overlay, capture_rarebal_dir);
+        runtime.set_dual_stream_overlap(dual_overlap);
+        runtime.set_dspark_tree_width(dspark_tree_width);
 
         const int srv_fd = ::socket(AF_INET, SOCK_STREAM, 0);
         if (srv_fd < 0) throw std::runtime_error("socket() failed");
@@ -980,8 +1082,10 @@ int main(int argc, char** argv) {
             throw std::runtime_error("listen() failed");
         }
 
-        std::printf("[DSV41_FE] OpenAI HTTP/SSE server listening on http://%s:%d/v1 (model=%s, max_seq_len=%d)\n",
-                    host.c_str(), port, model_id.c_str(), max_seq_len);
+        std::printf("[DSV41_FE] OpenAI + Anthropic HTTP/SSE server listening on http://%s:%d (/v1 + /anthropic/v1/messages, model=%s, max_seq_len=%d, dual_ovlp=%d, tree_w=%s, search=%s)\n",
+                    host.c_str(), port, model_id.c_str(), max_seq_len, int(dual_overlap),
+                    (dspark_tree_width == 8 ? "8" : (dspark_tree_width == 16 ? "16" : "auto")),
+                    search_url.empty() ? "off" : search_url.c_str());
         std::fflush(stdout);
 
         while (!g_stop_server) {
@@ -992,7 +1096,7 @@ int main(int argc, char** argv) {
                 if (errno == EINTR) continue;
                 break;
             }
-            std::thread(handle_connection, cfd, &runtime, model_id).detach();
+            std::thread(handle_connection, cfd, &runtime, model_id, search_url).detach();
         }
 
         ::close(srv_fd);

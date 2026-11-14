@@ -13,10 +13,12 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -72,15 +74,17 @@ struct RarebalLiveCollector {
     static constexpr int kMaxExperts   = 384;
     static constexpr int kDim          = 5120;
     static constexpr int kMinNeedRows  = 11776;  // 11,264 (> 2*K=10,240) cal + 512 held-out eval
-    static constexpr int kMaxStoreRows = 12800;  // 12,288 cal + 512 held-out eval
-    static constexpr int kMainCandCap  = 64;
-    static constexpr int kMtpCandCap   = 16;
+    static constexpr int kMaxStoreRows = 12032;  // 11,520 cal + 512 held-out eval
+    static constexpr int kMainCandCap  = 640;    // Wave 8 Track 8C: expanded main backbone hot-expert cap
+    static constexpr int kMtpCandCap   = 80;     // Wave 8 Track 8C: expanded DSpark MTP (mtp.0..2) hot-expert cap
 
     struct CandBuf {
         int block_id = 0;
         int eid = 0;
         bool pinned_p150 = false;
+        bool flushed_on_disk = false;
         int rows = 0;
+        int rare_count_cached = 0;
         std::vector<uint8_t> rare;
         std::vector<uint16_t> x_bf16;
     };
@@ -133,6 +137,31 @@ struct RarebalLiveCollector {
         std::printf("[RAREBAL_CAL] Armed live collector -> %s (vocab_rare=%zu/%zu, p150_l1_pinned=%zu)\n",
                     out_dir.c_str(), rare_v, V, pinned_p150_pairs.size());
         std::fflush(stdout);
+
+        // If a full-corpus router_hist.txt seed already exists, lock globally top candidates immediately (skip Pass 0)!
+        const std::string root_env = (std::getenv("DSV41_ROOT") != nullptr)
+                                         ? std::string(std::getenv("DSV41_ROOT"))
+                                         : std::string(".");
+        std::ifstream sh(root_env + "/packed_rarebal_overlay_wave8/router_hist.txt");
+        if (sh.is_open()) {
+            std::string line;
+            size_t loaded = 0;
+            while (std::getline(sh, line)) {
+                if (line.empty() || line[0] == '#') continue;
+                std::istringstream iss(line);
+                int b = -1, e = -1;
+                uint64_t h = 0, seen = 0;
+                if ((iss >> b >> e >> h >> seen) && b >= 0 && b < kTotalBlocks && e >= 0 && e < kMaxExperts) {
+                    router_hits[size_t(b)][size_t(e)] = h;
+                    ++loaded;
+                }
+            }
+            if (loaded >= 15000u) {
+                lock_candidates();
+                for (auto& r : router_hits) r.fill(0ULL);
+                total_rows_seen.fill(0ULL);
+            }
+        }
     }
 
     void set_batch_tokens(const int32_t* ids, int M) noexcept {
@@ -158,6 +187,35 @@ struct RarebalLiveCollector {
         else     block_need_mask &= ~(1ULL << block_id);
     }
 
+    void write_cand_bin(CandBuf& cb, bool release_ram) {
+        if (cb.rows <= 0) return;
+        if (!cb.flushed_on_disk) {
+            int rcnt = 0;
+            for (uint8_t u : cb.rare) rcnt += int(u != 0u);
+            cb.rare_count_cached = rcnt;
+        }
+        char fn[128];
+        std::snprintf(fn, sizeof(fn), "/b%02d_e%03d.bin", cb.block_id, cb.eid);
+        int fd = ::open((out_dir + fn).c_str(), O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0664);
+        if (fd >= 0) {
+            struct Hdr { uint32_t magic; int32_t bid; int32_t eid; int32_t rows; uint32_t pin; uint32_t pad; uint64_t hits; }
+                hdr{0x5242414Cu, cb.block_id, cb.eid, cb.rows, uint32_t(cb.pinned_p150), 0u, router_hits[size_t(cb.block_id)][size_t(cb.eid)]};
+            auto wr = [&](const void* p, size_t n) {
+                const auto* b = static_cast<const uint8_t*>(p);
+                for (size_t o = 0; o < n;) { const ssize_t w = ::write(fd, b + o, n - o); if (w <= 0) break; o += size_t(w); }
+            };
+            wr(&hdr, sizeof(hdr));
+            wr(cb.rare.data(), cb.rare.size());
+            wr(cb.x_bf16.data(), cb.x_bf16.size() * sizeof(uint16_t));
+            ::close(fd);
+            if (release_ram) {
+                cb.flushed_on_disk = true;
+                std::vector<uint8_t>().swap(cb.rare);
+                std::vector<uint16_t>().swap(cb.x_bf16);
+            }
+        }
+    }
+
     void lock_candidates() {
         if (candidates_locked) return;
         auto add_cand = [&](int b, int e, bool pin) {
@@ -166,8 +224,6 @@ struct RarebalLiveCollector {
             cand_slot[size_t(b)][size_t(e)] = idx;
             CandBuf cb;
             cb.block_id = b; cb.eid = e; cb.pinned_p150 = pin;
-            cb.rare.reserve(kMaxStoreRows);
-            cb.x_bf16.reserve(size_t(kMaxStoreRows) * kDim);
             cands.push_back(std::move(cb));
             block_need_mask |= (1ULL << b);
             return true;
@@ -191,8 +247,8 @@ struct RarebalLiveCollector {
         std::sort(all_main.begin(), all_main.end(), cmp);
 
         int mi50_cnt = 0, p150_cnt = int(cands.size());
-        for (const auto& x : mi50_r) { if (mi50_cnt >= 24) break; if (add_cand(x.b, x.e, false)) ++mi50_cnt; }
-        for (const auto& x : p150_r) { if (p150_cnt >= 24) break; if (add_cand(x.b, x.e, false)) ++p150_cnt; }
+        for (const auto& x : mi50_r) { if (mi50_cnt >= 240) break; if (add_cand(x.b, x.e, false)) ++mi50_cnt; }
+        for (const auto& x : p150_r) { if (p150_cnt >= 240) break; if (add_cand(x.b, x.e, false)) ++p150_cnt; }
         for (const auto& x : all_main) {
             if (int(cands.size()) >= kMainCandCap) break;
             add_cand(x.b, x.e, false);
@@ -209,8 +265,8 @@ struct RarebalLiveCollector {
             if (add_cand(x.b, x.e, false)) ++mtp_cnt;
         }
         candidates_locked = true;
-        std::printf("[RAREBAL_CAL] Locked %zu hot candidates (%d main + %d MTP)\n",
-                    cands.size(), int(cands.size()) - mtp_cnt, mtp_cnt);
+        std::printf("[RAREBAL_CAL] Locked %zu hot candidates (%d main [p150_pinned=%zu] + %d MTP)\n",
+                    cands.size(), int(cands.size()) - mtp_cnt, pinned_p150_pairs.size(), mtp_cnt);
         std::fflush(stdout);
     }
 
@@ -231,7 +287,10 @@ struct RarebalLiveCollector {
                         cb.rare.push_back(r_flag);
                         const uint16_t* row_ptr = x_bf16 + size_t(r) * kDim;
                         cb.x_bf16.insert(cb.x_bf16.end(), row_ptr, row_ptr + kDim);
-                        if (++cb.rows == kMaxStoreRows) any_full = true;
+                        if (++cb.rows == kMaxStoreRows) {
+                            write_cand_bin(cb, true);
+                            any_full = true;
+                        }
                     }
                 }
             }
@@ -251,7 +310,7 @@ struct RarebalLiveCollector {
         if (out_main_ok) *out_main_ok = m_ok;
         if (out_pin_ok)  *out_pin_ok  = p_ok;
         if (out_mtp_ok)  *out_mtp_ok  = mtp_ok;
-        return (p_ok == p_tot) && (m_ok >= 44) && (mtp_ok >= 12);
+        return (p_ok == p_tot) && ((m_ok + mtp_ok) >= 560);
     }
 
     void flush_to_disk() {
@@ -270,31 +329,23 @@ struct RarebalLiveCollector {
         std::ofstream cf(out_dir + "/candidates.txt", std::ios::trunc);
         int m_ok = 0, p_ok = 0, mtp_ok = 0;
         (void)targets_satisfied(&m_ok, &p_ok, &mtp_ok);
-        for (const auto& cb : cands) {
-            int rare_cnt = 0;
-            for (uint8_t u : cb.rare) rare_cnt += int(u != 0u);
+        for (auto& cb : cands) {
+            if (cb.rows > 0 && !cb.flushed_on_disk) {
+                write_cand_bin(cb, false);
+            }
+            const int rare_cnt = cb.flushed_on_disk ? cb.rare_count_cached : [&]() {
+                int rc = 0;
+                for (uint8_t u : cb.rare) rc += int(u != 0u);
+                return rc;
+            }();
             char fn[128];
             std::snprintf(fn, sizeof(fn), "/b%02d_e%03d.bin", cb.block_id, cb.eid);
             cf << cb.block_id << " " << cb.eid << " " << int(cb.pinned_p150) << " "
                << cb.rows << " " << rare_cnt << " " << router_hits[size_t(cb.block_id)][size_t(cb.eid)]
                << " " << (out_dir + fn) << "\n";
-            if (cb.rows <= 0) continue;
-            int fd = ::open((out_dir + fn).c_str(), O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0664);
-            if (fd >= 0) {
-                struct Hdr { uint32_t magic; int32_t bid; int32_t eid; int32_t rows; uint32_t pin; uint32_t pad; uint64_t hits; }
-                    hdr{0x5242414Cu, cb.block_id, cb.eid, cb.rows, uint32_t(cb.pinned_p150), 0u, router_hits[size_t(cb.block_id)][size_t(cb.eid)]};
-                auto wr = [&](const void* p, size_t n) {
-                    const auto* b = static_cast<const uint8_t*>(p);
-                    for (size_t o = 0; o < n;) { const ssize_t w = ::write(fd, b + o, n - o); if (w <= 0) break; o += size_t(w); }
-                };
-                wr(&hdr, sizeof(hdr));
-                wr(cb.rare.data(), cb.rare.size());
-                wr(cb.x_bf16.data(), cb.x_bf16.size() * sizeof(uint16_t));
-                ::close(fd);
-            }
         }
-        std::printf("[RAREBAL_CAL] Flushed turn #%d -> ready(>11776): main=%d (p150_pinned=%d/%zu) mtp=%d\n",
-                    turns_captured, m_ok, p_ok, pinned_p150_pairs.size(), mtp_ok);
+        std::printf("[RAREBAL_CAL] Flushed turn #%d -> ready(>11776): main=%d (p150_pinned=%d/%zu) mtp=%d (total_ready=%d)\n",
+                    turns_captured, m_ok, p_ok, pinned_p150_pairs.size(), mtp_ok, m_ok + mtp_ok);
         std::fflush(stdout);
     }
 };

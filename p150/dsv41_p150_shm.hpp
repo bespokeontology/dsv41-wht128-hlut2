@@ -10,25 +10,47 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#if defined(__x86_64__) || defined(_M_X64)
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__HIP_DEVICE_COMPILE__)
 #include <immintrin.h>
 #endif
 
 namespace dsv41 {
 
-static constexpr uint32_t DSV41_P150_SHM_MAGIC   = 0x44343150u;  // 'D41P'
-static constexpr uint32_t DSV41_P150_SHM_VERSION = 2u;
-static constexpr uint32_t DSV41_P150_MAX_ROWS    = 1024u;
-static constexpr uint32_t DSV41_P150_MAX_SLOTS   = 8u;           // top-6 routed experts padded to 8
-static constexpr uint32_t DSV41_P150_H           = 5120u;
-static constexpr uint32_t DSV41_P150_EXPERT_BASE = 216u;         // Global experts [216..383] -> local [0..167]
-static constexpr uint32_t DSV41_P150_NUM_EXPERTS = 168u;
-static constexpr uint32_t DSV41_P150_NUM_LAYERS  = 40u;          // Backbone layers 0..39
+static constexpr uint32_t DSV41_P150_SHM_MAGIC       = 0x44343150u;  // 'D41P'
+static constexpr uint32_t DSV41_P150_SHM_VERSION     = 3u;
+static constexpr uint32_t DSV41_P150_MAX_ROWS        = 1024u;
+static constexpr uint32_t DSV41_P150_FAST_RING_SLOTS = 4u;           // 4-slot double-buffered zero-SDMA ring (< 26 MiB /dev/shm)
+static constexpr uint32_t DSV41_P150_FAST_MAX_ROWS   = 64u;          // Covers M=1 decode, M=8/16 DSpark tree, M<=64 chunks
+static constexpr uint32_t DSV41_P150_MAX_SLOTS       = 8u;           // top-6 routed experts padded to 8
+static constexpr uint32_t DSV41_P150_H               = 5120u;
+static constexpr uint32_t DSV41_P150_EXPERT_BASE     = 216u;         // Global experts [216..383] -> local [0..167]
+static constexpr uint32_t DSV41_P150_NUM_EXPERTS     = 168u;
+static constexpr uint32_t DSV41_P150_NUM_LAYERS      = 40u;          // Backbone layers 0..39
+
+static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t),
+              "std::atomic<uint32_t> must match 32-bit PCIe system-scope atomic word");
 
 enum Dsv41P150Op : uint32_t {
-    DSV41_P150_OP_MOE_FORWARD = 1u,
-    DSV41_P150_OP_PING        = 2u,
-    DSV41_P150_OP_SHUTDOWN    = 99u,
+    DSV41_P150_OP_MOE_FORWARD   = 1u,
+    DSV41_P150_OP_PING          = 2u,
+    DSV41_P150_OP_MOE_RING_SLOT = 3u,
+    DSV41_P150_OP_SHUTDOWN      = 99u,
+};
+
+struct alignas(64) Dsv41P150FastRingSlot {
+    uint32_t layer;
+    uint32_t rows;
+    uint32_t input_is_wht_rotated;
+    uint32_t active_pairs;
+    int32_t  status;
+    uint32_t zero_output;
+    uint64_t device_ns;
+    uint64_t pad_hdr[4];
+
+    alignas(64) int32_t  row_slots[DSV41_P150_FAST_MAX_ROWS][DSV41_P150_MAX_SLOTS];
+    alignas(64) float    row_weights[DSV41_P150_FAST_MAX_ROWS][DSV41_P150_MAX_SLOTS];
+    alignas(64) uint16_t x_in_bf16[DSV41_P150_FAST_MAX_ROWS * DSV41_P150_H];
+    alignas(64) uint16_t y_out_bf16[DSV41_P150_FAST_MAX_ROWS * DSV41_P150_H];
 };
 
 struct alignas(64) Dsv41P150ShmChannel {
@@ -44,22 +66,27 @@ struct alignas(64) Dsv41P150ShmChannel {
     uint32_t layer;                  // 0..39
     uint32_t rows;                   // 1..1024
     uint32_t input_is_wht_rotated;   // 1 if x_in_bf16 already has WHT128(signs_h) applied, 0 if raw BF16
+    uint32_t ring_slot;              // 0..3 when op == DSV41_P150_OP_MOE_RING_SLOT
 
     alignas(64) std::atomic<uint32_t> resp_seq;
     int32_t  status;                 // 0 = ok, <0 = error
     uint64_t last_device_ns;
+    std::atomic<uint64_t> total_device_ns;
 
-    // Per-row local P150 expert slots [0..167] (-1 = unused) and scaled FP32 router weights
+    // Wave 8A 4-slot double-buffered zero-SDMA decode/verify ring (M <= 64)
+    alignas(64) Dsv41P150FastRingSlot fast_slots[DSV41_P150_FAST_RING_SLOTS];
+
+    // Per-row local P150 expert slots [0..167] (-1 = unused) and scaled FP32 router weights (M > 64 prefill)
     alignas(64) int32_t row_slots[DSV41_P150_MAX_ROWS][DSV41_P150_MAX_SLOTS];
     alignas(64) float   row_weights[DSV41_P150_MAX_ROWS][DSV41_P150_MAX_SLOTS];
 
-    // Row-major BF16 activations [rows, 5120] and TP2-summed BF16 expert outputs [rows, 5120]
+    // Row-major BF16 activations [rows, 5120] and TP2-summed BF16 expert outputs [rows, 5120] (M > 64 prefill)
     alignas(64) uint16_t x_in_bf16[DSV41_P150_MAX_ROWS * DSV41_P150_H];
     alignas(64) uint16_t y_out_bf16[DSV41_P150_MAX_ROWS * DSV41_P150_H];
 };
 
 inline void dsv41_cpu_relax() noexcept {
-#if defined(__x86_64__) || defined(_M_X64)
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__HIP_DEVICE_COMPILE__)
     _mm_pause();
 #endif
 }

@@ -22,19 +22,19 @@
 
 namespace dsv41 {
 
-inline constexpr uint32_t kTreeSpecMaxNodes = 8u;      // M <= 8 branched DSpark verify
-inline constexpr uint32_t kTreeSpecMaxDepth = 3u;      // mtp.0..2 depth <= 3
+inline constexpr uint32_t kTreeSpecMaxNodes = 16u;     // M <= 16 branched DSpark verify (M=8 & M=16)
+inline constexpr uint32_t kTreeSpecMaxDepth = 5u;      // mtp + Markov chain depth <= 5 (up to 6 emitted tokens)
 
 struct TreeSpecNode {
     int32_t parent = -1;    // node index parent; -1 only root node 0
     int32_t token  = -1;    // token id at this node
-    uint32_t depth = 0;     // 0 root anchor, 1 mtp.0 sibling, 2 mtp.1, 3 mtp.2
+    uint32_t depth = 0;     // 0 root anchor, 1..5 draft tree levels
 };
 
 struct TreeSpecPlan {
     uint32_t node_count = 0;
-    std::array<uint8_t, kTreeSpecMaxNodes> allow_mask{};  // bit j allowed if node j is root/parent-chain/self
-    std::array<int32_t, kTreeSpecMaxNodes> pos_id{};       // root_pos + depth
+    std::array<uint16_t, kTreeSpecMaxNodes> allow_mask{}; // bit j allowed if node j is root/parent-chain/self
+    std::array<int32_t, kTreeSpecMaxNodes> pos_id{};      // root_pos + depth
     std::array<uint32_t, kTreeSpecMaxNodes> sibling{};    // sibling ordinal at parent
     bool valid = false;
 };
@@ -63,11 +63,11 @@ inline TreeSpecPlan build_tree_spec_plan(
     if (!tree_spec_plan_valid(nodes, count) || root_pos < 0) return plan;
 
     for (uint32_t i = 0u; i < count; ++i) {
-        uint8_t mask = uint8_t(1u << i);        // itself
+        uint16_t mask = uint16_t(1u << i);      // itself
         uint32_t ancestor = i;
         for (uint32_t d = 0u; d < nodes[i].depth; ++d) {
             ancestor = uint32_t(nodes[ancestor].parent);
-            mask |= uint8_t(1u << ancestor);
+            mask |= uint16_t(1u << ancestor);
         }
         plan.allow_mask[i] = mask;
         plan.pos_id[i] = root_pos + int32_t(nodes[i].depth);
@@ -108,7 +108,7 @@ inline uint32_t tree_spec_children(
 
 inline bool tree_spec_allowed(const TreeSpecPlan& plan, uint32_t row, uint32_t ancestor_row) noexcept {
     if (!plan.valid || row >= plan.node_count || ancestor_row >= plan.node_count) return false;
-    return (plan.allow_mask[row] & uint8_t(1u << ancestor_row)) != 0u;
+    return (plan.allow_mask[row] & uint16_t(1u << ancestor_row)) != 0u;
 }
 
 // Exact top-k truncation with renormalization over the kept support (k >= 1).

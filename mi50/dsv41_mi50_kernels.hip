@@ -2,6 +2,7 @@
 // Zero Python anywhere. Engineered for ScratchSize == 0 across every single kernel.
 
 #include "dsv41_mi50_kernels.hpp"
+#include "../p150/dsv41_p150_shm.hpp"
 #include <hip/hip_fp16.h>
 
 #include <algorithm>
@@ -2089,6 +2090,17 @@ __device__ __forceinline__ void d_rope_sincos_f64(
     out_c = float(cd);
 }
 
+__device__ __forceinline__ uint32_t d_tree_anc_row16(const TreeAncMask256& mask, int row) {
+    const uint64_t w = (row < 8)
+        ? ((row < 4) ? mask.w0 : mask.w1)
+        : ((row < 12) ? mask.w2 : mask.w3);
+    return uint32_t((w >> (16 * (row & 3))) & 0xFFFFULL);
+}
+
+__device__ __forceinline__ int d_tree_nibble64(uint64_t nibbles, int idx) {
+    return int((nibbles >> (4 * idx)) & 0xFULL);
+}
+
 // Fused split + q_norm (1280) + kv_norm (512) + exact FP64-angle tail-64 RoPE + inplace UE8M0_32 quant on concatenated [qr; kv] [M, 1792]!
 __global__ __launch_bounds__(256)
 void k_split_qkv_norm_rope_quant(
@@ -2099,8 +2111,8 @@ void k_split_qkv_norm_rope_quant(
     uint16_t*       __restrict__ out_qr_bf16,  // [M, 1280]
     uint16_t*       __restrict__ out_kv_bf16,  // [M, 512]
     int pos_base, float eps,
-    uint64_t tree_anc_mask64,
-    uint32_t tree_depth_nibbles)
+    TreeAncMask256 tree_anc_mask,
+    uint64_t tree_depth_nibbles)
 {
     __shared__ float    s_wave[4];
     __shared__ uint16_t s_kv[512];
@@ -2141,8 +2153,8 @@ void k_split_qkv_norm_rope_quant(
 
         // 2. Exact FP64-angle Tail-64 RoPE at pos = pos_base + (tree ? depth[m] : m)
         if (tid < 32) {
-            const int pos = tree_anc_mask64
-                ? (pos_base + int((tree_depth_nibbles >> (4 * m)) & 0xFu))
+            const int pos = tree_anc_mask.active()
+                ? (pos_base + d_tree_nibble64(tree_depth_nibbles, m))
                 : (pos_base + m);
             float s, c;
             d_rope_sincos_f64(pos, tid, use_comp_yarn, s, c);
@@ -2175,15 +2187,15 @@ void k_rope_tail64_bf16(
     uint16_t* __restrict__ x_bf16,
     bool use_comp_yarn,
     int H, int D, int pos_base, int pos_stride, bool inverse,
-    uint64_t tree_anc_mask64,
-    uint32_t tree_depth_nibbles)
+    TreeAncMask256 tree_anc_mask,
+    uint64_t tree_depth_nibbles)
 {
     const int pair = int(threadIdx.x);  // 0..31
     const int h = int(blockIdx.x);      // 0..H-1
     const int m = int(blockIdx.y);      // 0..M-1
     int pos;
-    if (tree_anc_mask64) {
-        const int raw_pos = pos_base + int((tree_depth_nibbles >> (4 * m)) & 0xFu);
+    if (tree_anc_mask.active()) {
+        const int raw_pos = pos_base + d_tree_nibble64(tree_depth_nibbles, m);
         pos = (pos_stride == 2) ? (raw_pos & ~1) : raw_pos;
     } else {
         pos = pos_base + m * pos_stride;
@@ -2310,8 +2322,8 @@ void k_compressor_r2_tree_pool(
     const float* __restrict__ score_state,
     uint16_t*    __restrict__ out_pool_bf16,
     int start_pos, int M,
-    uint32_t tree_depth_nibbles,
-    uint32_t tree_parent_nibbles)
+    uint64_t tree_depth_nibbles,
+    uint64_t tree_parent_nibbles)
 {
     const int d = int(blockIdx.x) * 256 + int(threadIdx.x);
     if (d >= 512) return;
@@ -2320,7 +2332,7 @@ void k_compressor_r2_tree_pool(
     const float init_s0 = score_state[d];
 
     for (int m = 0; m < M; ++m) {
-        const int depth_m = int((tree_depth_nibbles >> (4 * m)) & 0xFu);
+        const int depth_m = d_tree_nibble64(tree_depth_nibbles, m);
         const int pos_m = start_pos + depth_m;
         if ((pos_m & 1) == 1) {
             float k0, s0;
@@ -2328,7 +2340,7 @@ void k_compressor_r2_tree_pool(
                 k0 = init_k0;
                 s0 = init_s0;
             } else {
-                const int p = int((tree_parent_nibbles >> (4 * m)) & 0xFu);
+                const int p = d_tree_nibble64(tree_parent_nibbles, m);
                 k0 = kv_f32[size_t(p) * 512u + size_t(d)];
                 s0 = score_f32[size_t(p) * 512u + size_t(d)];
             }
@@ -2346,13 +2358,16 @@ void k_compressor_r2_tree_pool(
     }
 }
 
-// Exact compressed KV quantization: block_size=16, scale_dtype=FP8_E4M3 (kernel.py:160-163)
+// Exact compressed KV quantization: block_size=16, scale_dtype=FP8_E4M3 (supports hot HBM2 + warm mapped DDR4 tiers!)
 __global__ __launch_bounds__(256)
 void k_pack_compress_kv_fp4_e4m3_16(
     const uint16_t* __restrict__ latent_bf16, // [N_lat, 512]
-    uint8_t* __restrict__ cache_fp4,          // [max_comp, 256]
-    uint8_t* __restrict__ cache_e4m3,         // [max_comp, 32]
-    int slot_offset)
+    uint8_t* __restrict__ cache_fp4,          // [hot_comp_cap, 256]
+    uint8_t* __restrict__ cache_e4m3,         // [hot_comp_cap, 32]
+    int slot_offset,
+    uint8_t* __restrict__ ext_cache_fp4,
+    uint8_t* __restrict__ ext_cache_e4m3,
+    int hot_comp_cap)
 {
     // Block: 256 threads = 32 groups of 8 threads (each thread handles 2 elements = 1 packed FP4 byte!)
     const int n = int(blockIdx.x);
@@ -2377,9 +2392,13 @@ void k_pack_compress_kv_fp4_e4m3_16(
     const uint8_t q1 = d_f32_to_fp4_e2m1(fmaxf(-6.0f, fminf(6.0f, v1 / s)));
 
     const size_t dst_slot = size_t(slot_offset + n);
-    cache_fp4[dst_slot * 256u + grp * 8 + lane] = uint8_t(q0 | (q1 << 4));
+    const bool is_ext = (dst_slot >= size_t(hot_comp_cap)) && (ext_cache_fp4 != nullptr);
+    uint8_t* dst_fp4  = is_ext ? ext_cache_fp4  : cache_fp4;
+    uint8_t* dst_e4m3 = is_ext ? ext_cache_e4m3 : cache_e4m3;
+    const size_t local_slot = is_ext ? (dst_slot - size_t(hot_comp_cap)) : dst_slot;
+    dst_fp4[local_slot * 256u + grp * 8 + lane] = uint8_t(q0 | (q1 << 4));
     if (lane == 0) {
-        cache_e4m3[dst_slot * 32u + grp] = s_e4m3;
+        dst_e4m3[local_slot * 32u + grp] = s_e4m3;
     }
 }
 
@@ -2652,17 +2671,17 @@ __device__ uint32_t d_radix_kth_largest(
     return prefix;
 }
 
-// 1 CTA of 256 threads per query row m: handles causal mask + compact 1B/8-key candidate_blocks (Layer 20 / 24..36) + exact top-512 + sort!
+// 1 CTA of 256 threads per query row m: handles causal mask + bit-packed 1b/8-key candidate_blocks (Layer 20 / 24..36) + exact top-512 + sort!
 __global__ __launch_bounds__(256)
 void k_indexer_candidates_and_topk(
     float* __restrict__ score_f32,
-    uint8_t* __restrict__ cand_block_mask,
+    uint32_t* __restrict__ cand_block_mask,
     int cand_block_stride,
     int32_t* __restrict__ out_comp_idxs,
     int T_comp, int start_pos, int ratio, int mode, int K_out,
     float* __restrict__ block_scores_scratch, // [M, ceil(T_comp/8)] when mode==1
-    uint64_t tree_anc_mask64,
-    uint32_t tree_depth_nibbles,
+    TreeAncMask256 tree_anc_mask,
+    uint64_t tree_depth_nibbles,
     int q_row_offset)
 {
     __shared__ uint32_t s_hist[256];
@@ -2680,16 +2699,16 @@ void k_indexer_candidates_and_topk(
     int last_blk0 = -1;
     int last_blk1 = -1;
 
-    if (tree_anc_mask64 != 0ULL) {
+    if (tree_anc_mask.active()) {
         const int gm = q_row_offset + m;
-        const uint32_t anc_row = uint32_t((tree_anc_mask64 >> (8 * gm)) & 0xFFULL);
+        const uint32_t anc_row = d_tree_anc_row16(tree_anc_mask, gm);
         const int base_comp = start_pos / ratio;
         const int tree_M = max(0, T_comp - base_comp);
         int valid_tree = 0;
         for (int j = 0; j < tree_M; ++j) {
             bool ok = (((anc_row >> j) & 1u) != 0u);
             if (ok && ratio == 2) {
-                ok = (((start_pos + int((tree_depth_nibbles >> (4 * j)) & 0xFu)) & 1) == 1);
+                ok = (((start_pos + d_tree_nibble64(tree_depth_nibbles, j)) & 1) == 1);
             }
             if (ok) ++valid_tree;
         }
@@ -2703,7 +2722,7 @@ void k_indexer_candidates_and_topk(
             const int j = t - base_comp;
             bool ok = (j >= 0 && j < tree_M) && (((anc_row >> j) & 1u) != 0u);
             if (ok && ratio == 2) {
-                ok = (((start_pos + int((tree_depth_nibbles >> (4 * j)) & 0xFu)) & 1) == 1);
+                ok = (((start_pos + d_tree_nibble64(tree_depth_nibbles, j)) & 1) == 1);
             }
             if (!ok) row[t] = neg_inf;
         }
@@ -2723,7 +2742,11 @@ void k_indexer_candidates_and_topk(
     // 2. Candidate block producer (Layer 20, mode==1) or consumer (Layers 24..36, mode==2)
     if (mode == 1) {
         const int num_blocks = (T_comp + 7) >> 3;
+        const int num_words  = (num_blocks + 31) >> 5;
         float* bscores = block_scores_scratch + size_t(m) * size_t(num_blocks);
+
+        uint32_t* cblk = cand_block_mask + size_t(m) * size_t(cand_block_stride);
+        for (int w = tid; w < num_words; w += 256) cblk[w] = 0u;
 
         for (int b = tid; b < num_blocks; b += 256) {
             if (last_blk0 >= 0 && b >= last_blk0 && b <= last_blk1) {
@@ -2740,11 +2763,10 @@ void k_indexer_candidates_and_topk(
         }
         __syncthreads();
 
-        uint8_t* cblk = cand_block_mask + size_t(m) * size_t(cand_block_stride);
         const int k_blk = min(2048, num_blocks);
         if (num_blocks <= 2048) {
             for (int b = tid; b < num_blocks; b += 256) {
-                cblk[b] = (bscores[b] > neg_inf) ? 1u : 0u;
+                if (bscores[b] > neg_inf) atomicOr(&cblk[b >> 5], 1u << (b & 31));
             }
         } else {
             const uint32_t kth_u = d_radix_kth_largest(bscores, num_blocks, k_blk, s_hist, s_scalar);
@@ -2773,14 +2795,15 @@ void k_indexer_candidates_and_topk(
                         if (int(prev) > 0) keep = true;
                     }
                 }
-                cblk[b] = keep ? 1u : 0u;
+                if (keep) atomicOr(&cblk[b >> 5], 1u << (b & 31));
             }
         }
         __syncthreads();
     } else if (mode == 2) {
-        const uint8_t* cblk = cand_block_mask + size_t(m) * size_t(cand_block_stride);
+        const uint32_t* cblk = cand_block_mask + size_t(m) * size_t(cand_block_stride);
         for (int t = tid; t < T_comp; t += 256) {
-            if (!cblk[t >> 3]) row[t] = neg_inf;
+            const int blk = t >> 3;
+            if (((cblk[blk >> 5] >> (blk & 31)) & 1u) == 0u) row[t] = neg_inf;
         }
         __syncthreads();
     }
@@ -2883,11 +2906,17 @@ __device__ __forceinline__ void d_load_win_kv_pak(
 }
 
 __device__ __forceinline__ void d_load_comp_kv_pak(
-    const uint8_t* comp_fp4, const uint8_t* comp_e4m3, const uint16_t* s_lut,
+    const uint8_t* comp_fp4, const uint8_t* comp_e4m3,
+    const uint8_t* ext_comp_fp4, const uint8_t* ext_comp_e4m3, int hot_comp_cap,
+    const uint16_t* s_lut,
     int32_t kv_idx, int d_lane, uint32_t* kv_pak_slot)
 {
-    const float sc = d_fp16_bits_to_f32(s_lut[comp_e4m3[size_t(kv_idx) * 32u + size_t(d_lane)]]);
-    const uint2 pb8 = *reinterpret_cast<const uint2*>(comp_fp4 + size_t(kv_idx) * 256u + d_lane * 8);
+    const bool is_ext = (kv_idx >= hot_comp_cap) && (ext_comp_fp4 != nullptr);
+    const uint8_t* src_fp4  = is_ext ? ext_comp_fp4  : comp_fp4;
+    const uint8_t* src_e4m3 = is_ext ? ext_comp_e4m3 : comp_e4m3;
+    const size_t slot = is_ext ? size_t(kv_idx - hot_comp_cap) : size_t(kv_idx);
+    const float sc = d_fp16_bits_to_f32(s_lut[src_e4m3[slot * 32u + size_t(d_lane)]]);
+    const uint2 pb8 = *reinterpret_cast<const uint2*>(src_fp4 + slot * 256u + d_lane * 8);
     const uint32_t words[2] = {pb8.x, pb8.y};
     #pragma unroll
     for (int w = 0; w < 2; ++w) {
@@ -2955,8 +2984,11 @@ void k_sparse_attn(
     int n_comp,
     uint16_t*       __restrict__ out_o_bf16,
     int M, int h_cnt,
-    uint64_t tree_anc_mask64,
-    uint32_t tree_depth_nibbles)
+    TreeAncMask256 tree_anc_mask,
+    uint64_t tree_depth_nibbles,
+    const uint8_t*  __restrict__ ext_comp_fp4,
+    const uint8_t*  __restrict__ ext_comp_e4m3,
+    int hot_comp_cap)
 {
     __shared__ uint16_t s_lut[256];
     __shared__ uint32_t s_kv_pak[8][256];
@@ -2985,16 +3017,17 @@ void k_sparse_attn(
 
     int win_first = 0, hist_valid = 0, n_win_m = 0;
     uint32_t anc_row = 0u;
+    const bool has_tree = tree_anc_mask.active();
     if (dspark_bidir) {
         win_first = max(swa_floor_pos, max(0, start_pos - 128));
         hist_valid = max(0, start_pos - win_first);
         n_win_m = hist_valid + M;
-    } else if (tree_anc_mask64 != 0ULL) {
-        const int q_pos = start_pos + int((tree_depth_nibbles >> (4 * m)) & 0xFu);
+    } else if (has_tree) {
+        const int q_pos = start_pos + d_tree_nibble64(tree_depth_nibbles, m);
         win_first = max(swa_floor_pos, max(0, q_pos - 127));
         hist_valid = max(0, start_pos - win_first);
         n_win_m = hist_valid + M;
-        anc_row = uint32_t((tree_anc_mask64 >> (8 * m)) & 0xFFULL);
+        anc_row = d_tree_anc_row16(tree_anc_mask, m);
     } else {
         const int q_pos = start_pos + m;
         win_first = max(swa_floor_pos, max(0, q_pos - 127));
@@ -3005,15 +3038,15 @@ void k_sparse_attn(
         const int slot = h_local;
         const int kv_ord = base + slot;
         int valid = (kv_ord < n_win_m) ? 1 : -1;
-        if (valid >= 0 && !dspark_bidir && tree_anc_mask64 != 0ULL && kv_ord >= hist_valid) {
+        if (valid >= 0 && !dspark_bidir && has_tree && kv_ord >= hist_valid) {
             const int j = kv_ord - hist_valid;
-            const int j_pos = start_pos + int((tree_depth_nibbles >> (4 * j)) & 0xFu);
+            const int j_pos = start_pos + d_tree_nibble64(tree_depth_nibbles, j);
             if (((anc_row >> j) & 1u) == 0u || j_pos < win_first) valid = -1;
         }
         if (d_lane == 0) s_valid[slot] = valid;
         if (valid >= 0) {
             const uint16_t* src = nullptr;
-            if (dspark_bidir || tree_anc_mask64 != 0ULL) {
+            if (dspark_bidir || has_tree) {
                 src = (kv_ord < hist_valid)
                     ? (win_kv_ring + size_t((win_first + kv_ord) & 127) * 512u + d_lane * 16)
                     : (cur_kv_bf16 + size_t(kv_ord - hist_valid) * 512u + d_lane * 16);
@@ -3042,7 +3075,10 @@ void k_sparse_attn(
             const int slot = h_local;
             const int32_t kv_idx = (base + slot < n_comp) ? c_idx_row[base + slot] : -1;
             if (d_lane == 0) s_valid[slot] = kv_idx;
-            if (kv_idx >= 0) d_load_comp_kv_pak(comp_fp4, comp_e4m3, s_lut, kv_idx, d_lane, s_kv_pak[slot]);
+            if (kv_idx >= 0) {
+                d_load_comp_kv_pak(comp_fp4, comp_e4m3, ext_comp_fp4, ext_comp_e4m3, hot_comp_cap,
+                                   s_lut, kv_idx, d_lane, s_kv_pak[slot]);
+            }
             __syncthreads();
 
             if (h < h_cnt) {
@@ -3144,7 +3180,10 @@ void k_sparse_attn_allheads(
     const int32_t*  __restrict__ comp_idxs,
     int n_comp,
     uint16_t*       __restrict__ out_o_bf16,
-    int h_cnt)
+    int h_cnt,
+    const uint8_t*  __restrict__ ext_comp_fp4,
+    const uint8_t*  __restrict__ ext_comp_e4m3,
+    int hot_comp_cap)
 {
     __shared__ uint16_t s_lut[256];
     __shared__ uint32_t s_kv_pak[8][256]; // 8.0 KiB conflict-free LDS -> 3 CTAs/CU (12 waves/CU)!
@@ -3209,7 +3248,10 @@ void k_sparse_attn_allheads(
         for (int base = 0; base < n_comp; base += 8) {
             const int32_t kv_idx = (base + h_loc < n_comp) ? c_idx_row[base + h_loc] : -1;
             if (d_lane == 0) s_valid[h_loc] = kv_idx;
-            if (kv_idx >= 0) d_load_comp_kv_pak(comp_fp4, comp_e4m3, s_lut, kv_idx, d_lane, s_kv_pak[h_loc]);
+            if (kv_idx >= 0) {
+                d_load_comp_kv_pak(comp_fp4, comp_e4m3, ext_comp_fp4, ext_comp_e4m3, hot_comp_cap,
+                                   s_lut, kv_idx, d_lane, s_kv_pak[h_loc]);
+            }
             __syncthreads();
 
             if (h < h_cnt) {
@@ -3240,7 +3282,7 @@ void k_sparse_attn_allheads(
     }
 }
 
-// 8-way Split-K Sparse Attention for M <= 8 Decode & DSpark Verify (3 CTAs/CU = 12 waves/CU, 8 KiB LDS, ScratchSize == 0!):
+// 8-way Split-K Sparse Attention for M <= 16 Decode & DSpark Verify (3 CTAs/CU = 12 waves/CU, 8 KiB LDS, ScratchSize == 0!):
 __global__ __launch_bounds__(256, 3)
 void k_sparse_attn_splitk(
     const uint16_t* __restrict__ q_bf16,
@@ -3254,8 +3296,11 @@ void k_sparse_attn_splitk(
     int n_comp,
     float*          __restrict__ split_scratch, // [M, 8, h_cnt, 514]
     int h_cnt,
-    uint64_t tree_anc_mask64,
-    uint32_t tree_depth_nibbles)
+    TreeAncMask256 tree_anc_mask,
+    uint64_t tree_depth_nibbles,
+    const uint8_t*  __restrict__ ext_comp_fp4,
+    const uint8_t*  __restrict__ ext_comp_e4m3,
+    int hot_comp_cap)
 {
     __shared__ uint16_t s_lut[256];
     __shared__ uint32_t s_kv_pak[8][256];
@@ -3281,13 +3326,14 @@ void k_sparse_attn_splitk(
         q_reg[j] = (h < h_cnt) ? d_bf16_to_f32(q_bf16[(size_t(m) * size_t(h_cnt) + size_t(h)) * 512u + d_lane * 16 + j]) : 0.0f;
     }
 
-    const int q_pos = tree_anc_mask64
-        ? (start_pos + int((tree_depth_nibbles >> (4 * m)) & 0xFu))
+    const bool has_tree = tree_anc_mask.active();
+    const int q_pos = has_tree
+        ? (start_pos + d_tree_nibble64(tree_depth_nibbles, m))
         : (start_pos + m);
     const int win_first = max(swa_floor_pos, max(0, q_pos - 127));
     const int hist_valid = max(0, start_pos - win_first);
-    const int n_win_m = tree_anc_mask64 ? (hist_valid + M_rows) : max(0, q_pos - win_first + 1);
-    const uint32_t anc_row = tree_anc_mask64 ? uint32_t((tree_anc_mask64 >> (8 * m)) & 0xFFULL) : 0u;
+    const int n_win_m = has_tree ? (hist_valid + M_rows) : max(0, q_pos - win_first + 1);
+    const uint32_t anc_row = has_tree ? d_tree_anc_row16(tree_anc_mask, m) : 0u;
     const int win_groups = (n_win_m + 7) >> 3;
     const int comp_groups = (n_comp > 0 && comp_fp4 && comp_e4m3 && comp_idxs) ? ((n_comp + 7) >> 3) : 0;
     const int total_groups = win_groups + comp_groups;
@@ -3304,15 +3350,15 @@ void k_sparse_attn_splitk(
         if (g_idx < win_groups) {
             const int kv_ord = g_idx * 8 + slot;
             int valid = (kv_ord < n_win_m) ? 1 : -1;
-            if (valid >= 0 && tree_anc_mask64 != 0ULL && kv_ord >= hist_valid) {
+            if (valid >= 0 && has_tree && kv_ord >= hist_valid) {
                 const int j = kv_ord - hist_valid;
-                const int j_pos = start_pos + int((tree_depth_nibbles >> (4 * j)) & 0xFu);
+                const int j_pos = start_pos + d_tree_nibble64(tree_depth_nibbles, j);
                 if (((anc_row >> j) & 1u) == 0u || j_pos < win_first) valid = -1;
             }
             if (d_lane == 0) s_valid[slot] = valid;
             if (valid >= 0) {
                 const uint16_t* src = nullptr;
-                if (tree_anc_mask64 != 0ULL) {
+                if (has_tree) {
                     src = (kv_ord < hist_valid)
                         ? (win_kv_ring + size_t((win_first + kv_ord) & 127) * 512u + d_lane * 16)
                         : (cur_kv_bf16 + size_t(kv_ord - hist_valid) * 512u + d_lane * 16);
@@ -3328,7 +3374,10 @@ void k_sparse_attn_splitk(
             const int base = (g_idx - win_groups) * 8;
             const int32_t kv_idx = (base + slot < n_comp) ? c_idx_row[base + slot] : -1;
             if (d_lane == 0) s_valid[slot] = kv_idx;
-            if (kv_idx >= 0) d_load_comp_kv_pak(comp_fp4, comp_e4m3, s_lut, kv_idx, d_lane, s_kv_pak[slot]);
+            if (kv_idx >= 0) {
+                d_load_comp_kv_pak(comp_fp4, comp_e4m3, ext_comp_fp4, ext_comp_e4m3, hot_comp_cap,
+                                   s_lut, kv_idx, d_lane, s_kv_pak[slot]);
+            }
         }
         __syncthreads();
 
@@ -3527,6 +3576,7 @@ void k_hlut2_pair_swiglu(
     const int ks = tid >> 5;            // 0..7
 
     const Mi50RoutedPair pr = pairs[p_idx];
+    if (pr.expert < 0 || pr.weight == 0.0f) return;
     const size_t e = size_t(pr.expert);
     const uint32_t* xr = x_rot_f16x2 + size_t(pr.row) * 2560u;
 
@@ -3631,6 +3681,7 @@ void k_hlut2_pair_down_atomic(
     const int g = tid >> 5;            // 0..5 (exact 128-group!)
 
     const Mi50RoutedPair pr = pairs[p_idx];
+    if (pr.expert < 0 || pr.weight == 0.0f) return;
     const size_t e = size_t(pr.expert);
     const uint32_t* xr = inter_rot_f16x2 + size_t(p_idx) * 384u + g * 64;
 
@@ -4352,25 +4403,26 @@ void k_hlut2_grouped_down32(
 __global__ __launch_bounds__(256)
 void k_commit_tree_win_kv_and_hidden(
     uint16_t*       __restrict__ win_kv_slab,      // [43, 128, 512]
-    const uint16_t* __restrict__ last_win_kv_slab, // [40, 8, 512]
-    uint16_t*       __restrict__ target_mean_bf16, // [>=16, 5120]
+    const uint16_t* __restrict__ last_win_kv_slab, // [40, tree_max_nodes, 512]
+    uint16_t*       __restrict__ target_mean_bf16, // [>=2*tree_max_nodes, 5120]
     int start_pos,
-    uint32_t acc_nodes_nibbles)
+    int tree_max_nodes,
+    uint64_t acc_nodes_nibbles)
 {
     const int bx  = int(blockIdx.x);  // 0..39 = layer win_kv, 40..59 = target_mean_bf16 cols
     const int d   = int(blockIdx.y);  // 0..accepted_A-1
     const int tid = int(threadIdx.x); // 0..255
-    const int src_node = int((acc_nodes_nibbles >> (4 * d)) & 0xFu);
+    const int src_node = d_tree_nibble64(acc_nodes_nibbles, d);
 
     if (bx < 40) {
-        const uint16_t* src = last_win_kv_slab + (size_t(bx) * 8u + size_t(src_node)) * 512u;
+        const uint16_t* src = last_win_kv_slab + (size_t(bx) * size_t(tree_max_nodes) + size_t(src_node)) * 512u;
         uint16_t* dst = win_kv_slab + (size_t(bx) * 128u + size_t((start_pos + d) & 127)) * 512u;
         dst[tid]       = src[tid];
         dst[256 + tid] = src[256 + tid];
     } else {
         const int col = (bx - 40) * 256 + tid;
         if (col < 5120) {
-            target_mean_bf16[size_t(8 + d) * 5120u + size_t(col)] =
+            target_mean_bf16[size_t(tree_max_nodes + d) * 5120u + size_t(col)] =
                 target_mean_bf16[size_t(src_node) * 5120u + size_t(col)];
         }
     }
@@ -4378,49 +4430,57 @@ void k_commit_tree_win_kv_and_hidden(
 
 __global__ __launch_bounds__(256)
 void k_commit_tree_global_kv_and_r2(
-    uint8_t* __restrict__ comp_fp4_0, uint8_t* __restrict__ comp_e4m3_0, uint8_t* __restrict__ idx_fp4_0, uint8_t* __restrict__ idx_ue8_0,
-    uint8_t* __restrict__ comp_fp4_1, uint8_t* __restrict__ comp_e4m3_1, uint8_t* __restrict__ idx_fp4_1, uint8_t* __restrict__ idx_ue8_1,
-    uint8_t* __restrict__ comp_fp4_2, uint8_t* __restrict__ comp_e4m3_2, uint8_t* __restrict__ idx_fp4_2, uint8_t* __restrict__ idx_ue8_2,
-    uint8_t* __restrict__ comp_fp4_3, uint8_t* __restrict__ comp_e4m3_3, uint8_t* __restrict__ idx_fp4_3, uint8_t* __restrict__ idx_ue8_3,
-    float* __restrict__ kv_state_0, float* __restrict__ sc_state_0, const float* __restrict__ kv_last_0, const float* __restrict__ sc_last_0,
-    float* __restrict__ kv_state_1, float* __restrict__ sc_state_1, const float* __restrict__ kv_last_1, const float* __restrict__ sc_last_1,
-    float* __restrict__ kv_state_2, float* __restrict__ sc_state_2, const float* __restrict__ kv_last_2, const float* __restrict__ sc_last_2,
+    TreeGlobalKvCommitArgs args,
     int start_pos,
     int accepted_A,
-    uint32_t acc_nodes_nibbles)
+    uint64_t acc_nodes_nibbles)
 {
+    __shared__ uint8_t s_cfp4[16][256];
+    __shared__ uint8_t s_ce4[16][32];
+    __shared__ uint8_t s_ifp4[16][64];
+    __shared__ uint8_t s_iue8[16][4];
+
     const int slot = int(blockIdx.x); // 0..3
     const int tid  = int(threadIdx.x);
 
-    uint8_t* c_fp4  = (slot == 0) ? comp_fp4_0  : ((slot == 1) ? comp_fp4_1  : ((slot == 2) ? comp_fp4_2  : comp_fp4_3));
-    uint8_t* c_e4m3 = (slot == 0) ? comp_e4m3_0 : ((slot == 1) ? comp_e4m3_1 : ((slot == 2) ? comp_e4m3_2 : comp_e4m3_3));
-    uint8_t* i_fp4  = (slot == 0) ? idx_fp4_0   : ((slot == 1) ? idx_fp4_1   : ((slot == 2) ? idx_fp4_2   : idx_fp4_3));
-    uint8_t* i_ue8  = (slot == 0) ? idx_ue8_0   : ((slot == 1) ? idx_ue8_1   : ((slot == 2) ? idx_ue8_2   : idx_ue8_3));
+    uint8_t* c_fp4    = (slot == 0) ? args.comp_fp4[0]      : ((slot == 1) ? args.comp_fp4[1]      : ((slot == 2) ? args.comp_fp4[2]      : args.comp_fp4[3]));
+    uint8_t* c_e4m3   = (slot == 0) ? args.comp_e4m3[0]     : ((slot == 1) ? args.comp_e4m3[1]     : ((slot == 2) ? args.comp_e4m3[2]     : args.comp_e4m3[3]));
+    uint8_t* ext_fp4  = (slot == 0) ? args.ext_comp_fp4[0]  : ((slot == 1) ? args.ext_comp_fp4[1]  : ((slot == 2) ? args.ext_comp_fp4[2]  : args.ext_comp_fp4[3]));
+    uint8_t* ext_e4m3 = (slot == 0) ? args.ext_comp_e4m3[0] : ((slot == 1) ? args.ext_comp_e4m3[1] : ((slot == 2) ? args.ext_comp_e4m3[2] : args.ext_comp_e4m3[3]));
+    uint8_t* i_fp4    = (slot == 0) ? args.idx_fp4[0]       : ((slot == 1) ? args.idx_fp4[1]       : ((slot == 2) ? args.idx_fp4[2]       : args.idx_fp4[3]));
+    uint8_t* i_ue8    = (slot == 0) ? args.idx_ue8[0]       : ((slot == 1) ? args.idx_ue8[1]       : ((slot == 2) ? args.idx_ue8[2]       : args.idx_ue8[3]));
+    const int hot_cap = (slot == 0) ? args.hot_comp_cap[0]  : ((slot == 1) ? args.hot_comp_cap[1]  : ((slot == 2) ? args.hot_comp_cap[2]  : args.hot_comp_cap[3]));
 
-    uint8_t r_cfp4[8];
-    uint8_t r_ce4[8];
-    uint8_t r_ifp4[8];
-    uint8_t r_iue8[8];
     int count = 0;
     const int base = (slot == 3) ? start_pos : (start_pos / 2);
 
     if (slot == 3) {
         count = accepted_A;
         for (int d = 0; d < accepted_A; ++d) {
-            const size_t s_idx = size_t(base + int((acc_nodes_nibbles >> (4 * d)) & 0xFu));
-            r_cfp4[d] = c_fp4[s_idx * 256u + size_t(tid)];
-            r_ce4[d]  = (tid < 32) ? c_e4m3[s_idx * 32u + size_t(tid)] : 0u;
-            r_ifp4[d] = (tid < 64) ? i_fp4[s_idx * 64u + size_t(tid)] : 0u;
-            r_iue8[d] = (tid < 4)  ? i_ue8[s_idx * 4u  + size_t(tid)] : 0u;
+            const int s_idx = base + d_tree_nibble64(acc_nodes_nibbles, d);
+            const bool is_ext = (s_idx >= hot_cap && ext_fp4 != nullptr);
+            const uint8_t* s_cfp4_ptr = is_ext ? (ext_fp4 + size_t(s_idx - hot_cap) * 256u) : (c_fp4 + size_t(s_idx) * 256u);
+            const uint8_t* s_ce4_ptr  = (s_idx >= hot_cap && ext_e4m3 != nullptr)
+                                            ? (ext_e4m3 + size_t(s_idx - hot_cap) * 32u)
+                                            : (c_e4m3 + size_t(s_idx) * 32u);
+            s_cfp4[d][tid] = s_cfp4_ptr[tid];
+            if (tid < 32) s_ce4[d][tid]  = s_ce4_ptr[tid];
+            if (tid < 64) s_ifp4[d][tid] = i_fp4[size_t(s_idx) * 64u + size_t(tid)];
+            if (tid < 4)  s_iue8[d][tid] = i_ue8[size_t(s_idx) * 4u  + size_t(tid)];
         }
     } else {
         for (int d = 0; d < accepted_A; ++d) {
             if (((start_pos + d) & 1) == 1) {
-                const size_t s_idx = size_t(base + int((acc_nodes_nibbles >> (4 * d)) & 0xFu));
-                r_cfp4[count] = c_fp4[s_idx * 256u + size_t(tid)];
-                r_ce4[count]  = (tid < 32) ? c_e4m3[s_idx * 32u + size_t(tid)] : 0u;
-                r_ifp4[count] = (tid < 64) ? i_fp4[s_idx * 64u + size_t(tid)] : 0u;
-                r_iue8[count] = (tid < 4)  ? i_ue8[s_idx * 4u  + size_t(tid)] : 0u;
+                const int s_idx = base + d_tree_nibble64(acc_nodes_nibbles, d);
+                const bool is_ext = (s_idx >= hot_cap && ext_fp4 != nullptr);
+                const uint8_t* s_cfp4_ptr = is_ext ? (ext_fp4 + size_t(s_idx - hot_cap) * 256u) : (c_fp4 + size_t(s_idx) * 256u);
+                const uint8_t* s_ce4_ptr  = (s_idx >= hot_cap && ext_e4m3 != nullptr)
+                                                ? (ext_e4m3 + size_t(s_idx - hot_cap) * 32u)
+                                                : (c_e4m3 + size_t(s_idx) * 32u);
+                s_cfp4[count][tid] = s_cfp4_ptr[tid];
+                if (tid < 32) s_ce4[count][tid]  = s_ce4_ptr[tid];
+                if (tid < 64) s_ifp4[count][tid] = i_fp4[size_t(s_idx) * 64u + size_t(tid)];
+                if (tid < 4)  s_iue8[count][tid] = i_ue8[size_t(s_idx) * 4u  + size_t(tid)];
                 ++count;
             }
         }
@@ -4428,19 +4488,25 @@ void k_commit_tree_global_kv_and_r2(
     __syncthreads();
 
     for (int k = 0; k < count; ++k) {
-        const size_t d_idx = size_t(base + k);
-        c_fp4[d_idx * 256u + size_t(tid)] = r_cfp4[k];
-        if (tid < 32) c_e4m3[d_idx * 32u + size_t(tid)] = r_ce4[k];
-        if (tid < 64) i_fp4[d_idx * 64u + size_t(tid)]  = r_ifp4[k];
-        if (tid < 4)  i_ue8[d_idx * 4u  + size_t(tid)]  = r_iue8[k];
+        const int d_idx = base + k;
+        uint8_t* d_cfp4_ptr = (d_idx >= hot_cap && ext_fp4 != nullptr)
+                                  ? (ext_fp4 + size_t(d_idx - hot_cap) * 256u)
+                                  : (c_fp4 + size_t(d_idx) * 256u);
+        uint8_t* d_ce4_ptr  = (d_idx >= hot_cap && ext_e4m3 != nullptr)
+                                  ? (ext_e4m3 + size_t(d_idx - hot_cap) * 32u)
+                                  : (c_e4m3 + size_t(d_idx) * 32u);
+        d_cfp4_ptr[tid] = s_cfp4[k][tid];
+        if (tid < 32) d_ce4_ptr[tid]                       = s_ce4[k][tid];
+        if (tid < 64) i_fp4[size_t(d_idx) * 64u + size_t(tid)] = s_ifp4[k][tid];
+        if (tid < 4)  i_ue8[size_t(d_idx) * 4u  + size_t(tid)] = s_iue8[k][tid];
     }
 
     if (slot < 3 && (((start_pos + accepted_A) & 1) == 1)) {
-        const int last_node = int((acc_nodes_nibbles >> (4 * (accepted_A - 1))) & 0xFu);
-        float* kv_st = (slot == 0) ? kv_state_0 : ((slot == 1) ? kv_state_1 : kv_state_2);
-        float* sc_st = (slot == 0) ? sc_state_0 : ((slot == 1) ? sc_state_1 : sc_state_2);
-        const float* kv_ls = (slot == 0) ? kv_last_0 : ((slot == 1) ? kv_last_1 : kv_last_2);
-        const float* sc_ls = (slot == 0) ? sc_last_0 : ((slot == 1) ? sc_last_1 : sc_last_2);
+        const int last_node = d_tree_nibble64(acc_nodes_nibbles, accepted_A - 1);
+        float* kv_st = (slot == 0) ? args.kv_state[0] : ((slot == 1) ? args.kv_state[1] : args.kv_state[2]);
+        float* sc_st = (slot == 0) ? args.sc_state[0] : ((slot == 1) ? args.sc_state[1] : args.sc_state[2]);
+        const float* kv_ls = (slot == 0) ? args.kv_last[0] : ((slot == 1) ? args.kv_last[1] : args.kv_last[2]);
+        const float* sc_ls = (slot == 0) ? args.sc_last[0] : ((slot == 1) ? args.sc_last[1] : args.sc_last[2]);
         kv_st[tid]       = kv_ls[size_t(last_node) * 512u + size_t(tid)];
         kv_st[256 + tid] = kv_ls[size_t(last_node) * 512u + 256u + size_t(tid)];
         sc_st[tid]       = sc_ls[size_t(last_node) * 512u + size_t(tid)];
@@ -4661,10 +4727,23 @@ void k_host_ring_allreduce_bf16(
     }
 }
 
+__global__ __launch_bounds__(64)
+void k_stamp_gpu_rtc(Dsv41GpuStageRtc* __restrict__ rtc) {
+    if (threadIdx.x == 0 && rtc != nullptr) {
+        const uint64_t now = __builtin_amdgcn_s_memrealtime();
+        __hip_atomic_store(&rtc->last_stamp, now, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+}
+
+void launch_stamp_gpu_rtc(Dsv41GpuStageRtc* d_stage_rtc, hipStream_t stream) {
+    if (d_stage_rtc == nullptr) return;
+    hipLaunchKernelGGL(k_stamp_gpu_rtc, dim3(1), dim3(64), 0, stream, d_stage_rtc);
+}
+
 __global__ __launch_bounds__(256, 4)
 void k_host_ring_allreduce_f32(
-    const float* __restrict__ d_src,
-    float*       __restrict__ d_dst,
+    const float* d_src,
+    float*       d_dst,
     HostRingAllReduceSlot* __restrict__ slot,
     int rank,
     uint64_t seq,
@@ -4707,7 +4786,9 @@ void k_host_ring_allreduce_f32(
 
     for (size_t i = gid0; i < n_elems; i += stride) {
         float v[3];
-        v[rank] = d_src[i];
+        v[rank] = (d_src == d_dst)
+                      ? __uint_as_float(__hip_atomic_load(&slot->payload[rank][i], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM))
+                      : d_src[i];
         v[p1]   = __uint_as_float(__hip_atomic_load(&slot->payload[p1][i], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM));
         v[p2]   = __uint_as_float(__hip_atomic_load(&slot->payload[p2][i], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM));
         d_dst[i] = (v[0] + v[1]) + v[2];
@@ -4745,7 +4826,8 @@ void k_host_ring_allreduce_f32_hc_post(
     HostRingAllReduceSlot* __restrict__ slot,
     int rank,
     uint64_t seq,
-    int M)
+    int M,
+    Dsv41GpuStageRtc* __restrict__ rtc)
 {
     const int tid = int(threadIdx.x);
     const int d   = int(blockIdx.x) * 256 + tid;  // 20 CTAs * 256 = 5120 columns (co-resident <= 60 CUs!)
@@ -4820,6 +4902,14 @@ void k_host_ring_allreduce_f32_hc_post(
         if (prev + 1u == uint32_t(gridDim.x)) {
             __hip_atomic_store(&slot->read_ctas[rank][0], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
             __hip_atomic_store(&slot->done_seq[rank][0], seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+            if (rank == 0 && rtc != nullptr) {
+                const uint64_t now = __builtin_amdgcn_s_memrealtime();
+                const uint64_t p_st = __hip_atomic_load(&rtc->last_stamp, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+                if (now > p_st && p_st != 0ULL) {
+                    __hip_atomic_fetch_add(&rtc->att_ticks, now - p_st, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+                }
+                __hip_atomic_store(&rtc->last_stamp, now, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+            }
         }
     }
 }
@@ -4874,7 +4964,10 @@ void k_host_ring_finish_f32_hc_post(
     HostRingAllReduceSlot* __restrict__ slot,
     int rank,
     uint64_t seq,
-    int M)
+    int M,
+    const uint32_t* __restrict__ d_p150_resp_seq,
+    uint32_t p150_req_seq,
+    Dsv41GpuStageRtc* __restrict__ rtc)
 {
     const int tid = int(threadIdx.x);
     const int d   = int(blockIdx.x) * 256 + tid;
@@ -4885,6 +4978,28 @@ void k_host_ring_finish_f32_hc_post(
         while (__hip_atomic_load(&slot->ready_seq[p1][0], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq ||
                __hip_atomic_load(&slot->ready_seq[p2][0], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq) {
             __builtin_amdgcn_s_sleep(1);
+        }
+        if (rank == 0 && blockIdx.x == 0 && rtc != nullptr) {
+            const uint64_t t_moe = __builtin_amdgcn_s_memrealtime();
+            const uint64_t p_st  = __hip_atomic_load(&rtc->last_stamp, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+            if (t_moe > p_st && p_st != 0ULL) {
+                __hip_atomic_fetch_add(&rtc->mi50_moe_ticks, t_moe - p_st, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            }
+            __hip_atomic_store(&rtc->last_stamp, t_moe, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        }
+        if (d_p150_resp_seq != nullptr) {
+            while (static_cast<int32_t>(
+                       __hip_atomic_load(d_p150_resp_seq, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) - p150_req_seq) < 0) {
+                __builtin_amdgcn_s_sleep(1);
+            }
+            if (rank == 0 && blockIdx.x == 0 && rtc != nullptr) {
+                const uint64_t t_p150 = __builtin_amdgcn_s_memrealtime();
+                const uint64_t p_st   = __hip_atomic_load(&rtc->last_stamp, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+                if (t_p150 > p_st && p_st != 0ULL) {
+                    __hip_atomic_fetch_add(&rtc->p150_wait_ticks, t_p150 - p_st, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+                }
+                __hip_atomic_store(&rtc->last_stamp, t_p150, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+            }
         }
     }
     __syncthreads();
@@ -4927,6 +5042,14 @@ void k_host_ring_finish_f32_hc_post(
         if (prev + 1u == uint32_t(gridDim.x)) {
             __hip_atomic_store(&slot->read_ctas[rank][0], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
             __hip_atomic_store(&slot->done_seq[rank][0], seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+            if (rank == 0 && rtc != nullptr) {
+                const uint64_t now = __builtin_amdgcn_s_memrealtime();
+                const uint64_t p_st = __hip_atomic_load(&rtc->last_stamp, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+                if (now > p_st && p_st != 0ULL) {
+                    __hip_atomic_fetch_add(&rtc->ar_ticks, now - p_st, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+                }
+                __hip_atomic_store(&rtc->last_stamp, now, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+            }
         }
     }
 }
@@ -4945,12 +5068,13 @@ void launch_host_ring_allreduce_f32_hc_post(
     const float* d_src_f32, const uint16_t* d_p150_bf16,
     const uint16_t* d_res_bf16, const float* d_post_f32, const float* d_comb_f32,
     uint16_t* d_out_h_bf16, HostRingAllReduceSlot* d_mapped_slot,
-    int rank, uint64_t seq, int M, hipStream_t stream)
+    int rank, uint64_t seq, int M, hipStream_t stream,
+    Dsv41GpuStageRtc* d_stage_rtc)
 {
     if (M <= 0) return;
     hipLaunchKernelGGL(k_host_ring_allreduce_f32_hc_post, dim3(20), dim3(256), 0, stream,
                        d_src_f32, d_p150_bf16, d_res_bf16, d_post_f32, d_comb_f32,
-                       d_out_h_bf16, d_mapped_slot, rank, seq, M);
+                       d_out_h_bf16, d_mapped_slot, rank, seq, M, d_stage_rtc);
 }
 
 void launch_host_ring_upload_f32(
@@ -4966,12 +5090,15 @@ void launch_host_ring_finish_f32_hc_post(
     const float* d_src_f32, const uint16_t* d_p150_bf16,
     const uint16_t* d_res_bf16, const float* d_post_f32, const float* d_comb_f32,
     uint16_t* d_out_h_bf16, HostRingAllReduceSlot* d_mapped_slot,
-    int rank, uint64_t seq, int M, hipStream_t stream)
+    int rank, uint64_t seq, int M, hipStream_t stream,
+    const uint32_t* d_p150_resp_seq, uint32_t p150_req_seq,
+    Dsv41GpuStageRtc* d_stage_rtc)
 {
     if (M <= 0) return;
     hipLaunchKernelGGL(k_host_ring_finish_f32_hc_post, dim3(20), dim3(256), 0, stream,
                        d_src_f32, d_p150_bf16, d_res_bf16, d_post_f32, d_comb_f32,
-                       d_out_h_bf16, d_mapped_slot, rank, seq, M);
+                       d_out_h_bf16, d_mapped_slot, rank, seq, M,
+                       d_p150_resp_seq, p150_req_seq, d_stage_rtc);
 }
 
 void launch_add_bf16_3way(
@@ -5209,13 +5336,13 @@ void launch_split_qkv_norm_rope_quant(
     bool use_comp_yarn,
     uint16_t* d_out_qr_bf16, uint16_t* d_out_kv_bf16,
     int M, int pos_base, float eps, hipStream_t stream,
-    uint64_t tree_anc_mask64, uint32_t tree_depth_nibbles)
+    TreeAncMask256 tree_anc_mask, uint64_t tree_depth_nibbles)
 {
     if (M <= 0) return;
     hipLaunchKernelGGL(k_split_qkv_norm_rope_quant, dim3(2, M), dim3(256), 0, stream,
                        d_qkv_bf16, d_q_norm_bf16, d_kv_norm_bf16, use_comp_yarn,
                        d_out_qr_bf16, d_out_kv_bf16, pos_base, eps,
-                       tree_anc_mask64, tree_depth_nibbles);
+                       tree_anc_mask, tree_depth_nibbles);
 }
 
 void init_rope_inv_freq_gpu()
@@ -5284,16 +5411,16 @@ void init_rope_inv_freq_gpu()
 void launch_rope_tail64_bf16(
     uint16_t* d_x_bf16, bool use_comp_yarn,
     int M, int H, int D, int pos_base, int pos_stride, bool inverse, hipStream_t stream,
-    uint64_t tree_anc_mask64, uint32_t tree_depth_nibbles)
+    TreeAncMask256 tree_anc_mask, uint64_t tree_depth_nibbles)
 {
     if (M <= 0 || H <= 0) return;
-    if (M >= 16 && pos_stride == 1 && tree_anc_mask64 == 0ULL) {
+    if (M >= 16 && pos_stride == 1 && !tree_anc_mask.active()) {
         hipLaunchKernelGGL(k_rope_tail64_givens_bf16, dim3((H + 3) / 4, (M + 63) / 64), dim3(256), 0, stream,
                            d_x_bf16, use_comp_yarn, M, H, D, pos_base, inverse);
     } else {
         hipLaunchKernelGGL(k_rope_tail64_bf16, dim3(H, M), dim3(32), 0, stream,
                            d_x_bf16, use_comp_yarn, H, D, pos_base, pos_stride, inverse,
-                           tree_anc_mask64, tree_depth_nibbles);
+                           tree_anc_mask, tree_depth_nibbles);
     }
 }
 
@@ -5312,7 +5439,7 @@ void launch_compressor_r2_tree_pool(
     const float* d_kv_f32, const float* d_score_f32,
     const float* d_kv_state_f32, const float* d_score_state_f32,
     uint16_t* d_out_pool_bf16, int start_pos, int M,
-    uint32_t tree_depth_nibbles, uint32_t tree_parent_nibbles, hipStream_t stream)
+    uint64_t tree_depth_nibbles, uint64_t tree_parent_nibbles, hipStream_t stream)
 {
     if (M <= 0) return;
     hipLaunchKernelGGL(k_compressor_r2_tree_pool, dim3(2), dim3(256), 0, stream,
@@ -5322,11 +5449,13 @@ void launch_compressor_r2_tree_pool(
 
 void launch_pack_compress_kv_fp4_e4m3_16(
     const uint16_t* d_latent_bf16, uint8_t* d_cache_fp4, uint8_t* d_cache_e4m3,
-    int slot_offset, int N_lat, hipStream_t stream)
+    int slot_offset, int N_lat, hipStream_t stream,
+    uint8_t* d_ext_cache_fp4, uint8_t* d_ext_cache_e4m3, int hot_comp_cap)
 {
     if (N_lat <= 0) return;
     hipLaunchKernelGGL(k_pack_compress_kv_fp4_e4m3_16, dim3(N_lat), dim3(256), 0, stream,
-                       d_latent_bf16, d_cache_fp4, d_cache_e4m3, slot_offset);
+                       d_latent_bf16, d_cache_fp4, d_cache_e4m3, slot_offset,
+                       d_ext_cache_fp4, d_ext_cache_e4m3, hot_comp_cap);
 }
 
 void launch_pack_index_k_fp4_ue8m0_32(
@@ -5375,17 +5504,17 @@ void launch_indexer_score(
 }
 
 void launch_indexer_candidates_and_topk(
-    float* d_score_f32, uint8_t* d_cand_block_mask, int cand_block_stride,
+    float* d_score_f32, uint32_t* d_cand_block_mask, int cand_block_stride,
     int32_t* d_out_comp_idxs,
     int M, int T_comp, int start_pos, int ratio, int mode, int K_out, hipStream_t stream,
-    uint64_t tree_anc_mask64, uint32_t tree_depth_nibbles, int q_row_offset)
+    TreeAncMask256 tree_anc_mask, uint64_t tree_depth_nibbles, int q_row_offset)
 {
     if (M <= 0 || T_comp <= 0 || K_out <= 0) return;
     float* block_scratch = d_score_f32 + size_t(M) * size_t(T_comp);
     hipLaunchKernelGGL(k_indexer_candidates_and_topk, dim3(M), dim3(256), 0, stream,
                        d_score_f32, d_cand_block_mask, cand_block_stride,
                        d_out_comp_idxs, T_comp, start_pos, ratio, mode, K_out, block_scratch,
-                       tree_anc_mask64, tree_depth_nibbles, q_row_offset);
+                       tree_anc_mask, tree_depth_nibbles, q_row_offset);
 }
 
 void launch_sparse_attn(
@@ -5395,61 +5524,53 @@ void launch_sparse_attn(
     const uint8_t* d_comp_fp4, const uint8_t* d_comp_e4m3, const int32_t* d_comp_idxs, int n_comp,
     float* d_splitk_scratch,
     uint16_t* d_out_o_bf16, int M, int h_cnt, hipStream_t stream,
-    uint64_t tree_anc_mask64, uint32_t tree_depth_nibbles)
+    TreeAncMask256 tree_anc_mask, uint64_t tree_depth_nibbles,
+    const uint8_t* d_ext_comp_fp4, const uint8_t* d_ext_comp_e4m3, int hot_comp_cap)
 {
     if (M <= 0 || h_cnt <= 0) return;
     const int max_win = std::min(128, std::max(0, start_pos + M - swa_floor_pos));
-    if (M <= 8 && !dspark_bidir && d_splitk_scratch != nullptr && (max_win + n_comp) >= 64) {
+    if (M <= 16 && !dspark_bidir && d_splitk_scratch != nullptr && (max_win + n_comp) >= 64) {
         hipLaunchKernelGGL(k_sparse_attn_splitk, dim3(M, (h_cnt + 7) / 8, 8), dim3(256), 0, stream,
                            d_q_bf16, d_win_kv_ring, d_cur_kv_bf16, start_pos, swa_floor_pos,
                            d_comp_fp4, d_comp_e4m3, d_comp_idxs, n_comp,
-                           d_splitk_scratch, h_cnt, tree_anc_mask64, tree_depth_nibbles);
+                           d_splitk_scratch, h_cnt, tree_anc_mask, tree_depth_nibbles,
+                           d_ext_comp_fp4, d_ext_comp_e4m3, hot_comp_cap);
         hipLaunchKernelGGL(k_sparse_attn_reduce_splits, dim3(M, h_cnt), dim3(256), 0, stream,
                            d_splitk_scratch, d_attn_sink_f32, d_out_o_bf16, h_cnt);
-    } else if (M > 16 && !dspark_bidir && tree_anc_mask64 == 0ULL && h_cnt >= 8) {
+    } else if (M > 16 && !dspark_bidir && !tree_anc_mask.active() && h_cnt >= 8) {
         hipLaunchKernelGGL(k_sparse_attn_allheads, dim3(M, (h_cnt + 7) / 8), dim3(256), 0, stream,
                            d_q_bf16, d_attn_sink_f32,
                            d_win_kv_ring, d_cur_kv_bf16, start_pos, swa_floor_pos,
                            d_comp_fp4, d_comp_e4m3, d_comp_idxs, n_comp,
-                           d_out_o_bf16, h_cnt);
+                           d_out_o_bf16, h_cnt,
+                           d_ext_comp_fp4, d_ext_comp_e4m3, hot_comp_cap);
     } else {
         hipLaunchKernelGGL(k_sparse_attn, dim3(M, (h_cnt + 7) / 8), dim3(256), 0, stream,
                            d_q_bf16, d_attn_sink_f32,
                            d_win_kv_ring, d_cur_kv_bf16, start_pos, swa_floor_pos, dspark_bidir,
                            d_comp_fp4, d_comp_e4m3, d_comp_idxs, n_comp,
-                           d_out_o_bf16, M, h_cnt, tree_anc_mask64, tree_depth_nibbles);
+                           d_out_o_bf16, M, h_cnt, tree_anc_mask, tree_depth_nibbles,
+                           d_ext_comp_fp4, d_ext_comp_e4m3, hot_comp_cap);
     }
 }
 
 void launch_commit_tree_win_kv_and_hidden(
     uint16_t* d_win_kv_slab, const uint16_t* d_last_win_kv_slab, uint16_t* d_target_mean_bf16,
-    int start_pos, int accepted_A, uint32_t acc_nodes_nibbles, hipStream_t stream)
+    int start_pos, int accepted_A, int tree_max_nodes, uint64_t acc_nodes_nibbles, hipStream_t stream)
 {
     if (accepted_A <= 0) return;
     hipLaunchKernelGGL(k_commit_tree_win_kv_and_hidden, dim3(60, accepted_A), dim3(256), 0, stream,
-                       d_win_kv_slab, d_last_win_kv_slab, d_target_mean_bf16, start_pos, acc_nodes_nibbles);
+                       d_win_kv_slab, d_last_win_kv_slab, d_target_mean_bf16,
+                       start_pos, tree_max_nodes, acc_nodes_nibbles);
 }
 
 void launch_commit_tree_global_kv_and_r2(
-    uint8_t* d_comp_fp4_0, uint8_t* d_comp_e4m3_0, uint8_t* d_idx_fp4_0, uint8_t* d_idx_ue8_0,
-    uint8_t* d_comp_fp4_1, uint8_t* d_comp_e4m3_1, uint8_t* d_idx_fp4_1, uint8_t* d_idx_ue8_1,
-    uint8_t* d_comp_fp4_2, uint8_t* d_comp_e4m3_2, uint8_t* d_idx_fp4_2, uint8_t* d_idx_ue8_2,
-    uint8_t* d_comp_fp4_3, uint8_t* d_comp_e4m3_3, uint8_t* d_idx_fp4_3, uint8_t* d_idx_ue8_3,
-    float* d_kv_state_0, float* d_sc_state_0, const float* d_kv_last_0, const float* d_sc_last_0,
-    float* d_kv_state_1, float* d_sc_state_1, const float* d_kv_last_1, const float* d_sc_last_1,
-    float* d_kv_state_2, float* d_sc_state_2, const float* d_kv_last_2, const float* d_sc_last_2,
-    int start_pos, int accepted_A, uint32_t acc_nodes_nibbles, hipStream_t stream)
+    const TreeGlobalKvCommitArgs& args,
+    int start_pos, int accepted_A, uint64_t acc_nodes_nibbles, hipStream_t stream)
 {
     if (accepted_A <= 0) return;
     hipLaunchKernelGGL(k_commit_tree_global_kv_and_r2, dim3(4), dim3(256), 0, stream,
-                       d_comp_fp4_0, d_comp_e4m3_0, d_idx_fp4_0, d_idx_ue8_0,
-                       d_comp_fp4_1, d_comp_e4m3_1, d_idx_fp4_1, d_idx_ue8_1,
-                       d_comp_fp4_2, d_comp_e4m3_2, d_idx_fp4_2, d_idx_ue8_2,
-                       d_comp_fp4_3, d_comp_e4m3_3, d_idx_fp4_3, d_idx_ue8_3,
-                       d_kv_state_0, d_sc_state_0, d_kv_last_0, d_sc_last_0,
-                       d_kv_state_1, d_sc_state_1, d_kv_last_1, d_sc_last_1,
-                       d_kv_state_2, d_sc_state_2, d_kv_last_2, d_sc_last_2,
-                       start_pos, accepted_A, acc_nodes_nibbles);
+                       args, start_pos, accepted_A, acc_nodes_nibbles);
 }
 
 void launch_moe_gate(
@@ -5463,32 +5584,202 @@ void launch_moe_gate(
                        d_out_ids, d_out_weights, n_routed, top_k, route_scale);
 }
 
-__global__ __launch_bounds__(64)
-void k_pack_mtp_routed_pairs(
+__global__ __launch_bounds__(256, 4)
+void k_stage_and_arm_p150_shm(
+    Dsv41P150ShmChannel* __restrict__ shm,
+    uint32_t*            __restrict__ wg_sync_counter,
+    const int32_t*       __restrict__ topk_ids,
+    const float*         __restrict__ topk_weights,
+    const uint16_t*      __restrict__ x_rot_bf16,
+    uint32_t layer_id,
+    int M,
+    int top_k,
+    int expert_base,
+    uint32_t req_seq)
+{
+    __shared__ uint32_t s_active_pairs;
+    const int tid = int(threadIdx.x);
+    const uint32_t rslot = (req_seq - 1u) & (DSV41_P150_FAST_RING_SLOTS - 1u);
+    Dsv41P150FastRingSlot* rs = &shm->fast_slots[rslot];
+
+    if (req_seq > DSV41_P150_FAST_RING_SLOTS && tid == 0) {
+        const uint32_t min_done = req_seq - DSV41_P150_FAST_RING_SLOTS;
+        while (static_cast<int32_t>(
+                   __hip_atomic_load(reinterpret_cast<const uint32_t*>(&shm->resp_seq),
+                                     __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) - min_done) < 0) {
+            __builtin_amdgcn_s_sleep(1);
+        }
+    }
+    __syncthreads();
+
+    if (blockIdx.x == 0) {
+        if (tid == 0) s_active_pairs = 0u;
+        __syncthreads();
+        if (tid < M) {
+            uint32_t cur = 0u;
+            for (int k = 0; k < top_k; ++k) {
+                const int32_t eid = topk_ids[tid * top_k + k];
+                const float w = topk_weights[tid * top_k + k];
+                if (eid >= expert_base && w != 0.0f && cur < DSV41_P150_MAX_SLOTS) {
+                    rs->row_slots[tid][cur]   = eid - expert_base;
+                    rs->row_weights[tid][cur] = w;
+                    ++cur;
+                }
+            }
+            for (uint32_t s = cur; s < DSV41_P150_MAX_SLOTS; ++s) {
+                rs->row_slots[tid][s]   = -1;
+                rs->row_weights[tid][s] = 0.0f;
+            }
+            if (cur > 0u) atomicAdd(&s_active_pairs, cur);
+        }
+        __syncthreads();
+        if (tid == 0) {
+            rs->layer = layer_id;
+            rs->rows  = uint32_t(M);
+            rs->input_is_wht_rotated = 1u;
+            rs->active_pairs = s_active_pairs;
+            rs->status = 0;
+            rs->zero_output = (s_active_pairs == 0u) ? 1u : 0u;
+        }
+    }
+
+    const size_t total_u32 = (size_t(M) * size_t(DSV41_P150_H)) >> 1;
+    const uint32_t* src_u32 = reinterpret_cast<const uint32_t*>(x_rot_bf16);
+    uint32_t* dst_u32 = reinterpret_cast<uint32_t*>(rs->x_in_bf16);
+    const size_t stride = size_t(gridDim.x) * 256u;
+    for (size_t w = size_t(blockIdx.x) * 256u + size_t(tid); w < total_u32; w += stride) {
+        __hip_atomic_store(&dst_u32[w], src_u32[w], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        __threadfence_system();
+        const uint32_t prev = __hip_atomic_fetch_add(wg_sync_counter, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        if (prev + 1u == uint32_t(gridDim.x)) {
+            __hip_atomic_store(wg_sync_counter, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            if (req_seq > 1u) {
+                const uint32_t prev_req = req_seq - 1u;
+                while (static_cast<int32_t>(
+                           __hip_atomic_load(reinterpret_cast<const uint32_t*>(&shm->resp_seq),
+                                             __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) - prev_req) < 0) {
+                    __builtin_amdgcn_s_sleep(1);
+                }
+            }
+            __hip_atomic_store(&shm->op, uint32_t(DSV41_P150_OP_MOE_RING_SLOT), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            __hip_atomic_store(&shm->ring_slot, rslot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            __threadfence_system();
+            __hip_atomic_store(reinterpret_cast<uint32_t*>(&shm->req_seq), req_seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        }
+    }
+}
+
+void launch_stage_and_arm_p150_shm(
+    Dsv41P150ShmChannel* d_mapped_shm,
+    uint32_t* d_wg_sync_counter,
+    const int32_t* d_topk_ids,
+    const float* d_topk_weights,
+    const uint16_t* d_x_rot_bf16,
+    uint32_t layer_id,
+    int M, int top_k, int expert_base,
+    uint32_t req_seq,
+    hipStream_t stream)
+{
+    if (d_mapped_shm == nullptr || M <= 0 || M > int(DSV41_P150_FAST_MAX_ROWS)) return;
+    hipLaunchKernelGGL(k_stage_and_arm_p150_shm, dim3(8), dim3(256), 0, stream,
+                       d_mapped_shm, d_wg_sync_counter, d_topk_ids, d_topk_weights, d_x_rot_bf16,
+                       layer_id, M, top_k, expert_base, req_seq);
+}
+
+__global__ __launch_bounds__(256)
+void k_pack_mi50_routed_pairs_compact256(
     const int32_t* __restrict__ topk_ids,
     const float*   __restrict__ topk_w,
     Mi50RoutedPair* __restrict__ out_pairs,
     int total_pairs,
-    int top_k)
+    int top_k,
+    int max_expert)
+{
+    __shared__ uint32_t s_cnt;
+    const int tid = int(threadIdx.x);
+    if (tid == 0) s_cnt = 0u;
+    __syncthreads();
+
+    bool valid = false;
+    Mi50RoutedPair p{};
+    if (tid < total_pairs) {
+        const int32_t eid = topk_ids[tid];
+        const float   w   = topk_w[tid];
+        if (eid >= 0 && eid < max_expert && w != 0.0f) {
+            valid = true;
+            p.row    = tid / top_k;
+            p.expert = eid;
+            p.weight = w;
+            p.pad    = 0;
+        }
+    }
+    if (valid) {
+        const uint32_t slot = atomicAdd(&s_cnt, 1u);
+        out_pairs[slot] = p;
+    }
+    __syncthreads();
+
+    const uint32_t n_valid = s_cnt;
+    if (tid >= int(n_valid) && tid < total_pairs) {
+        Mi50RoutedPair inv{};
+        inv.row    = 0;
+        inv.expert = -1;
+        inv.weight = 0.0f;
+        inv.pad    = 0;
+        out_pairs[tid] = inv;
+    }
+}
+
+__global__ __launch_bounds__(64)
+void k_pack_mi50_routed_pairs(
+    const int32_t* __restrict__ topk_ids,
+    const float*   __restrict__ topk_w,
+    Mi50RoutedPair* __restrict__ out_pairs,
+    int total_pairs,
+    int top_k,
+    int max_expert)
 {
     const int idx = int(blockIdx.x) * 64 + int(threadIdx.x);
     if (idx >= total_pairs) return;
+    const int32_t eid = topk_ids[idx];
+    const float   w   = topk_w[idx];
     Mi50RoutedPair p;
-    p.row    = idx / top_k;
-    p.expert = topk_ids[idx];
-    p.weight = topk_w[idx];
-    p.pad    = 0;
+    p.row = idx / top_k;
+    if (eid >= 0 && eid < max_expert && w != 0.0f) {
+        p.expert = eid;
+        p.weight = w;
+    } else {
+        p.expert = -1;
+        p.weight = 0.0f;
+    }
+    p.pad = 0;
     out_pairs[idx] = p;
+}
+
+void launch_pack_mi50_routed_pairs(
+    const int32_t* d_topk_ids, const float* d_topk_weights,
+    Mi50RoutedPair* d_out_pairs, int M, int top_k, int max_expert, hipStream_t stream)
+{
+    const int total_pairs = M * top_k;
+    if (total_pairs <= 0) return;
+    if (total_pairs <= 256) {
+        hipLaunchKernelGGL(k_pack_mi50_routed_pairs_compact256, dim3(1), dim3(256), 0, stream,
+                           d_topk_ids, d_topk_weights, d_out_pairs, total_pairs, top_k, max_expert);
+        return;
+    }
+    hipLaunchKernelGGL(k_pack_mi50_routed_pairs, dim3((total_pairs + 63) / 64), dim3(64), 0, stream,
+                       d_topk_ids, d_topk_weights, d_out_pairs, total_pairs, top_k, max_expert);
 }
 
 void launch_pack_mtp_routed_pairs(
     const int32_t* d_topk_ids, const float* d_topk_weights,
     Mi50RoutedPair* d_out_pairs, int M, int top_k, hipStream_t stream)
 {
-    const int total_pairs = M * top_k;
-    if (total_pairs <= 0) return;
-    hipLaunchKernelGGL(k_pack_mtp_routed_pairs, dim3((total_pairs + 63) / 64), dim3(64), 0, stream,
-                       d_topk_ids, d_topk_weights, d_out_pairs, total_pairs, top_k);
+    launch_pack_mi50_routed_pairs(d_topk_ids, d_topk_weights, d_out_pairs, M, top_k, 128, stream);
 }
 
 void launch_wht128_bf16_to_f16(
@@ -5536,10 +5827,6 @@ void launch_mi50_routed_hlut2_grouped(
     float* d_out_accum_f32, hipStream_t stream)
 {
     if (num_active <= 0 || P <= 0) return;
-    // Wave 7B: M >= 64 CED prefill forces the expert-major BM=16 grouped SwiGLU path.
-    // Each active expert block unpacks one 272 B HLUT2 superblock tile and reuses it
-    // across 16 routed token rows in v_dot2_f32_f16 (FP32 accumulation, single RNE round),
-    // eliminating the BM=8 re-read that Wave 6C used whenever P <= 640.
     if (M >= 64) {
         hipLaunchKernelGGL(
             k_hlut2_grouped_swiglu16, dim3(6, num_active), dim3(256), 0, stream,
@@ -5556,7 +5843,7 @@ void launch_mi50_routed_hlut2_grouped(
             d_out_accum_f32);
         return;
     }
-    if (P <= 640) {
+    if (M < 16 && P <= 640) {
         hipLaunchKernelGGL(
             k_hlut2_grouped_swiglu8, dim3(6, num_active), dim3(256), 0, stream,
             reinterpret_cast<const uint32_t*>(d_x_rot_f16),
@@ -5614,8 +5901,8 @@ void launch_add_bf16_2way_inplace(uint16_t* d_dst_bf16, const uint16_t* d_src_bf
     hipLaunchKernelGGL(k_add_bf16_2way_inplace, dim3((n_elems + 255) / 256), dim3(256), 0, stream, d_dst_bf16, d_src_bf16, n_elems);
 }
 
-__global__ __launch_bounds__(128)
-void k_build_mtp_csr(
+__global__ __launch_bounds__(256)
+void k_build_mi50_csr(
     const int32_t* __restrict__ topk_ids,
     const float*   __restrict__ topk_w,
     int32_t*       __restrict__ active_experts,
@@ -5625,11 +5912,11 @@ void k_build_mtp_csr(
     int top_k,
     int n_experts)
 {
-    __shared__ int32_t s_cnt[128];
-    __shared__ int32_t s_off[129];
-    __shared__ int32_t s_act[128];
+    __shared__ int32_t s_cnt[256];
+    __shared__ int32_t s_off[257];
+    __shared__ int32_t s_act[256];
 
-    const int tid = int(threadIdx.x); // 0..127
+    const int tid = int(threadIdx.x); // 0..255
     int my_cnt = 0;
     if (tid < n_experts) {
         for (int i = 0; i < total_pairs; ++i) {
@@ -5681,16 +5968,25 @@ void k_build_mtp_csr(
     }
 }
 
-void launch_build_mtp_csr(
+void launch_build_mi50_csr(
     const int32_t* d_topk_ids, const float* d_topk_weights,
     int32_t* d_active_experts, int32_t* d_csr_offsets, Mi50RoutedPair* d_sorted_pairs,
     int M, int top_k, int n_experts, hipStream_t stream)
 {
     const int total_pairs = M * top_k;
-    if (total_pairs <= 0 || n_experts <= 0 || n_experts > 128) return;
-    hipLaunchKernelGGL(k_build_mtp_csr, dim3(1), dim3(128), 0, stream,
+    if (total_pairs <= 0 || n_experts <= 0 || n_experts > 256) return;
+    hipLaunchKernelGGL(k_build_mi50_csr, dim3(1), dim3(256), 0, stream,
                        d_topk_ids, d_topk_weights, d_active_experts, d_csr_offsets, d_sorted_pairs,
                        total_pairs, top_k, n_experts);
+}
+
+void launch_build_mtp_csr(
+    const int32_t* d_topk_ids, const float* d_topk_weights,
+    int32_t* d_active_experts, int32_t* d_csr_offsets, Mi50RoutedPair* d_sorted_pairs,
+    int M, int top_k, int n_experts, hipStream_t stream)
+{
+    launch_build_mi50_csr(d_topk_ids, d_topk_weights, d_active_experts, d_csr_offsets, d_sorted_pairs,
+                          M, top_k, n_experts, stream);
 }
 
 void launch_keep_dpm_warm(
@@ -6110,27 +6406,27 @@ void k_dspark_prepare_tree_markov_emb(
     const uint16_t*      __restrict__ mapped_markov_embed_bf16,
     uint16_t*            __restrict__ out_markov_emb_bf16,
     uint64_t seq,
-    int wait_stage,
+    uint32_t wait_stage_mask,
+    uint32_t src_slots_nibbles,
     int num_rows)
 {
     const int tid = int(threadIdx.x);
     if (tid == 0) {
-        while (__hip_atomic_load(&ctrl->ready_tree_stage_seq[wait_stage], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq) {
-            __builtin_amdgcn_s_sleep(1);
+        for (int s = 0; s < kDsparkMaxStages; ++s) {
+            if ((wait_stage_mask >> s) & 1u) {
+                while (__hip_atomic_load(&ctrl->ready_tree_stage_seq[s], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq) {
+                    __builtin_amdgcn_s_sleep(1);
+                }
+            }
         }
     }
     __syncthreads();
 
-    if (wait_stage == 0) {
-        const int32_t t1 = ctrl->tree_tokens[1];
-        out_markov_emb_bf16[tid] = mapped_markov_embed_bf16[size_t(t1) * 256u + size_t(tid)];
-        if (num_rows >= 2) {
-            const int32_t t2 = ctrl->tree_tokens[2];
-            out_markov_emb_bf16[256 + tid] = mapped_markov_embed_bf16[size_t(t2) * 256u + size_t(tid)];
-        }
-    } else {
-        const int32_t t4 = ctrl->tree_tokens[4];
-        out_markov_emb_bf16[tid] = mapped_markov_embed_bf16[size_t(t4) * 256u + size_t(tid)];
+    for (int r = 0; r < num_rows; ++r) {
+        const int slot = int((src_slots_nibbles >> (4 * r)) & 0xFu);
+        const int32_t tok = ctrl->tree_tokens[slot];
+        out_markov_emb_bf16[size_t(r) * 256u + size_t(tid)] =
+            mapped_markov_embed_bf16[size_t(tok) * 256u + size_t(tid)];
     }
 }
 
@@ -6143,8 +6439,8 @@ void k_dspark_tree_topk_tp3(
     int tree_stage,
     int out_slot,
     int B_out,
-    int anc_slot1,
-    int anc_slot2,
+    uint32_t anc_slots_nibbles,
+    int anc_cnt,
     int rank,
     int vocab_offset,
     int vocab_rows)
@@ -6152,8 +6448,8 @@ void k_dspark_tree_topk_tp3(
     union SharedTreeTopk {
         uint32_t seen[1352];
         struct {
-            float   val[256][3];
-            int32_t id[256][3];
+            float   val[256][kDsparkMaxTopkOut];
+            int32_t id[256][kDsparkMaxTopkOut];
         } top;
     };
     __shared__ SharedTreeTopk sh;
@@ -6167,7 +6463,7 @@ void k_dspark_tree_topk_tp3(
         __syncthreads();
 
         const int R = ctrl->recent_len;
-        const int depth_extra = (anc_slot2 >= 0) ? 3 : 2;
+        const int depth_extra = anc_cnt + 1;
         const int hist_start = max(0, (R + depth_extra) - 1024);
         for (int k = hist_start + tid; k < R; k += 256) {
             const int32_t t = ctrl->recent_hist[k];
@@ -6176,11 +6472,14 @@ void k_dspark_tree_topk_tp3(
                 atomicOr(&sh.seen[lt >> 5], 1u << (lt & 31));
             }
         }
-        if (tid < 3) {
+        if (tid <= anc_cnt) {
             int32_t t = -1;
-            if (tid == 0) t = ctrl->anchor_token;
-            else if (tid == 1 && anc_slot1 >= 0) t = ctrl->tree_tokens[anc_slot1];
-            else if (tid == 2 && anc_slot2 >= 0) t = ctrl->tree_tokens[anc_slot2];
+            if (tid == 0) {
+                t = ctrl->anchor_token;
+            } else {
+                const int anc_slot = int((anc_slots_nibbles >> (4 * (tid - 1))) & 0xFu);
+                t = ctrl->tree_tokens[anc_slot];
+            }
             if (t >= vocab_offset && t < vocab_offset + vocab_rows) {
                 const int lt = t - vocab_offset;
                 atomicOr(&sh.seen[lt >> 5], 1u << (lt & 31));
@@ -6189,8 +6488,8 @@ void k_dspark_tree_topk_tp3(
         __syncthreads();
     }
 
-    float b0 = -1.0e38f, b1 = -1.0e38f, b2 = -1.0e38f;
-    int32_t i0 = 0x7FFFFFFF, i1 = 0x7FFFFFFF, i2 = 0x7FFFFFFF;
+    float b0 = -1.0e38f, b1 = -1.0e38f, b2 = -1.0e38f, b3 = -1.0e38f;
+    int32_t i0 = 0x7FFFFFFF, i1 = 0x7FFFFFFF, i2 = 0x7FFFFFFF, i3 = 0x7FFFFFFF;
 
     for (int v = tid; v < vocab_rows; v += 256) {
         float lg = base_logits_f32[v];
@@ -6202,14 +6501,19 @@ void k_dspark_tree_topk_tp3(
         }
         const int32_t gid = vocab_offset + v;
         if (lg > b0 || (lg == b0 && gid < i0)) {
+            b3 = b2; i3 = i2;
             b2 = b1; i2 = i1;
             b1 = b0; i1 = i0;
             b0 = lg; i0 = gid;
         } else if (lg > b1 || (lg == b1 && gid < i1)) {
+            b3 = b2; i3 = i2;
             b2 = b1; i2 = i1;
             b1 = lg; i1 = gid;
         } else if (lg > b2 || (lg == b2 && gid < i2)) {
+            b3 = b2; i3 = i2;
             b2 = lg; i2 = gid;
+        } else if (lg > b3 || (lg == b3 && gid < i3)) {
+            b3 = lg; i3 = gid;
         }
     }
     __syncthreads();
@@ -6217,15 +6521,16 @@ void k_dspark_tree_topk_tp3(
     sh.top.val[tid][0] = b0; sh.top.id[tid][0] = i0;
     sh.top.val[tid][1] = b1; sh.top.id[tid][1] = i1;
     sh.top.val[tid][2] = b2; sh.top.id[tid][2] = i2;
+    sh.top.val[tid][3] = b3; sh.top.id[tid][3] = i3;
     __syncthreads();
 
     for (int half = 128; half > 0; half >>= 1) {
         if (tid < half) {
-            float m_val[3];
-            int32_t m_id[3];
+            float m_val[4];
+            int32_t m_id[4];
             int ca = 0, cb = 0;
             #pragma unroll
-            for (int k = 0; k < 3; ++k) {
+            for (int k = 0; k < 4; ++k) {
                 const float va = sh.top.val[tid][ca];
                 const int32_t ia = sh.top.id[tid][ca];
                 const float vb = sh.top.val[tid + half][cb];
@@ -6237,7 +6542,7 @@ void k_dspark_tree_topk_tp3(
                 }
             }
             #pragma unroll
-            for (int k = 0; k < 3; ++k) {
+            for (int k = 0; k < 4; ++k) {
                 sh.top.val[tid][k] = m_val[k];
                 sh.top.id[tid][k]  = m_id[k];
             }
@@ -6246,7 +6551,8 @@ void k_dspark_tree_topk_tp3(
     }
 
     if (tid == 0) {
-        for (int k = 0; k < 3; ++k) {
+        #pragma unroll
+        for (int k = 0; k < kDsparkMaxTopkOut; ++k) {
             ctrl->tree_rank_val[tree_stage][rank][k] = sh.top.val[0][k];
             ctrl->tree_rank_id[tree_stage][rank][k]  = sh.top.id[0][k];
         }
@@ -6259,23 +6565,29 @@ void k_dspark_tree_topk_tp3(
                    __hip_atomic_load(&ctrl->ready_tree_rank_seq[tree_stage][2], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq) {
                 __builtin_amdgcn_s_sleep(1);
             }
-            int cur[3] = {0, 0, 0};
+            int cur0 = 0, cur1 = 0, cur2 = 0;
             for (int k = 0; k < B_out; ++k) {
                 int best_r = 0;
                 float best_v = -1.0e38f;
                 int32_t best_i = 0x7FFFFFFF;
-                for (int r = 0; r < 3; ++r) {
-                    if (cur[r] < 3) {
-                        const float rv = ctrl->tree_rank_val[tree_stage][r][cur[r]];
-                        const int32_t ri = ctrl->tree_rank_id[tree_stage][r][cur[r]];
-                        if (rv > best_v || (rv == best_v && ri < best_i)) {
-                            best_v = rv;
-                            best_i = ri;
-                            best_r = r;
-                        }
-                    }
+                if (cur0 < kDsparkMaxTopkOut) {
+                    const float rv = ctrl->tree_rank_val[tree_stage][0][cur0];
+                    const int32_t ri = ctrl->tree_rank_id[tree_stage][0][cur0];
+                    if (rv > best_v || (rv == best_v && ri < best_i)) { best_v = rv; best_i = ri; best_r = 0; }
                 }
-                ++cur[best_r];
+                if (cur1 < kDsparkMaxTopkOut) {
+                    const float rv = ctrl->tree_rank_val[tree_stage][1][cur1];
+                    const int32_t ri = ctrl->tree_rank_id[tree_stage][1][cur1];
+                    if (rv > best_v || (rv == best_v && ri < best_i)) { best_v = rv; best_i = ri; best_r = 1; }
+                }
+                if (cur2 < kDsparkMaxTopkOut) {
+                    const float rv = ctrl->tree_rank_val[tree_stage][2][cur2];
+                    const int32_t ri = ctrl->tree_rank_id[tree_stage][2][cur2];
+                    if (rv > best_v || (rv == best_v && ri < best_i)) { best_v = rv; best_i = ri; best_r = 2; }
+                }
+                if (best_r == 0) ++cur0;
+                else if (best_r == 1) ++cur1;
+                else ++cur2;
                 ctrl->tree_tokens[out_slot + k] = (best_i < 0x7FFFFFFF) ? best_i : 0;
             }
             __threadfence_system();
@@ -6313,20 +6625,24 @@ void launch_dspark_pack_conf_in(
 
 void launch_dspark_prepare_tree_markov_emb(
     DsparkGpuSampleSlot* d_ctrl, const uint16_t* d_mapped_markov_embed_bf16,
-    uint16_t* d_out_markov_emb_bf16, uint64_t seq, int wait_stage, int num_rows, hipStream_t stream)
+    uint16_t* d_out_markov_emb_bf16, uint64_t seq,
+    uint32_t wait_stage_mask, uint32_t src_slots_nibbles, int num_rows, hipStream_t stream)
 {
+    if (num_rows <= 0) return;
     hipLaunchKernelGGL(k_dspark_prepare_tree_markov_emb, dim3(1), dim3(256), 0, stream,
-                       d_ctrl, d_mapped_markov_embed_bf16, d_out_markov_emb_bf16, seq, wait_stage, num_rows);
+                       d_ctrl, d_mapped_markov_embed_bf16, d_out_markov_emb_bf16,
+                       seq, wait_stage_mask, src_slots_nibbles, num_rows);
 }
 
 void launch_dspark_tree_topk_tp3(
     DsparkGpuSampleSlot* d_ctrl, const float* d_base_logits_row_f32, const float* d_markov_logits_row_f32,
-    uint64_t seq, int tree_stage, int out_slot, int B_out, int anc_slot1, int anc_slot2,
+    uint64_t seq, int tree_stage, int out_slot, int B_out,
+    uint32_t anc_slots_nibbles, int anc_cnt,
     int rank, int vocab_offset, int vocab_rows, hipStream_t stream)
 {
     hipLaunchKernelGGL(k_dspark_tree_topk_tp3, dim3(1), dim3(256), 0, stream,
                        d_ctrl, d_base_logits_row_f32, d_markov_logits_row_f32,
-                       seq, tree_stage, out_slot, B_out, anc_slot1, anc_slot2,
+                       seq, tree_stage, out_slot, B_out, anc_slots_nibbles, anc_cnt,
                        rank, vocab_offset, vocab_rows);
 }
 

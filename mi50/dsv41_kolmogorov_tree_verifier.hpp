@@ -362,6 +362,326 @@ inline Dsv41TreeVerifyResult verify_deterministic_tree_u01(
 }
 
 // ============================================================================
+// WAVE 8B: Exact Kolmogorov-Dirac Verifier & Balanced Topology for M <= 16
+// Fits inside the SAME single 32-row P150A L1 decode tile (0 B extra L1/VRAM)!
+// ============================================================================
+inline constexpr std::size_t kMaxSpecTree16Nodes = 16;
+
+struct Dsv41SpecTree16 {
+  std::uint32_t num_nodes = 0;  // 1 <= num_nodes <= 16 (node 0 is root)
+  std::uint32_t base_pos = 0;   // Sequence cursor of root node 0
+  std::array<std::int32_t, kMaxSpecTree16Nodes> parent{};         // parent[0] = -1, 0 <= parent[i] < i
+  std::array<std::uint32_t, kMaxSpecTree16Nodes> depth{};         // depth[0] = 0, depth[i] = depth[parent[i]] + 1 (<= 5)
+  std::array<std::uint32_t, kMaxSpecTree16Nodes> rope_pos{};      // base_pos + depth[i] (sibling-invariant!)
+  std::array<std::uint16_t, kMaxSpecTree16Nodes> ancestor_mask{}; // 16-bit mask: bit j set iff j is ancestor of i
+  std::array<std::uint16_t, kMaxSpecTree16Nodes> child_mask{};    // Deduplicated active draft children of node i
+  std::array<std::int32_t, kMaxSpecTree16Nodes> token_id{};       // Draft token proposed by node i (i >= 1)
+};
+
+struct Dsv41Tree16VerifyResult {
+  std::uint32_t num_emitted = 0;  // L in [1, 16]: (L - 1) accepted draft tokens + 1 bonus/recovery token
+  std::array<std::uint32_t, kMaxSpecTree16Nodes> accepted_nodes{}; // [0, i_1, ..., i_{L-1}], strictly increasing
+  std::array<std::int32_t, kMaxSpecTree16Nodes> emitted_tokens{};  // [tok(i_1), ..., tok(i_{L-1}), bonus_token]
+  std::uint32_t kv_compaction_copies = 0;
+  std::uint32_t r2_completed_pairs = 0;
+};
+
+// Canonical Wave 8B Balanced High-Branching M=16 DSpark Causal Tree:
+//   - Level 0 (depth 0): Node 0 (root anchor)                         [1 node]
+//   - Level 1 (depth 1): Nodes 1..4 (Stage 0 top-4 under 0)           [4 nodes]
+//   - Level 2 (depth 2): Nodes 5..6 (under 1), 7..8 (under 2),
+//                        Node 9 (under 3), Node 10 (under 4)          [6 nodes]
+//   - Level 3 (depth 3): Node 11 (under 5), Node 12 (under 6),
+//                        Node 13 (under 7)                            [3 nodes]
+//   - Level 4 (depth 4): Node 14 (under 11)                           [1 node]
+//   - Level 5 (depth 5): Node 15 (under 14)                           [1 node]
+// Total = 16 nodes, max emitted tokens per step = 6 (5 draft + 1 bonus)!
+inline constexpr int kTree16NumNodes = 16;
+inline constexpr std::array<std::int32_t, 16> kTree16Parents = {
+    -1, 0, 0, 0, 0, 1, 1, 2, 2, 3, 4, 5, 6, 7, 11, 14};
+inline constexpr std::array<std::uint32_t, 16> kTree16Depths = {
+    0u, 1u, 1u, 1u, 1u, 2u, 2u, 2u, 2u, 2u, 2u, 3u, 3u, 3u, 4u, 5u};
+
+// SGPR-safe 4x64-bit scalar causal mask (never array-indexed on GPU to preserve ScratchSize == 0!)
+#ifndef DSV41_TREE_ANC_MASK256_DEFINED
+#define DSV41_TREE_ANC_MASK256_DEFINED
+struct TreeAncMask256 {
+  std::uint64_t w0 = 0ULL;  // rows 0..3  (16 bits each)
+  std::uint64_t w1 = 0ULL;  // rows 4..7  (16 bits each)
+  std::uint64_t w2 = 0ULL;  // rows 8..11 (16 bits each)
+  std::uint64_t w3 = 0ULL;  // rows 12..15 (16 bits each)
+
+#if defined(__HIPCC__)
+  __host__ __device__
+#endif
+  constexpr bool active() const noexcept {
+    return (w0 | w1 | w2 | w3) != 0ULL;
+  }
+};
+#endif
+
+inline constexpr TreeAncMask256 make_tree_anc_mask256_from_parents(
+    const std::int32_t* parents, int num_nodes) noexcept {
+  std::uint16_t rows[16]{};
+  for (int i = 0; i < num_nodes && i < 16; ++i) {
+    if (i == 0) {
+      rows[0] = 0x0001u;
+    } else {
+      const int p = parents[i];
+      rows[i] = static_cast<std::uint16_t>((p >= 0 ? rows[p] : 0u) | (1u << i));
+    }
+  }
+  TreeAncMask256 m{};
+  for (int k = 0; k < 4; ++k) {
+    m.w0 |= (static_cast<std::uint64_t>(rows[0 + k]) << (16 * k));
+    m.w1 |= (static_cast<std::uint64_t>(rows[4 + k]) << (16 * k));
+    m.w2 |= (static_cast<std::uint64_t>(rows[8 + k]) << (16 * k));
+    m.w3 |= (static_cast<std::uint64_t>(rows[12 + k]) << (16 * k));
+  }
+  return m;
+}
+
+inline constexpr TreeAncMask256 widen_tree8_anc_mask64(std::uint64_t mask64) noexcept {
+  if (mask64 == 0ULL) return TreeAncMask256{};
+  TreeAncMask256 m{};
+  for (int k = 0; k < 4; ++k) {
+    m.w0 |= (((mask64 >> (8 * (0 + k))) & 0xFFULL) << (16 * k));
+    m.w1 |= (((mask64 >> (8 * (4 + k))) & 0xFFULL) << (16 * k));
+  }
+  return m;
+}
+
+inline constexpr std::uint64_t pack_tree16_depth_nibbles(
+    const std::uint32_t* depths, int num_nodes) noexcept {
+  std::uint64_t out = 0ULL;
+  for (int i = 0; i < num_nodes && i < 16; ++i) {
+    out |= (static_cast<std::uint64_t>(depths[i] & 0xFu) << (4 * i));
+  }
+  return out;
+}
+
+inline constexpr std::uint64_t pack_tree16_parent_nibbles(
+    const std::int32_t* parents, int num_nodes) noexcept {
+  std::uint64_t out = 0ULL;
+  for (int i = 1; i < num_nodes && i < 16; ++i) {
+    const std::uint32_t p = (parents[i] >= 0) ? static_cast<std::uint32_t>(parents[i]) : 0u;
+    out |= (static_cast<std::uint64_t>(p & 0xFu) << (4 * i));
+  }
+  return out;
+}
+
+inline constexpr TreeAncMask256 kTree16AncMask256 =
+    make_tree_anc_mask256_from_parents(kTree16Parents.data(), kTree16NumNodes);
+inline constexpr std::uint64_t kTree16DepthNibbles64 =
+    pack_tree16_depth_nibbles(kTree16Depths.data(), kTree16NumNodes);
+inline constexpr std::uint64_t kTree16ParentNibbles64 =
+    pack_tree16_parent_nibbles(kTree16Parents.data(), kTree16NumNodes);
+
+inline bool build_spec_tree16_topology(
+    std::uint32_t num_nodes,
+    std::uint32_t base_pos,
+    const std::int32_t* parent_in,
+    const std::int32_t* token_id_in,
+    Dsv41SpecTree16* out) noexcept {
+  if (!out || !parent_in || !token_id_in || num_nodes == 0 ||
+      num_nodes > kMaxSpecTree16Nodes) {
+    return false;
+  }
+  if (parent_in[0] != -1) {
+    return false;
+  }
+
+  *out = Dsv41SpecTree16{};
+  out->num_nodes = num_nodes;
+  out->base_pos = base_pos;
+  out->parent[0] = -1;
+  out->depth[0] = 0;
+  out->rope_pos[0] = base_pos;
+  out->ancestor_mask[0] = 0x0001u;
+  out->token_id[0] = token_id_in[0];
+
+  for (std::uint32_t i = 1; i < num_nodes; ++i) {
+    const std::int32_t p = parent_in[i];
+    if (p < 0 || static_cast<std::uint32_t>(p) >= i) {
+      return false;
+    }
+    const auto pu = static_cast<std::uint32_t>(p);
+    out->parent[i] = p;
+    out->depth[i] = out->depth[pu] + 1u;
+    out->rope_pos[i] = base_pos + out->depth[i];
+    out->ancestor_mask[i] =
+        static_cast<std::uint16_t>(out->ancestor_mask[pu] | (1u << i));
+    out->token_id[i] = token_id_in[i];
+
+    bool duplicate_sibling = false;
+    std::uint16_t sib_bits = out->child_mask[pu];
+    while (sib_bits != 0u) {
+      const std::uint32_t s = static_cast<std::uint32_t>(__builtin_ctz(sib_bits));
+      if (out->token_id[s] == token_id_in[i]) {
+        duplicate_sibling = true;
+        break;
+      }
+      sib_bits &= static_cast<std::uint16_t>(sib_bits - 1u);
+    }
+    if (!duplicate_sibling && token_id_in[i] >= 0) {
+      out->child_mask[pu] =
+          static_cast<std::uint16_t>(out->child_mask[pu] | (1u << i));
+    }
+  }
+  return true;
+}
+
+inline Dsv41Tree16VerifyResult verify_deterministic_tree16_u01(
+    const Dsv41SpecTree16& tree,
+    const double* target_probs,
+    std::size_t vocab_size,
+    const double* u_per_depth) noexcept {
+  Dsv41Tree16VerifyResult res{};
+  std::uint32_t cur = 0;
+  std::uint32_t step_d = 0;
+
+  while (true) {
+    res.accepted_nodes[step_d] = cur;
+    const double* p_row = target_probs + static_cast<std::size_t>(cur) * vocab_size;
+    const double u = std::clamp(u_per_depth[step_d], 0.0, 0.9999999999999999);
+
+    std::uint16_t mask = tree.child_mask[cur];
+    double branch_cdf = 0.0;
+    std::int32_t chosen_child = -1;
+
+    while (mask != 0u) {
+      const std::uint32_t c = static_cast<std::uint32_t>(__builtin_ctz(mask));
+      mask &= static_cast<std::uint16_t>(mask - 1u);
+      const std::int32_t tok = tree.token_id[c];
+      if (tok >= 0 && static_cast<std::size_t>(tok) < vocab_size) {
+        const double pm = p_row[tok];
+        if (pm > 0.0) {
+          if (chosen_child < 0 && u < branch_cdf + pm) {
+            chosen_child = static_cast<std::int32_t>(c);
+          }
+          branch_cdf += pm;
+        }
+      }
+    }
+
+    if (chosen_child >= 0) {
+      const auto cu = static_cast<std::uint32_t>(chosen_child);
+      res.emitted_tokens[step_d] = tree.token_id[cu];
+      ++step_d;
+      cur = cu;
+      continue;
+    }
+
+    const double rem_mass = std::max(0.0, 1.0 - branch_cdf);
+    const double target_u = (rem_mass > 1e-15) ? std::max(0.0, u - branch_cdf) : 0.0;
+
+    std::array<std::int32_t, kMaxSpecTree16Nodes> excl{};
+    std::uint32_t n_excl = 0;
+    std::uint16_t m2 = tree.child_mask[cur];
+    while (m2 != 0u) {
+      const std::uint32_t c = static_cast<std::uint32_t>(__builtin_ctz(m2));
+      m2 &= static_cast<std::uint16_t>(m2 - 1u);
+      excl[n_excl++] = tree.token_id[c];
+    }
+
+    double comp_cdf = 0.0;
+    std::size_t fallback_v = 0;
+    bool found = false;
+    for (std::size_t v = 0; v < vocab_size; ++v) {
+      const double pv = p_row[v];
+      if (pv <= 0.0) continue;
+      bool is_excluded = false;
+      for (std::uint32_t e = 0; e < n_excl; ++e) {
+        if (excl[e] == static_cast<std::int32_t>(v)) {
+          is_excluded = true;
+          break;
+        }
+      }
+      if (is_excluded) continue;
+      fallback_v = v;
+      comp_cdf += pv;
+      if (target_u < comp_cdf) {
+        res.emitted_tokens[step_d] = static_cast<std::int32_t>(v);
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      res.emitted_tokens[step_d] =
+          (n_excl > 0 && rem_mass <= 1e-15) ? excl[n_excl - 1]
+                                            : static_cast<std::int32_t>(fallback_v);
+    }
+    ++step_d;
+    break;
+  }
+
+  res.num_emitted = step_d;
+  for (std::uint32_t d = 1; d < res.num_emitted; ++d) {
+    if (res.accepted_nodes[d] != d) {
+      ++res.kv_compaction_copies;
+    }
+  }
+  res.r2_completed_pairs = count_completed_r2_pairs(tree.base_pos, res.num_emitted);
+  return res;
+}
+
+// Entropy-Adaptive M = 8 <-> M = 16 DSpark Controller (--dspark-tree-width auto|8|16):
+//   - Fixed8:  always uses M = 8 when tree confidence gate fires
+//   - Fixed16: always uses M = 16 when tree confidence gate fires
+//   - Auto:    runs M = 8 when rolling 16-step EMA tau >= 4.2 (or outside <think>),
+//              switches to M = 16 when rolling tau < 3.9 inside <think>,
+//              and switches back to M = 8 once tau >= 4.2 or </think> closes.
+enum class Dsv41TreeWidthMode : std::uint8_t {
+  Auto    = 0,
+  Fixed8  = 8,
+  Fixed16 = 16,
+};
+
+struct Dsv41AdaptiveTreeWidthController {
+  Dsv41TreeWidthMode mode = Dsv41TreeWidthMode::Auto;
+  double ema_tau = 4.25;
+  int current_width = 8;
+
+  explicit constexpr Dsv41AdaptiveTreeWidthController(
+      Dsv41TreeWidthMode m = Dsv41TreeWidthMode::Auto) noexcept
+      : mode(m),
+        ema_tau(4.25),
+        current_width(m == Dsv41TreeWidthMode::Fixed16 ? 16 : 8) {}
+
+  int select_width(bool in_think) noexcept {
+    if (mode == Dsv41TreeWidthMode::Fixed8) {
+      current_width = 8;
+      return 8;
+    }
+    if (mode == Dsv41TreeWidthMode::Fixed16) {
+      current_width = 16;
+      return 16;
+    }
+    if (!in_think) {
+      current_width = 8;
+      return 8;
+    }
+    if (ema_tau < 3.9) {
+      current_width = 16;
+    } else if (ema_tau >= 4.2) {
+      current_width = 8;
+    }
+    return current_width;
+  }
+
+  void observe_step(int emitted_tokens, bool in_think) noexcept {
+    // 16-step exponential moving average (alpha = 2 / (16 + 1) ≈ 0.125)
+    ema_tau = 0.875 * ema_tau + 0.125 * static_cast<double>(emitted_tokens);
+    if (!in_think && mode == Dsv41TreeWidthMode::Auto) {
+      current_width = 8;
+    } else if (mode == Dsv41TreeWidthMode::Auto) {
+      if (ema_tau < 3.9) current_width = 16;
+      else if (ema_tau >= 4.2) current_width = 8;
+    }
+  }
+};
+
+// ============================================================================
 // MODE 2: Exact Kolmogorov-Borel Verifier for STOCHASTIC Draft Trees
 // (SpecInfer Recursive Rejection Sampling where child c ~ draft_probs[c, :]).
 //
@@ -462,11 +782,11 @@ inline Dsv41TreeVerifyResult verify_stochastic_specinfer_tree(
 // kv_slots[base_pos + i_d] -> kv_slots[base_pos + d] in ascending order d = 1..L-1
 // is strictly alias-safe with zero temporary KV scratch!
 // ============================================================================
-template <typename KvSlotT>
+template <typename KvSlotT, typename VerifyResT>
 inline std::uint32_t compact_accepted_kv_slots_inplace(
     KvSlotT* kv_slots,
     std::uint32_t base_pos,
-    const Dsv41TreeVerifyResult& vr) noexcept {
+    const VerifyResT& vr) noexcept {
   std::uint32_t copies = 0;
   for (std::uint32_t d = 1; d < vr.num_emitted; ++d) {
     const std::uint32_t src_node = vr.accepted_nodes[d];

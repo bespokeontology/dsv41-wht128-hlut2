@@ -51,11 +51,14 @@ struct Dsv41GenStats {
     double t_p150_wait_ms = 0.0;
     double t_allreduce_ms = 0.0;
     double t_engram_wait_ms = 0.0;
+    double overlap_saved_ms = 0.0;
     uint64_t dspark_steps = 0;
     uint64_t dspark_drafted = 0;
     uint64_t dspark_accepted = 0;
     uint64_t dspark_tree_steps = 0;
     uint64_t dspark_tree_accepted = 0;
+    uint64_t dspark_tree16_steps = 0;
+    uint64_t dspark_tree16_accepted = 0;
     bool think_guard_triggered = false;
     uint32_t think_guard_period = 0;
     uint32_t think_guard_rewound = 0;
@@ -102,7 +105,10 @@ public:
 
     void reset_session_cache();
     void set_sync_timers(bool enable);
+    void set_dual_stream_overlap(bool enable);
+    void set_dspark_tree_width(int width_mode);  // 0 = auto, 8 = fixed M=8, 16 = fixed M=16
     void clear_all_caches();
+    bool capture_rarebal_corpus(const std::vector<int32_t>& corpus_ids);
 
     // Thread-safe generation with multi-tier KV prefix reuse, strict CED prefill, and 3-stage DSpark (M=6)
     std::vector<int32_t> generate(

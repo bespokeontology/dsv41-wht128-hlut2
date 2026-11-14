@@ -19,9 +19,43 @@ namespace dsv41 {
 // Host-side routed pair descriptor uploaded per MoE call
 struct Mi50RoutedPair {
     int32_t row;       // 0 .. M-1
-    int32_t expert;    // 0 .. mi50_experts-1
+    int32_t expert;    // 0 .. mi50_experts-1 (-1 = inactive/filtered)
     float   weight;    // scaled router weight
     int32_t pad;
+};
+
+struct Dsv41P150ShmChannel;
+
+// SGPR-safe 4x64-bit scalar causal mask (never array-indexed on GPU to preserve ScratchSize == 0!)
+#ifndef DSV41_TREE_ANC_MASK256_DEFINED
+#define DSV41_TREE_ANC_MASK256_DEFINED
+struct TreeAncMask256 {
+    uint64_t w0 = 0ULL;  // rows 0..3  (16 bits each)
+    uint64_t w1 = 0ULL;  // rows 4..7  (16 bits each)
+    uint64_t w2 = 0ULL;  // rows 8..11 (16 bits each)
+    uint64_t w3 = 0ULL;  // rows 12..15 (16 bits each)
+
+#if defined(__HIPCC__)
+    __host__ __device__
+#endif
+    constexpr bool active() const noexcept {
+        return (w0 | w1 | w2 | w3) != 0ULL;
+    }
+};
+#endif
+
+struct TreeGlobalKvCommitArgs {
+    uint8_t* comp_fp4[4]{};
+    uint8_t* comp_e4m3[4]{};
+    uint8_t* ext_comp_fp4[4]{};
+    uint8_t* ext_comp_e4m3[4]{};
+    uint8_t* idx_fp4[4]{};
+    uint8_t* idx_ue8[4]{};
+    int      hot_comp_cap[4]{0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF};
+    float*       kv_state[3]{};
+    float*       sc_state[3]{};
+    const float* kv_last[3]{};
+    const float* sc_last[3]{};
 };
 
 // 1. Embedding & RMSNorm & Conversions
@@ -125,6 +159,19 @@ void launch_host_ring_allreduce_f32(
     size_t n_elems,
     hipStream_t stream);
 
+struct alignas(64) Dsv41GpuStageRtc {
+    uint64_t last_stamp;
+    uint64_t att_ticks;
+    uint64_t mi50_moe_ticks;
+    uint64_t p150_wait_ticks;
+    uint64_t ar_ticks;
+    uint64_t pad[3];
+};
+
+void launch_stamp_gpu_rtc(
+    Dsv41GpuStageRtc* d_stage_rtc,
+    hipStream_t stream);
+
 // Dumitrescu mixed-precision FP32 TP3 HostRingAllReduce + optional P150A BF16 add + FP32 mHC post -> single final RNE BF16!
 void launch_host_ring_allreduce_f32_hc_post(
     const float* d_src_f32,         // [M, 5120] FP32 local shard
@@ -137,11 +184,12 @@ void launch_host_ring_allreduce_f32_hc_post(
     int rank,
     uint64_t seq,
     int M,
-    hipStream_t stream);
+    hipStream_t stream,
+    Dsv41GpuStageRtc* d_stage_rtc = nullptr);
 
 // Split Phase-1 upload + Phase-2 finish for Zero-SDMA P150A + TP3 MoE overlap:
 // Phase 1 streams local [M, 5120] FP32 partials into HostRingAllReduceSlot while P150A executes;
-// Phase 2 reads mapped /dsv41_p150_ipc y_out_bf16 directly via system-scope atomic loads (0 hipMemcpyAsync!).
+// Phase 2 optionally waits on mapped P150A resp_seq directly on GPU and reads y_out_bf16 via system-scope atomic loads!
 void launch_host_ring_upload_f32(
     const float* d_src_f32,         // [M, 5120] FP32 local shard
     HostRingAllReduceSlot* d_mapped_slot,
@@ -161,7 +209,10 @@ void launch_host_ring_finish_f32_hc_post(
     int rank,
     uint64_t seq,
     int M,
-    hipStream_t stream);
+    hipStream_t stream,
+    const uint32_t* d_p150_resp_seq = nullptr,
+    uint32_t p150_req_seq = 0u,
+    Dsv41GpuStageRtc* d_stage_rtc = nullptr);
 
 void launch_add_f32_and_bf16_to_bf16(
     const float* d_routed_tp3_sum,  // [M, 5120] FP32 (sum of 3 MI50 routed + shared partials)
@@ -297,8 +348,8 @@ void launch_split_qkv_norm_rope_quant(
     uint16_t* d_out_kv_bf16,        // [M, 512]
     int M, int pos_base, float eps,
     hipStream_t stream,
-    uint64_t tree_anc_mask64 = 0ULL,
-    uint32_t tree_depth_nibbles = 0u);
+    TreeAncMask256 tree_anc_mask = {},
+    uint64_t tree_depth_nibbles = 0ULL);
 
 // 5. Exact FP64-Angle Register RoPE / YaRN (< 1 KiB __constant__), Compressor, Indexer, and Sparse Attention (CSA2 + DSpark)
 void init_rope_inv_freq_gpu();
@@ -308,8 +359,8 @@ void launch_rope_tail64_bf16(
     bool use_comp_yarn,           // false=window (theta=10000), true=compressed YaRN (theta=160000, factor=16)
     int M, int H, int D, int pos_base, int pos_stride, bool inverse,
     hipStream_t stream,
-    uint64_t tree_anc_mask64 = 0ULL,
-    uint32_t tree_depth_nibbles = 0u);
+    TreeAncMask256 tree_anc_mask = {},
+    uint64_t tree_depth_nibbles = 0ULL);
 
 int launch_compressor_r2_pool(
     const float* d_kv_f32,        // [M, 512]
@@ -320,7 +371,7 @@ int launch_compressor_r2_pool(
     int start_pos, int M,
     hipStream_t stream);
 
-// Speculative M <= 8 causal-tree r=2 pooling (pools parent->child odd pairs without mutating persistent kv_state/score_state!)
+// Speculative M <= 16 causal-tree r=2 pooling (pools parent->child odd pairs without mutating persistent kv_state/score_state!)
 void launch_compressor_r2_tree_pool(
     const float* d_kv_f32,        // [M, 512]
     const float* d_score_f32,     // [M, 512]
@@ -328,16 +379,19 @@ void launch_compressor_r2_tree_pool(
     const float* d_score_state_f32,
     uint16_t* d_out_pool_bf16,    // [M, 512]
     int start_pos, int M,
-    uint32_t tree_depth_nibbles,
-    uint32_t tree_parent_nibbles,
+    uint64_t tree_depth_nibbles,
+    uint64_t tree_parent_nibbles,
     hipStream_t stream);
 
 void launch_pack_compress_kv_fp4_e4m3_16(
     const uint16_t* d_latent_bf16,// [N_lat, 512] (post-RoPE!)
-    uint8_t* d_cache_fp4,         // [max_comp, 256] (writes starting at slot_offset)
-    uint8_t* d_cache_e4m3,        // [max_comp, 32]  (writes starting at slot_offset)
+    uint8_t* d_cache_fp4,         // [hot_comp_cap, 256] (writes starting at slot_offset)
+    uint8_t* d_cache_e4m3,        // [hot_comp_cap, 32]  (writes starting at slot_offset)
     int slot_offset, int N_lat,
-    hipStream_t stream);
+    hipStream_t stream,
+    uint8_t* d_ext_cache_fp4 = nullptr,
+    uint8_t* d_ext_cache_e4m3 = nullptr,
+    int hot_comp_cap = 0x7FFFFFFF);
 
 // Packed 68 B/slot Indexer K cache: 64 B FP4_x2 + 4 B UE8M0 (exact 890 B/tok CSA2 Global KV!)
 void launch_pack_index_k_fp4_ue8m0_32(
@@ -363,18 +417,18 @@ void launch_indexer_score(
 
 void launch_indexer_candidates_and_topk(
     float* d_score_f32,             // [M, T_comp] (TP3 all-reduced; upper tail holds M * ceil(T_comp/8) scratch!)
-    uint8_t* d_cand_block_mask,     // [M, cand_block_stride] (1 byte per 8 compressed keys!)
+    uint32_t* d_cand_block_mask,    // [M, cand_block_stride] bit-packed (1 bit per 8 compressed keys!)
     int cand_block_stride,
     int32_t* d_out_comp_idxs,       // [M, K_out]  (0..T_comp-1 or -1, sorted ascending!)
     int M, int T_comp, int start_pos, int ratio,
     int mode,                       // 0 = plain topk, 1 = layer 20 candidate source + topk, 2 = candidate consumer + topk
     int K_out,                      // min(512, T_comp)
     hipStream_t stream,
-    uint64_t tree_anc_mask64 = 0ULL,
-    uint32_t tree_depth_nibbles = 0u,
+    TreeAncMask256 tree_anc_mask = {},
+    uint64_t tree_depth_nibbles = 0ULL,
     int q_row_offset = 0);
 
-// Zero-staging in-place ring SWA + Top-512 CSA2 + automatic Split-K for M <= 8 (+ zero-alloc SGPR causal-tree support!)
+// Zero-staging in-place ring SWA + Top-512 CSA2 + automatic Split-K for M <= 16 (+ zero-alloc SGPR causal-tree support!)
 void launch_sparse_attn(
     const uint16_t* d_q_bf16,       // [M, h_cnt, 512]
     const float* d_attn_sink_f32,   // [h_cnt]
@@ -383,41 +437,39 @@ void launch_sparse_attn(
     int start_pos,
     int swa_floor_pos,              // 0 normally; replay_start_pos during SWA Bounded Replay
     bool dspark_bidir,              // false = causal CSA2, true = DSpark bidirectional draft
-    const uint8_t* d_comp_fp4,      // [max_comp, 256] (optional, nullptr if n_comp==0)
-    const uint8_t* d_comp_e4m3,     // [max_comp, 32]  (optional, nullptr if n_comp==0)
+    const uint8_t* d_comp_fp4,      // [hot_comp_cap, 256] (optional, nullptr if n_comp==0)
+    const uint8_t* d_comp_e4m3,     // [hot_comp_cap, 32]  (optional, nullptr if n_comp==0)
     const int32_t* d_comp_idxs,     // [M, n_comp] (0..T_comp-1 or -1)
     int n_comp,
-    float* d_splitk_scratch,        // optional scratch (>= M * 8 * h_cnt * 514 floats) for M<=8 Split-K
+    float* d_splitk_scratch,        // optional scratch (>= M * 8 * h_cnt * 514 floats) for M<=16 Split-K
     uint16_t* d_out_o_bf16,         // [M, h_cnt, 512]
     int M, int h_cnt,
     hipStream_t stream,
-    uint64_t tree_anc_mask64 = 0ULL,
-    uint32_t tree_depth_nibbles = 0u);
+    TreeAncMask256 tree_anc_mask = {},
+    uint64_t tree_depth_nibbles = 0ULL,
+    const uint8_t* d_ext_comp_fp4 = nullptr,
+    const uint8_t* d_ext_comp_e4m3 = nullptr,
+    int hot_comp_cap = 0x7FFFFFFF);
 
-// Accepted-branch gather & Global KV / r=2 state compaction for M <= 8 causal-tree verification (0 extra HBM2!)
+// Accepted-branch gather & Global KV / r=2 state compaction for M <= 16 causal-tree verification (0 extra HBM2!)
 void launch_commit_tree_win_kv_and_hidden(
     uint16_t* d_win_kv_slab,            // [43, 128, 512]
-    const uint16_t* d_last_win_kv_slab, // [40, 8, 512]
-    uint16_t* d_target_mean_bf16,       // [>=16, 5120] (gathers accepted_nodes[0..A-1] -> rows [8..8+A-1])
+    const uint16_t* d_last_win_kv_slab, // [40, tree_max_nodes, 512]
+    uint16_t* d_target_mean_bf16,       // [>=2*tree_max_nodes, 5120] (gathers accepted_nodes[0..A-1] -> rows [tree_max_nodes..tree_max_nodes+A-1])
     int start_pos,
     int accepted_A,
-    uint32_t acc_nodes_nibbles,
+    int tree_max_nodes,
+    uint64_t acc_nodes_nibbles,
     hipStream_t stream);
 
 void launch_commit_tree_global_kv_and_r2(
-    uint8_t* d_comp_fp4_0, uint8_t* d_comp_e4m3_0, uint8_t* d_idx_fp4_0, uint8_t* d_idx_ue8_0,
-    uint8_t* d_comp_fp4_1, uint8_t* d_comp_e4m3_1, uint8_t* d_idx_fp4_1, uint8_t* d_idx_ue8_1,
-    uint8_t* d_comp_fp4_2, uint8_t* d_comp_e4m3_2, uint8_t* d_idx_fp4_2, uint8_t* d_idx_ue8_2,
-    uint8_t* d_comp_fp4_3, uint8_t* d_comp_e4m3_3, uint8_t* d_idx_fp4_3, uint8_t* d_idx_ue8_3,
-    float* d_kv_state_0, float* d_sc_state_0, const float* d_kv_last_0, const float* d_sc_last_0,
-    float* d_kv_state_1, float* d_sc_state_1, const float* d_kv_last_1, const float* d_sc_last_1,
-    float* d_kv_state_2, float* d_sc_state_2, const float* d_kv_last_2, const float* d_sc_last_2,
+    const TreeGlobalKvCommitArgs& args,
     int start_pos,
     int accepted_A,
-    uint32_t acc_nodes_nibbles,
+    uint64_t acc_nodes_nibbles,
     hipStream_t stream);
 
-// 6. MoE Gate + Multi-Row Routed HLUT2 (3x MI50 TP3)
+// 6. MoE Gate + Multi-Row Routed HLUT2 (3x MI50 TP3) + Zero-Sync GPU->P150A Doorbell
 void launch_moe_gate(
     const float* d_logits_f32,    // [M, n_routed] (x.float() @ gate.weight.float()^T)
     const float* d_bias_f32,      // [n_routed]
@@ -428,7 +480,26 @@ void launch_moe_gate(
     int M, int n_routed, int top_k, float route_scale,
     hipStream_t stream);
 
-// Device-resident MTP pair packer: builds Mi50RoutedPair [M * top_k] directly on GPU with zero host sync!
+// Wave 8A Direct GPU->PCIe->/dev/shm Fast-Ring Stager & Doorbell Armer (zero host sync / zero CPU relay!)
+void launch_stage_and_arm_p150_shm(
+    Dsv41P150ShmChannel* d_mapped_shm,
+    uint32_t* d_wg_sync_counter,  // [1] device uint32 counter on tp=0
+    const int32_t* d_topk_ids,    // [M, top_k]
+    const float* d_topk_weights,  // [M, top_k]
+    const uint16_t* d_x_rot_bf16, // [M, 5120] WHT128-rotated BF16
+    uint32_t layer_id,
+    int M, int top_k, int expert_base,
+    uint32_t req_seq,
+    hipStream_t stream);
+
+// Device-resident MI50/MTP pair packer: builds Mi50RoutedPair [M * top_k] (filtering [0..max_expert-1]) with zero host sync!
+void launch_pack_mi50_routed_pairs(
+    const int32_t* d_topk_ids,    // [M, top_k]
+    const float*   d_topk_weights,// [M, top_k]
+    Mi50RoutedPair* d_out_pairs,  // [M * top_k]
+    int M, int top_k, int max_expert,
+    hipStream_t stream);
+
 void launch_pack_mtp_routed_pairs(
     const int32_t* d_topk_ids,    // [M, top_k]
     const float*   d_topk_weights,// [M, top_k]
@@ -436,7 +507,16 @@ void launch_pack_mtp_routed_pairs(
     int M, int top_k,
     hipStream_t stream);
 
-// Device-resident 1-CTA MTP CSR builder (<= 128 experts, zero host sync) for grouped HLUT2 execution!
+// Device-resident 1-CTA MI50/MTP CSR builder (<= 256 experts, zero host sync) for grouped HLUT2 execution!
+void launch_build_mi50_csr(
+    const int32_t* d_topk_ids,      // [M, top_k]
+    const float*   d_topk_weights,  // [M, top_k]
+    int32_t* d_active_experts,      // [n_experts]
+    int32_t* d_csr_offsets,         // [n_experts + 1]
+    Mi50RoutedPair* d_sorted_pairs, // [M * top_k]
+    int M, int top_k, int n_experts,
+    hipStream_t stream);
+
 void launch_build_mtp_csr(
     const int32_t* d_topk_ids,      // [M, top_k]
     const float*   d_topk_weights,  // [M, top_k]
@@ -472,8 +552,7 @@ void launch_mi50_routed_hlut2_pairs(
     float* d_out_accum_f32,            // [M, 5120] FP32 (atomicAdd into existing buffer!)
     hipStream_t stream);
 
-// Grouped expert execution for large prefill chunks (M > 8): BM=32 expert-major for M >= 64 prefill,
-// BM=8/16 adaptive below 64. Every unpacked 272 B HLUT2 tile is reused across 32 token rows.
+// Grouped expert execution: BM=32 expert-major for M >= 64 prefill, BM=8/16 adaptive for M=2..63 decode/verify.
 void launch_mi50_routed_hlut2_grouped(
     const uint16_t* d_x_rot_f16,       // [M, 5120] FP16
     const int32_t* d_active_experts,   // [num_active] expert IDs
@@ -503,7 +582,9 @@ void launch_keep_dpm_warm(
     hipStream_t stream);
 
 // 7. GPU-Resident 5-Step DSpark Markov + Sliding RepPenalty + Borel Full-Partition Top-p/Greedy Sampler (1 sync instead of 19!)
-static constexpr int kDsparkMaxCand = 4096;
+static constexpr int kDsparkMaxCand    = 4096;
+static constexpr int kDsparkMaxStages  = 12;   // Up to 10 stages for M=16 balanced tree (4 stages for M=8)
+static constexpr int kDsparkMaxTopkOut = 4;    // Top-4 root branching for M=16 (Top-3 for M=8)
 
 struct DsparkGpuSampleSlot {
     uint64_t call_seq;
@@ -533,12 +614,12 @@ struct DsparkGpuSampleSlot {
     float    out_conf_logits[5];
     float    out_root_top1_prob;
 
-    // Deterministic top-B M=8 tree extraction (width [3, 2, 1, 1], Dirac delta proposals)
-    alignas(64) uint64_t ready_tree_rank_seq[4][3];
-    alignas(64) uint64_t ready_tree_stage_seq[4];
-    float    tree_rank_val[4][3][3];
-    int32_t  tree_rank_id[4][3][3];
-    int32_t  tree_tokens[8];
+    // Deterministic top-B M=8 / M=16 causal tree extraction (Dirac delta proposals)
+    alignas(64) uint64_t ready_tree_rank_seq[kDsparkMaxStages][3];
+    alignas(64) uint64_t ready_tree_stage_seq[kDsparkMaxStages];
+    float    tree_rank_val[kDsparkMaxStages][3][kDsparkMaxTopkOut];
+    int32_t  tree_rank_id[kDsparkMaxStages][3][kDsparkMaxTopkOut];
+    int32_t  tree_tokens[16];
 
     uint32_t kept_cnt[5];
     int32_t  kept_id[5][kDsparkMaxCand];
@@ -581,20 +662,21 @@ void launch_dspark_prepare_tree_markov_emb(
     const uint16_t* d_mapped_markov_embed_bf16, // [129280, 256] coherent pinned host BF16
     uint16_t* d_out_markov_emb_bf16,            // [num_rows, 256] local HBM2
     uint64_t seq,
-    int wait_stage,                             // 0 = wait stage 0 (reads tree_tokens[1], tree_tokens[2]); 1 = wait stage 1 (reads tree_tokens[4])
-    int num_rows,                               // 2 for stage 1, 1 for stage 2
+    uint32_t wait_stage_mask,                   // bitmask of ready_tree_stage_seq stages to wait on
+    uint32_t src_slots_nibbles,                 // 4-bit tree_tokens indices per output row (0..num_rows-1)
+    int num_rows,
     hipStream_t stream);
 
 void launch_dspark_tree_topk_tp3(
     DsparkGpuSampleSlot* d_ctrl,
-    const float* d_base_logits_row_f32,         // [vocab_rows] (for stage 0: already rep-penalized step-0 logits; for stages 1..3: saved raw base row)
-    const float* d_markov_logits_row_f32,       // nullptr for stage 0; [vocab_rows] for stages 1..3
+    const float* d_base_logits_row_f32,         // [vocab_rows] (stage 0: rep-penalized step-0 logits; stages 1..9: saved raw base row)
+    const float* d_markov_logits_row_f32,       // nullptr for stage 0; [vocab_rows] for stages >= 1
     uint64_t seq,
-    int tree_stage,                             // 0..3
-    int out_slot,                               // 1 (B=3), 4 (B=2), 6 (B=1), 7 (B=1)
-    int B_out,                                  // 1..3
-    int anc_slot1,                              // -1 or tree_tokens index (e.g. 1 or 2)
-    int anc_slot2,                              // -1 or tree_tokens index (e.g. 4)
+    int tree_stage,                             // 0..9
+    int out_slot,                               // destination start index in tree_tokens[]
+    int B_out,                                  // 1..4
+    uint32_t anc_slots_nibbles,                 // 4-bit ancestor indices in tree_tokens[] (0..anc_cnt-1)
+    int anc_cnt,                                // 0..4
     int rank,
     int vocab_offset,
     int vocab_rows,

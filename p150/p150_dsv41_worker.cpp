@@ -148,6 +148,47 @@ int main(int argc, char** argv) {
                 shm.ptr->last_device_ns = 0;
                 shm.ptr->resp_seq.store(seq, std::memory_order_release);
                 continue;
+            } else if (op == dsv41::DSV41_P150_OP_MOE_RING_SLOT) {
+                const uint32_t rslot = shm.ptr->ring_slot & (dsv41::DSV41_P150_FAST_RING_SLOTS - 1u);
+                auto& rs = shm.ptr->fast_slots[rslot];
+                if (rs.active_pairs == 0u || rs.rows == 0u) {
+                    if (rs.rows > 0u && rs.rows <= dsv41::DSV41_P150_FAST_MAX_ROWS) {
+                        std::memset(rs.y_out_bf16, 0, size_t(rs.rows) * dsv41::DSV41_P150_H * sizeof(uint16_t));
+                    }
+                    rs.zero_output = 1u;
+                    rs.device_ns   = 0ULL;
+                    rs.status      = 0;
+                    shm.ptr->last_device_ns = 0ULL;
+                    shm.ptr->status = 0;
+                    shm.ptr->resp_seq.store(seq, std::memory_order_release);
+                    continue;
+                }
+                try {
+                    const auto tw0 = std::chrono::steady_clock::now();
+                    (void)engine.forward_moe(
+                        rs.layer,
+                        rs.rows,
+                        rs.input_is_wht_rotated != 0u,
+                        rs.row_slots,
+                        rs.row_weights,
+                        rs.x_in_bf16,
+                        rs.y_out_bf16);
+                    const uint64_t wall_ns = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - tw0).count());
+                    publish_mask();
+                    rs.zero_output = 0u;
+                    rs.device_ns   = wall_ns;
+                    rs.status      = 0;
+                    shm.ptr->last_device_ns = wall_ns;
+                    shm.ptr->total_device_ns.fetch_add(wall_ns, std::memory_order_relaxed);
+                    shm.ptr->status = 0;
+                } catch (const std::exception& ex) {
+                    std::fprintf(stderr, "[P150_DSV41] forward_moe ring error: %s\n", ex.what());
+                    rs.status = -1;
+                    shm.ptr->status = -1;
+                }
+                shm.ptr->resp_seq.store(seq, std::memory_order_release);
             } else if (op == dsv41::DSV41_P150_OP_MOE_FORWARD) {
                 try {
                     const uint64_t ns = engine.forward_moe(
@@ -160,6 +201,7 @@ int main(int argc, char** argv) {
                         shm.ptr->y_out_bf16);
                     publish_mask();
                     shm.ptr->last_device_ns = ns;
+                    shm.ptr->total_device_ns.fetch_add(ns, std::memory_order_relaxed);
                     shm.ptr->status = 0;
                 } catch (const std::exception& ex) {
                     std::fprintf(stderr, "[P150_DSV41] forward_moe error: %s\n", ex.what());

@@ -66,10 +66,13 @@ static constexpr int kMtpTopk           = 3;
 static constexpr float kRouteScale      = 1.5f;
 static constexpr int kDSparkBlockSize   = 5;     // M = 1 + 5 = 6 chain verify tokens!
 static constexpr int kTree8NumNodes     = 8;     // Width-[3,2,1,1] causal draft tree (M = 8 verify nodes)
+static constexpr int kMaxTreeNodes      = 16;    // Balanced high-branching M = 16 causal draft tree
 static constexpr uint64_t kTree8AncMask64     = 0x9345231309050301ULL;
-static constexpr uint32_t kTree8DepthNibbles  = 0x32221110u;
-static constexpr uint32_t kTree8ParentNibbles = 0x4211000Fu;
-static constexpr float    kTree8Top1ConfThresh = 0.72f;
+static constexpr TreeAncMask256 kTree8AncMask256 = widen_tree8_anc_mask64(kTree8AncMask64);
+static constexpr uint64_t kTree8DepthNibbles64  = 0x32221110ULL;
+static constexpr uint64_t kTree8ParentNibbles64 = 0x4211000FULL;
+static constexpr float    kTree8Top1ConfThresh  = 0.72f;
+static constexpr float    kTree16Top1ConfThresh = 0.82f;
 static constexpr std::array<int32_t, kTree8NumNodes>  kTree8Parents = {-1, 0, 0, 0, 1, 1, 2, 4};
 static constexpr std::array<uint32_t, kTree8NumNodes> kTree8Depths  = {0u, 1u, 1u, 1u, 2u, 2u, 2u, 3u};
 static constexpr int32_t kDSparkNoiseId = 128799;
@@ -344,6 +347,8 @@ struct TpRankContext {
     hipEvent_t ev_done        = nullptr;
     hipEvent_t ev_x_ready     = nullptr;
     hipEvent_t ev_router_done = nullptr;
+    hipEvent_t ev_router_done_ring[kNumLayers]{};
+    hipEvent_t ev_p150_armed_ring[kNumLayers]{};
     hipEvent_t ev_engram_ready[2]{};
     hipEvent_t ev_engram_consumed[2]{};
     hipEvent_t ev_radix_stage[2]{};
@@ -367,11 +372,16 @@ struct TpRankContext {
     float*    d_comp_kv_state_slab = nullptr;
     float*    d_comp_kv_state[3]{};      // [2, 512] F32 for r=2 layers (2, 8, 14)
     float*    d_comp_score_state[3]{};   // [2, 512] F32 for r=2 layers (2, 8, 14)
-    float*    d_comp_kv_last[3]{};       // [8, 512] F32 saved during M<=6 verify for rollback
-    float*    d_comp_score_last[3]{};    // [8, 512] F32 saved during M<=6 verify for rollback
-    uint8_t*  d_comp_kv_fp4[4]{};        // [max_comp, 256] U8 (slots 0..2: r=2, slot 3: r=1)
-    uint8_t*  d_comp_kv_e4m3[4]{};       // [max_comp, 32]  U8
-    uint8_t*  d_index_k_fp4[4]{};        // [max_comp, 64]  U8 (68 B/slot packed Indexer K!)
+    float*    d_comp_kv_last[3]{};       // [16, 512] F32 saved during M<=16 verify for rollback
+    float*    d_comp_score_last[3]{};    // [16, 512] F32 saved during M<=16 verify for rollback
+    int       hot_comp_cap[4]{};         // Hot HBM2 compressed KV slots per source (262144 for r=2, 524288 for r=1)
+    uint8_t*  d_comp_kv_fp4[4]{};        // [hot_comp_cap, 256] U8 (slots 0..2: r=2, slot 3: r=1)
+    uint8_t*  d_comp_kv_e4m3[4]{};       // [hot_comp_cap, 32]  U8
+    uint8_t*  h_ext_comp_kv_fp4[4]{};    // Coherent mapped pinned DDR4 warm tier [max_comp - hot_comp_cap, 256]
+    uint8_t*  h_ext_comp_kv_e4m3[4]{};   // Coherent mapped pinned DDR4 warm tier [max_comp - hot_comp_cap, 32]
+    uint8_t*  d_ext_comp_kv_fp4[4]{};    // Device mapped view of h_ext_comp_kv_fp4
+    uint8_t*  d_ext_comp_kv_e4m3[4]{};   // Device mapped view of h_ext_comp_kv_e4m3
+    uint8_t*  d_index_k_fp4[4]{};        // [max_comp, 64]  U8 (68 B/slot packed Indexer K — 100% HBM2 up to 1M!)
     uint8_t*  d_index_k_ue8m0[4]{};      // [max_comp, 4]   U8
 
     // Workspace Scratch (sized for kMaxChunkM = 512, exact multiple of 64!)
@@ -400,7 +410,8 @@ struct TpRankContext {
     uint16_t* d_wo_mid_bf16 = nullptr;   // [M, 3072]
 
     int32_t*  d_comp_topk_idxs  = nullptr; // [M, 512]
-    uint8_t*  d_cand_block_mask = nullptr; // [M, cand_block_stride] (1 byte per 8 compressed keys!)
+    uint32_t* d_cand_block_mask = nullptr; // [M, cand_block_stride] bit-packed (1 bit per 8 compressed keys!)
+    uint32_t* d_p150_wg_sync    = nullptr; // [1] device CTA barrier counter on tp=0 for k_stage_and_arm_p150_shm
 
     float*    d_comp_kv_tmp_f32    = nullptr; // [M, 512]
     float*    d_comp_score_tmp_f32 = nullptr; // [M, 512]
@@ -460,10 +471,19 @@ struct Dsv41Runtime::Impl {
     Dsv41EngramEngine engram_cpu;
     Dsv41P150ShmMapping p150_shm;
     bool p150_shm_pinned = false;
+    Dsv41P150ShmChannel* d_p150_shm_ptr = nullptr;
     std::array<uint16_t*, kTpSize> d_p150_shm_y_out_bf16{nullptr, nullptr, nullptr};
+    std::array<const uint32_t*, kTpSize> d_p150_resp_seq{nullptr, nullptr, nullptr};
+    std::array<std::array<uint16_t*, DSV41_P150_FAST_RING_SLOTS>, kTpSize> d_p150_fast_y_out_bf16{};
     uint32_t p150_seq_counter = 0u;
     HostRingAllReduceSlot* h_ar_ring = nullptr;
     uint64_t host_ar_seq = 0u;
+    Dsv41GpuStageRtc* h_stage_rtc = nullptr;
+    Dsv41GpuStageRtc* d_stage_rtc = nullptr;
+    double inv_rtc_ticks_per_ms = 1.0 / 25000.0;
+    bool dual_stream_overlap = true;
+    bool rtc_active_in_chunk = false;
+    Dsv41TreeWidthMode tree_width_mode = Dsv41TreeWidthMode::Auto;
 
     // Coherent mapped pinned DDR4 Markov embedding [129280, 256] BF16 (63.1 MiB in DDR4 -> 0 B HBM2!) + GPU DSpark slot
     uint16_t* h_markov_embed_mapped = nullptr;
@@ -513,7 +533,7 @@ struct Dsv41Runtime::Impl {
     std::vector<Mi50RoutedPair> mi50_sorted_pairs_buf;
     std::vector<int32_t> mi50_active_exp_buf;
     std::vector<int32_t> mi50_csr_buf;
-    std::array<float, 8 * kVocabSize> host_full_logits{};
+    std::vector<float> host_full_logits;
     std::vector<double> host_tree_probs_f64;
     std::array<std::vector<float>, kDSparkBlockSize> draft_q_probs;
     std::array<float, kDSparkBlockSize> draft_q_selected{};
@@ -588,6 +608,10 @@ struct Dsv41Runtime::Impl {
             if (ctx[tp].ev_done)        (void)hipEventDestroy(ctx[tp].ev_done);
             if (ctx[tp].ev_x_ready)     (void)hipEventDestroy(ctx[tp].ev_x_ready);
             if (ctx[tp].ev_router_done) (void)hipEventDestroy(ctx[tp].ev_router_done);
+            for (int l = 0; l < kNumLayers; ++l) {
+                if (ctx[tp].ev_router_done_ring[l]) (void)hipEventDestroy(ctx[tp].ev_router_done_ring[l]);
+                if (ctx[tp].ev_p150_armed_ring[l])  (void)hipEventDestroy(ctx[tp].ev_p150_armed_ring[l]);
+            }
             for (int s = 0; s < 2; ++s) {
                 if (ctx[tp].ev_engram_ready[s])    (void)hipEventDestroy(ctx[tp].ev_engram_ready[s]);
                 if (ctx[tp].ev_engram_consumed[s]) (void)hipEventDestroy(ctx[tp].ev_engram_consumed[s]);
@@ -609,9 +633,17 @@ struct Dsv41Runtime::Impl {
             }
         }
         if (p150_shm_pinned && p150_shm.ptr) {
+            d_p150_shm_ptr = nullptr;
             d_p150_shm_y_out_bf16.fill(nullptr);
+            d_p150_resp_seq.fill(nullptr);
+            for (auto& arr : d_p150_fast_y_out_bf16) arr.fill(nullptr);
             (void)hipHostUnregister(p150_shm.ptr);
             p150_shm_pinned = false;
+        }
+        if (h_stage_rtc) {
+            (void)hipHostFree(h_stage_rtc);
+            h_stage_rtc = nullptr;
+            d_stage_rtc = nullptr;
         }
         if (h_dspark_ctrl) {
             (void)hipHostFree(h_dspark_ctrl);
@@ -864,7 +896,7 @@ struct Dsv41Runtime::Impl {
         auto& c = ctx[tp];
         c.tp = tp;
         c.vocab_offset = vocab_offset_in;
-        c.cand_block_stride = (max_seq_len + 7) / 8;
+        c.cand_block_stride = (max_seq_len + 511) / 256;
 
         int lo_pri = 0, hi_pri = 0;
         DSV41_HIP_CHECK(hipDeviceGetStreamPriorityRange(&lo_pri, &hi_pri));
@@ -895,6 +927,12 @@ struct Dsv41Runtime::Impl {
         DSV41_HIP_CHECK(hipEventCreateWithFlags(&c.ev_done, hipEventDisableTiming));
         DSV41_HIP_CHECK(hipEventCreateWithFlags(&c.ev_x_ready, hipEventDisableTiming));
         DSV41_HIP_CHECK(hipEventCreateWithFlags(&c.ev_router_done, hipEventDisableTiming));
+        if (tp == 0) {
+            for (int l = 0; l < kNumLayers; ++l) {
+                DSV41_HIP_CHECK(hipEventCreateWithFlags(&c.ev_router_done_ring[l], hipEventDisableTiming));
+                DSV41_HIP_CHECK(hipEventCreateWithFlags(&c.ev_p150_armed_ring[l], hipEventDisableTiming));
+            }
+        }
         for (int s = 0; s < 2; ++s) {
             DSV41_HIP_CHECK(hipEventCreateWithFlags(&c.ev_engram_ready[s], hipEventDisableTiming));
             DSV41_HIP_CHECK(hipEventCreateWithFlags(&c.ev_engram_consumed[s], hipEventDisableTiming));
@@ -944,21 +982,42 @@ struct Dsv41Runtime::Impl {
         for (int b = 0; b < kTotalBlocks; ++b) {
             c.d_win_kv[b] = c.d_win_kv_slab + size_t(b) * kWindowSize * kHeadDim;
         }
-        c.d_last_win_kv_slab = alloc_gpu_buf<uint16_t>(size_t(kNumLayers) * 8u * kHeadDim, c.device_allocs, true);
+        c.d_last_win_kv_slab = alloc_gpu_buf<uint16_t>(size_t(kNumLayers) * size_t(kMaxTreeNodes) * kHeadDim, c.device_allocs, true);
         for (int l = 0; l < kNumLayers; ++l) {
-            c.d_last_win_kv_bf16[l] = c.d_last_win_kv_slab + size_t(l) * 8u * kHeadDim;
+            c.d_last_win_kv_bf16[l] = c.d_last_win_kv_slab + size_t(l) * size_t(kMaxTreeNodes) * kHeadDim;
         }
         c.d_comp_kv_state_slab = alloc_gpu_buf<float>(kCompStateSlabElems, c.device_allocs, true);
         for (int s = 0; s < 3; ++s) {
             c.d_comp_kv_state[s]    = c.d_comp_kv_state_slab + size_t(s * 4 + 0) * kHeadDim;
             c.d_comp_score_state[s] = c.d_comp_kv_state_slab + size_t(s * 4 + 2) * kHeadDim;
-            c.d_comp_kv_last[s]     = alloc_gpu_buf<float>(8u * kHeadDim, c.device_allocs, true);
-            c.d_comp_score_last[s]  = alloc_gpu_buf<float>(8u * kHeadDim, c.device_allocs, true);
+            c.d_comp_kv_last[s]     = alloc_gpu_buf<float>(size_t(kMaxTreeNodes) * kHeadDim, c.device_allocs, true);
+            c.d_comp_score_last[s]  = alloc_gpu_buf<float>(size_t(kMaxTreeNodes) * kHeadDim, c.device_allocs, true);
         }
         for (int s = 0; s < 4; ++s) {
             const size_t max_comp = (s < 3) ? size_t(max_seq_len / 2 + 64) : size_t(max_seq_len + 64);
-            c.d_comp_kv_fp4[s]   = alloc_gpu_buf<uint8_t>(max_comp * 256u, c.device_allocs, true);
-            c.d_comp_kv_e4m3[s]  = alloc_gpu_buf<uint8_t>(max_comp * 32u,  c.device_allocs, true);
+            const size_t hot_cap  = std::min<size_t>(max_comp, (s < 3) ? 262144u : 524288u);
+            c.hot_comp_cap[s]    = static_cast<int>(hot_cap);
+            c.d_comp_kv_fp4[s]   = alloc_gpu_buf<uint8_t>(hot_cap * 256u, c.device_allocs, true);
+            c.d_comp_kv_e4m3[s]  = alloc_gpu_buf<uint8_t>(hot_cap * 32u,  c.device_allocs, true);
+            if (max_comp > hot_cap) {
+                const size_t ext_slots = max_comp - hot_cap;
+                void* h_fp4 = nullptr;
+                void* h_e4  = nullptr;
+                DSV41_HIP_CHECK(hipHostMalloc(&h_fp4, ext_slots * 256u, hipHostMallocMapped | hipHostMallocCoherent));
+                DSV41_HIP_CHECK(hipHostMalloc(&h_e4,  ext_slots * 32u,  hipHostMallocMapped | hipHostMallocCoherent));
+                std::memset(h_fp4, 0, ext_slots * 256u);
+                std::memset(h_e4,  0, ext_slots * 32u);
+                c.host_allocs.push_back(h_fp4);
+                c.host_allocs.push_back(h_e4);
+                c.h_ext_comp_kv_fp4[s]  = static_cast<uint8_t*>(h_fp4);
+                c.h_ext_comp_kv_e4m3[s] = static_cast<uint8_t*>(h_e4);
+                void* d_fp4 = nullptr;
+                void* d_e4  = nullptr;
+                DSV41_HIP_CHECK(hipHostGetDevicePointer(&d_fp4, h_fp4, 0));
+                DSV41_HIP_CHECK(hipHostGetDevicePointer(&d_e4,  h_e4,  0));
+                c.d_ext_comp_kv_fp4[s]  = static_cast<uint8_t*>(d_fp4);
+                c.d_ext_comp_kv_e4m3[s] = static_cast<uint8_t*>(d_e4);
+            }
             c.d_index_k_fp4[s]   = alloc_gpu_buf<uint8_t>(max_comp * 64u,  c.device_allocs, true);
             c.d_index_k_ue8m0[s] = alloc_gpu_buf<uint8_t>(max_comp * 4u,   c.device_allocs, true);
         }
@@ -978,7 +1037,8 @@ struct Dsv41Runtime::Impl {
         c.d_sub_bf16  = alloc_gpu_buf<uint16_t>(M * kDim, c.device_allocs);
         c.d_part_bf16 = alloc_gpu_buf<uint16_t>(M * kDim, c.device_allocs);
         c.d_part_f32  = alloc_gpu_buf<float>(kPartF32Floats, c.device_allocs);
-        c.d_sum_f32   = alloc_gpu_buf<float>(kPartF32Floats, c.device_allocs);
+        // Track 8D: Deduplicate d_sum_f32 onto d_part_f32 (in-place barrier-separated HostRingAllReduce saves +50.00 MiB/rank!)
+        c.d_sum_f32   = c.d_part_f32;
 
         c.d_fp8_act   = alloc_gpu_buf<uint8_t>(M * 12288u, c.device_allocs);
         c.d_fp8_scale = alloc_gpu_buf<uint8_t>(M * 384u, c.device_allocs);
@@ -991,7 +1051,10 @@ struct Dsv41Runtime::Impl {
         c.d_wo_mid_bf16 = alloc_gpu_buf<uint16_t>(M * 3u * kOLoraRank, c.device_allocs);
 
         c.d_comp_topk_idxs  = alloc_gpu_buf<int32_t>(M * kIndexTopk, c.device_allocs);
-        c.d_cand_block_mask = alloc_gpu_buf<uint8_t>(size_t(kMaxDecChunkM) * size_t(c.cand_block_stride), c.device_allocs);
+        c.d_cand_block_mask = alloc_gpu_buf<uint32_t>(size_t(kMaxDecChunkM) * size_t(c.cand_block_stride), c.device_allocs);
+        if (tp == 0) {
+            c.d_p150_wg_sync = alloc_gpu_buf<uint32_t>(16u, c.device_allocs, true);
+        }
 
         c.d_comp_kv_tmp_f32    = alloc_gpu_buf<float>(M * kHeadDim, c.device_allocs);
         c.d_comp_score_tmp_f32 = alloc_gpu_buf<float>(M * kHeadDim, c.device_allocs);
@@ -1022,15 +1085,15 @@ struct Dsv41Runtime::Impl {
         const size_t dec_M = kMaxDecM;
         c.d_target_mean_bf16  = alloc_gpu_buf<uint16_t>(dec_M * kDim, c.device_allocs);
         c.d_main_x_bf16       = alloc_gpu_buf<uint16_t>(dec_M * kDim, c.device_allocs);
-        c.d_logits_part_f32   = alloc_gpu_buf<float>(64u * size_t(c.vocab_rows), c.device_allocs);
+        c.d_logits_part_f32   = alloc_gpu_buf<float>(16u * size_t(c.vocab_rows), c.device_allocs);
         c.d_markov_sum_bf16   = alloc_gpu_buf<uint16_t>(64u * kMarkovRank, c.device_allocs);
-        c.d_markov_logits_f32 = alloc_gpu_buf<float>(64u * size_t(c.vocab_rows), c.device_allocs);
+        c.d_markov_logits_f32 = alloc_gpu_buf<float>(16u * size_t(c.vocab_rows), c.device_allocs);
         c.d_conf_in_bf16      = alloc_gpu_buf<uint16_t>(64u * (kDim + kMarkovRank), c.device_allocs);
         c.d_conf_out_f32      = alloc_gpu_buf<float>(64u, c.device_allocs);
 
         c.h_reduce_bf16 = alloc_pinned<uint16_t>(tp, 64u);
         c.h_reduce_f32  = alloc_pinned<float>(tp, 64u);
-        c.h_logits_part    = alloc_pinned<float>(tp, 8u * size_t(c.vocab_rows));
+        c.h_logits_part    = alloc_pinned<float>(tp, 16u * size_t(c.vocab_rows));
         c.h_engram_bf16[0] = alloc_pinned<uint16_t>(tp, M * 2048u);
         c.h_engram_bf16[1] = alloc_pinned<uint16_t>(tp, M * 2048u);
         if (tp == 0) {
@@ -1048,11 +1111,13 @@ struct Dsv41Runtime::Impl {
 
         size_t free_b = 0, total_b = 0;
         DSV41_HIP_CHECK(hipMemGetInfo(&free_b, &total_b));
-        std::printf("[DSV41_RT] MI50 tp=%d ready: vocab=[%d..%d) h_cnt=%d ih_cnt=%d HBM=%.2f / %.2f GiB used\n",
+        std::printf("[DSV41_RT] MI50 tp=%d ready: vocab=[%d..%d) h_cnt=%d ih_cnt=%d HBM=%.2f / %.2f GiB used (free=%.1f MiB, max_seq_len=%d)\n",
                     tp, c.vocab_offset, c.vocab_offset + c.vocab_rows,
                     c.blocks[2].h_cnt, c.blocks[2].ih_cnt,
                     double(total_b - free_b) / (1024.0 * 1024.0 * 1024.0),
-                    double(total_b) / (1024.0 * 1024.0 * 1024.0));
+                    double(total_b) / (1024.0 * 1024.0 * 1024.0),
+                    double(free_b) / (1024.0 * 1024.0),
+                    max_seq_len);
         std::fflush(stdout);
     }
 
@@ -1105,7 +1170,8 @@ struct Dsv41Runtime::Impl {
     // Dumitrescu mixed-precision FP32 TP3 HostRingAllReduce + optional P150A BF16 add + FP32 mHC post -> 1 final RNE BF16 (M <= 64)
     void all_reduce_tp3_f32_hc_post(const float* src0, const float* src1, const float* src2,
                                     const uint16_t* p150_0, const uint16_t* p150_1, const uint16_t* p150_2,
-                                    int in_h_slot, int out_h_slot, int M) {
+                                    int in_h_slot, int out_h_slot, int M,
+                                    Dsv41GpuStageRtc* rtc_tp0 = nullptr) {
         if (M <= 0) return;
         sync_tp0_if_profiling();
         const auto tar0 = std::chrono::steady_clock::now();
@@ -1119,10 +1185,13 @@ struct Dsv41Runtime::Impl {
             launch_host_ring_allreduce_f32_hc_post(
                 srcs[tp], p150s[tp], c.d_h_bf16[in_h_slot],
                 c.d_post_mix_f32, c.d_comb_mix_f32, c.d_h_bf16[out_h_slot],
-                slot, tp, seq, M, c.stream);
+                slot, tp, seq, M, c.stream,
+                (tp == 0) ? rtc_tp0 : nullptr);
         }
         sync_tp0_if_profiling();
-        accum_allreduce_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tar0).count();
+        if (!rtc_tp0) {
+            accum_allreduce_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tar0).count();
+        }
     }
 
     // Write `count` BF16 [512] rows from d_src_bf16 into ring d_win_kv[block_id] starting at global `start_pos`
@@ -1186,7 +1255,9 @@ struct Dsv41Runtime::Impl {
             // Compress KV cache (RoPE + FP4/E4M3_16)
             launch_rope_tail64_bf16(c.d_latent_bf16, true, M, 1, kHeadDim, start_pos, 1, false, c.stream);
             launch_pack_compress_kv_fp4_e4m3_16(c.d_latent_bf16, c.d_comp_kv_fp4[kv_slot], c.d_comp_kv_e4m3[kv_slot],
-                                                start_pos, M, c.stream);
+                                                start_pos, M, c.stream,
+                                                c.d_ext_comp_kv_fp4[kv_slot], c.d_ext_comp_kv_e4m3[kv_slot],
+                                                c.hot_comp_cap[kv_slot]);
         }
     }
 
@@ -1201,16 +1272,17 @@ struct Dsv41Runtime::Impl {
         bool commit_window_immediately,
         bool skip_global_kv_write,
         int& io_shared_k_comp,
-        uint64_t tree_anc_mask64 = 0ULL,
-        uint32_t tree_depth_nibbles = 0u,
-        uint32_t tree_parent_nibbles = 0u)
+        TreeAncMask256 tree_anc_mask = {},
+        uint64_t tree_depth_nibbles = 0ULL,
+        uint64_t tree_parent_nibbles = 0ULL)
     {
+        const bool is_tree = tree_anc_mask.active();
         const int ratio = kCompressRatios[l];
         const int kv_slot = kv_source_slot_for_layer(l);
         int n_lat = 0;
         const int lat_slot_base = (ratio > 0) ? (start_pos / ratio) : 0;
         const int T_comp = (ratio > 0)
-            ? ((tree_anc_mask64 != 0ULL) ? (lat_slot_base + M) : ((start_pos + M) / ratio))
+            ? (is_tree ? (lat_slot_base + M) : ((start_pos + M) / ratio))
             : 0;
         const int K_comp = (ratio > 0) ? std::min(kIndexTopk, T_comp) : 0;
         const int swa_floor = std::max(chunk_swa_floor, (l >= 20) ? win_valid_from_20_39 : 0);
@@ -1230,14 +1302,14 @@ struct Dsv41Runtime::Impl {
                             M, kQkvConcatRows, kDim, false, false, c.stream);
             launch_split_qkv_norm_rope_quant(c.d_qkv_bf16, b.d_q_norm, b.d_kv_norm, use_comp_yarn,
                                              c.d_qr_bf16, c.d_kv_cur_bf16, M, start_pos, kNormEps, c.stream,
-                                             tree_anc_mask64, tree_depth_nibbles);
+                                             tree_anc_mask, tree_depth_nibbles);
 
             // Quantize qr [M, 1280] (reused by wq_b AND indexer.wq_b!)
             launch_act_quant_ue8m0_32(c.d_qr_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr, M, kQLoraRank, false, c.stream);
             launch_fp8_gemm(c.d_fp8_act, c.d_fp8_scale, b.d_wq_b_w, b.d_wq_b_s, c.d_q_bf16, nullptr,
                             M, b.h_cnt * kHeadDim, kQLoraRank, false, false, c.stream);
             launch_rope_tail64_bf16(c.d_q_bf16, use_comp_yarn, M, b.h_cnt, kHeadDim, start_pos, 1, false, c.stream,
-                                    tree_anc_mask64, tree_depth_nibbles);
+                                    tree_anc_mask, tree_depth_nibbles);
 
             // Compressor pre-RoPE latent (skipped during SWA Bounded Replay when Global KV already restored!)
             if (b.is_kv_source && !skip_global_kv_write) {
@@ -1257,7 +1329,7 @@ struct Dsv41Runtime::Impl {
                                                        size_t(M) * kHeadDim * sizeof(float),
                                                        hipMemcpyDeviceToDevice, c.stream));
                     }
-                    if (tree_anc_mask64 != 0ULL) {
+                    if (is_tree) {
                         launch_compressor_r2_tree_pool(c.d_comp_kv_tmp_f32, c.d_comp_score_tmp_f32,
                                                        c.d_comp_kv_state[r2_idx], c.d_comp_score_state[r2_idx],
                                                        c.d_latent_bf16, start_pos, M,
@@ -1283,8 +1355,8 @@ struct Dsv41Runtime::Impl {
                                         n_lat, kIndexHeadDim, kNormEps, c.stream);
                     launch_rope_tail64_bf16(c.d_idx_k_tmp_bf16, true,
                                             n_lat, 1, kIndexHeadDim,
-                                            (tree_anc_mask64 != 0ULL) ? start_pos : (lat_slot_base * ratio),
-                                            ratio, false, c.stream, tree_anc_mask64, tree_depth_nibbles);
+                                            is_tree ? start_pos : (lat_slot_base * ratio),
+                                            ratio, false, c.stream, tree_anc_mask, tree_depth_nibbles);
                     launch_pack_index_k_fp4_ue8m0_32(c.d_idx_k_tmp_bf16,
                                                      c.d_index_k_fp4[kv_slot], c.d_index_k_ue8m0[kv_slot],
                                                      lat_slot_base, n_lat, c.stream);
@@ -1294,7 +1366,7 @@ struct Dsv41Runtime::Impl {
                                     M, b.ih_cnt * kIndexHeadDim, kQLoraRank, false, false, c.stream);
                     launch_rope_tail64_bf16(c.d_idx_q_bf16, true,
                                             M, b.ih_cnt, kIndexHeadDim, start_pos, 1, false, c.stream,
-                                            tree_anc_mask64, tree_depth_nibbles);
+                                            tree_anc_mask, tree_depth_nibbles);
                     launch_fp4_quant_dequant_ue8m0_32_inplace(c.d_idx_q_bf16, M * b.ih_cnt, kIndexHeadDim, c.stream);
                     launch_bf16_gemm(c.d_x_bf16, b.d_idx_weights_proj, c.d_idx_weights_bf16, nullptr,
                                      M, b.ih_cnt, kDim, false, c.stream);
@@ -1336,7 +1408,7 @@ struct Dsv41Runtime::Impl {
                     for (int tp = 0; tp < 3; ++tp) {
                         DSV41_HIP_CHECK(hipSetDevice(tp));
                         auto& c = ctx[tp];
-                        uint8_t* cand_ptr = (mode == 0)
+                        uint32_t* cand_ptr = (mode == 0)
                             ? nullptr
                             : (c.d_cand_block_mask + size_t(m0) * size_t(c.cand_block_stride));
                         launch_indexer_candidates_and_topk(
@@ -1345,9 +1417,9 @@ struct Dsv41Runtime::Impl {
                             c.cand_block_stride,
                             c.d_comp_topk_idxs + size_t(m0) * size_t(K_comp),
                             sub_m, T_comp,
-                            (tree_anc_mask64 != 0ULL) ? start_pos : (start_pos + m0),
+                            is_tree ? start_pos : (start_pos + m0),
                             ratio, mode, K_comp, c.stream,
-                            tree_anc_mask64, tree_depth_nibbles, m0);
+                            tree_anc_mask, tree_depth_nibbles, m0);
                     }
                 }
                 sync_tp0_if_profiling();
@@ -1367,10 +1439,12 @@ struct Dsv41Runtime::Impl {
             if (b.is_kv_source && !skip_global_kv_write && n_lat > 0) {
                 launch_rope_tail64_bf16(c.d_latent_bf16, true,
                                         n_lat, 1, kHeadDim,
-                                        (tree_anc_mask64 != 0ULL) ? start_pos : (lat_slot_base * ratio),
-                                        ratio, false, c.stream, tree_anc_mask64, tree_depth_nibbles);
+                                        is_tree ? start_pos : (lat_slot_base * ratio),
+                                        ratio, false, c.stream, tree_anc_mask, tree_depth_nibbles);
                 launch_pack_compress_kv_fp4_e4m3_16(c.d_latent_bf16, c.d_comp_kv_fp4[kv_slot], c.d_comp_kv_e4m3[kv_slot],
-                                                    lat_slot_base, n_lat, c.stream);
+                                                    lat_slot_base, n_lat, c.stream,
+                                                    c.d_ext_comp_kv_fp4[kv_slot], c.d_ext_comp_kv_e4m3[kv_slot],
+                                                    c.hot_comp_cap[kv_slot]);
             }
 
             // CRITICAL INVARIANT: launch_sparse_attn MUST run BEFORE write_ring_window_gpu so historical slots < start_pos
@@ -1383,9 +1457,12 @@ struct Dsv41Runtime::Impl {
                 (active_k_comp > 0) ? c.d_comp_kv_e4m3[kv_slot] : nullptr,
                 (active_k_comp > 0) ? c.d_comp_topk_idxs : nullptr,
                 active_k_comp,
-                (M <= 8) ? c.d_part_f32 : nullptr,
+                (M <= 16) ? c.d_part_f32 : nullptr,
                 c.d_o_bf16, M, b.h_cnt, c.stream,
-                tree_anc_mask64, tree_depth_nibbles);
+                tree_anc_mask, tree_depth_nibbles,
+                (active_k_comp > 0) ? c.d_ext_comp_kv_fp4[kv_slot] : nullptr,
+                (active_k_comp > 0) ? c.d_ext_comp_kv_e4m3[kv_slot] : nullptr,
+                (active_k_comp > 0) ? c.hot_comp_cap[kv_slot] : 0x7FFFFFFF);
 
             if (commit_window_immediately) {
                 write_ring_window_gpu(tp, l, c.d_kv_cur_bf16, start_pos, M);
@@ -1408,7 +1485,7 @@ struct Dsv41Runtime::Impl {
 
             // Inverse RoPE on tail 64 dims of o + grouped wo_a + wo_b
             launch_rope_tail64_bf16(c.d_o_bf16, use_comp_yarn, M, b.h_cnt, kHeadDim, start_pos, 1, true, c.stream,
-                                    tree_anc_mask64, tree_depth_nibbles);
+                                    tree_anc_mask, tree_depth_nibbles);
             launch_act_quant_ue8m0_32(c.d_o_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr,
                                       M, b.g_cnt * 4096, false, c.stream);
             launch_fp8_grouped_wo_a(c.d_fp8_act, c.d_fp8_scale, b.d_wo_a_w, b.d_wo_a_s,
@@ -1430,7 +1507,8 @@ struct Dsv41Runtime::Impl {
         const auto t_aar0 = std::chrono::steady_clock::now();
         if (M <= kF32RingMaxM) {
             all_reduce_tp3_f32_hc_post(ctx[0].d_part_f32, ctx[1].d_part_f32, ctx[2].d_part_f32,
-                                       nullptr, nullptr, nullptr, in_h_slot, out_h_slot, M);
+                                       nullptr, nullptr, nullptr, in_h_slot, out_h_slot, M,
+                                       rtc_active_in_chunk ? d_stage_rtc : nullptr);
         } else {
             all_reduce_tp3_bf16(ctx[0].d_part_bf16, ctx[1].d_part_bf16, ctx[2].d_part_bf16,
                                 ctx[0].d_sub_bf16,  ctx[1].d_sub_bf16,  ctx[2].d_sub_bf16,
@@ -1446,7 +1524,9 @@ struct Dsv41Runtime::Impl {
         if (sync_timers) {
             sub_att_ar_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_aar0).count();
         }
-        accum_attn_ms += std::max(0.0, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_att0).count() - hsi_delta_ms);
+        if (!rtc_active_in_chunk) {
+            accum_attn_ms += std::max(0.0, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_att0).count() - hsi_delta_ms);
+        }
     }
 
     // Run MoE FFN + mHC post for block `block_id` (0..42):
@@ -1539,8 +1619,104 @@ struct Dsv41Runtime::Impl {
             return;
         }
 
-        // Wave 7A Backbone MoE: tp=0 router_stream gets 100% CU exclusivity first; NO MI50 shared/routed
-        // starts until the P150A [216..383] doorbell is armed strictly after ev_router_done.
+        // Wave 8A True Dual-Stream P150A || MI50 Overlap (M <= 64):
+        //   - Runs 384-way router + top-6 gate on all 3 MI50 ranks (0 host syncs!).
+        //   - Forks tp=0 high-priority router_stream right after ev_router_done_ring[block_id] to stage
+        //     fast_slots[rslot] and arm shm->req_seq directly over PCIe BEFORE shared_experts / [0..215] HLUT2!
+        //   - Runs shared_experts + device-resident [0..215] HLUT2 + HostRing upload concurrently with 2x P150A,
+        //     and waits on mapped d_p150_resp_seq inside k_host_ring_finish_f32_hc_post (0 CPU stalls across 40 layers!).
+        if (M <= kF32RingMaxM && dual_stream_overlap && p150_shm.ptr && p150_shm_pinned &&
+            d_p150_shm_ptr != nullptr && !rarebal_collector && !sync_timers)
+        {
+            uint32_t posted_p150_seq = 0u;
+            for (int tp = 0; tp < 3; ++tp) {
+                DSV41_HIP_CHECK(hipSetDevice(tp));
+                auto& c = ctx[tp];
+                const auto& b = c.blocks[block_id];
+                launch_bf16_gemm(c.d_x_bf16, b.d_gate_w, nullptr, c.d_gate_logits_f32,
+                                 M, b.n_routed_experts, kDim, true, c.stream);
+                launch_moe_gate(c.d_gate_logits_f32, b.d_gate_bias, b.d_gate_bias_vl, nullptr,
+                                c.d_topk_ids, c.d_topk_weights,
+                                M, b.n_routed_experts, top_k, kRouteScale, c.stream);
+                if (tp == 0) {
+                    DSV41_HIP_CHECK(hipEventRecord(c.ev_router_done_ring[block_id], c.stream));
+                    DSV41_HIP_CHECK(hipStreamWaitEvent(c.router_stream, c.ev_router_done_ring[block_id], 0));
+                    posted_p150_seq = ++p150_seq_counter;
+                    launch_stage_and_arm_p150_shm(
+                        d_p150_shm_ptr, c.d_p150_wg_sync,
+                        c.d_topk_ids, c.d_topk_weights, c.d_part_bf16,
+                        static_cast<uint32_t>(block_id), M, top_k, kMi50BackboneExp,
+                        posted_p150_seq, c.router_stream);
+                    DSV41_HIP_CHECK(hipEventRecord(c.ev_p150_armed_ring[block_id], c.router_stream));
+                }
+            }
+
+            const int P_tot = M * top_k;
+            const bool use_pairs = (M <= 16);
+            for (int tp = 0; tp < 3; ++tp) {
+                DSV41_HIP_CHECK(hipSetDevice(tp));
+                auto& c = ctx[tp];
+                const auto& b = c.blocks[block_id];
+                if (tp == 0) {
+                    // Ensure high-priority router_stream arms shm->req_seq on empty CUs BEFORE tp=0 launches shared_experts/HLUT2!
+                    DSV41_HIP_CHECK(hipStreamWaitEvent(c.stream, c.ev_p150_armed_ring[block_id], 0));
+                }
+
+                // 1. Shared SwiGLU initializes c.d_moe_part_f32 (accumulate_f32 = false)
+                launch_act_quant_ue8m0_32(c.d_x_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr, M, kDim, false, c.stream);
+                launch_fp8_gemm(c.d_fp8_act, c.d_fp8_scale, b.d_sh_w13_w, b.d_sh_w13_s, c.d_sh_gateup_bf16, nullptr,
+                                M, 2 * kSharedInterTp, kDim, false, false, c.stream);
+                launch_swiglu10_split_quant_ue8m0_32(c.d_sh_gateup_bf16, c.d_fp8_act, c.d_fp8_scale,
+                                                     M, kSharedInterTp, c.stream);
+                launch_fp8_gemm(c.d_fp8_act, c.d_fp8_scale, b.d_sh_w2_w, b.d_sh_w2_s, nullptr, c.d_moe_part_f32,
+                                M, kDim, kSharedInterTp, true, false, c.stream);
+
+                // 2. Device-resident MI50 [0..215] HLUT2 routed experts (0 host syncs!)
+                if (use_pairs) {
+                    launch_pack_mi50_routed_pairs(c.d_topk_ids, c.d_topk_weights, c.d_routed_pairs,
+                                                  M, top_k, b.mi50_experts, c.stream);
+                    launch_mi50_routed_hlut2_pairs(
+                        c.d_x_rot_f16, c.d_routed_pairs, P_tot,
+                        b.d_hlut2_gate_codes, b.d_hlut2_gate_sc, b.d_hlut2_gate_cent,
+                        b.d_hlut2_up_codes,   b.d_hlut2_up_sc,   b.d_hlut2_up_cent,
+                        b.d_hlut2_down_codes, b.d_hlut2_down_sc, b.d_hlut2_down_cent,
+                        b.d_signs_i, c.d_inter_bf16, c.d_inter_rot_f16,
+                        c.d_moe_part_f32, c.stream);
+                } else {
+                    const int max_act = std::min(b.mi50_experts, P_tot);
+                    launch_build_mi50_csr(c.d_topk_ids, c.d_topk_weights,
+                                          c.d_active_experts, c.d_csr_offsets, c.d_routed_pairs,
+                                          M, top_k, b.mi50_experts, c.stream);
+                    launch_mi50_routed_hlut2_grouped(
+                        c.d_x_rot_f16, c.d_active_experts, c.d_csr_offsets, c.d_routed_pairs,
+                        M, max_act, P_tot,
+                        b.d_hlut2_gate_codes, b.d_hlut2_gate_sc, b.d_hlut2_gate_cent,
+                        b.d_hlut2_up_codes,   b.d_hlut2_up_sc,   b.d_hlut2_up_cent,
+                        b.d_hlut2_down_codes, b.d_hlut2_down_sc, b.d_hlut2_down_cent,
+                        b.d_signs_i, c.d_inter_bf16, c.d_inter_rot_f16,
+                        c.d_moe_part_f32, c.stream);
+                }
+            }
+
+            // 3. Upload MI50 FP32 partials + GPU wait on mapped P150A resp_seq + fused mHC post
+            const uint32_t rslot = (posted_p150_seq - 1u) & (DSV41_P150_FAST_RING_SLOTS - 1u);
+            const uint64_t ar_seq = ++host_ar_seq;
+            HostRingAllReduceSlot* ar_slot = &h_ar_ring[(ar_seq - 1ULL) & (kHostArRingSlots - 1ULL)];
+            for (int tp = 0; tp < 3; ++tp) {
+                DSV41_HIP_CHECK(hipSetDevice(tp));
+                auto& c = ctx[tp];
+                launch_host_ring_upload_f32(c.d_moe_part_f32, ar_slot, tp, ar_seq, M, c.stream);
+                launch_host_ring_finish_f32_hc_post(
+                    c.d_moe_part_f32, d_p150_fast_y_out_bf16[tp][rslot],
+                    c.d_h_bf16[in_h_slot], c.d_post_mix_f32, c.d_comb_mix_f32, c.d_h_bf16[out_h_slot],
+                    ar_slot, tp, ar_seq, M, c.stream,
+                    d_p150_resp_seq[tp], posted_p150_seq,
+                    (tp == 0 && rtc_active_in_chunk) ? d_stage_rtc : nullptr);
+            }
+            return;
+        }
+
+        // Wave 7A Backbone MoE (prefill M > 64, RAREBAL collector, or --no-dual-stream-overlap):
         {
             DSV41_HIP_CHECK(hipSetDevice(0));
             auto& c0 = ctx[0];
@@ -1896,9 +2072,9 @@ struct Dsv41Runtime::Impl {
         bool capture_dspark_hidden,
         int chunk_swa_floor = 0,
         bool skip_global_kv_write = false,
-        uint64_t tree_anc_mask64 = 0ULL,
-        uint32_t tree_depth_nibbles = 0u,
-        uint32_t tree_parent_nibbles = 0u,
+        TreeAncMask256 tree_anc_mask = {},
+        uint64_t tree_depth_nibbles = 0ULL,
+        uint64_t tree_parent_nibbles = 0ULL,
         const int32_t* tree_parents = nullptr,
         const uint32_t* tree_depths = nullptr)
     {
@@ -1911,7 +2087,7 @@ struct Dsv41Runtime::Impl {
         }
 
         // 1. Compute CPU Engram 4-gram hashes & kick off async DDR4 gather + PCIe H2D for BOTH L1 and L14!
-        if (tree_anc_mask64 != 0ULL && tree_parents != nullptr && tree_depths != nullptr) {
+        if (tree_anc_mask.active() && tree_parents != nullptr && tree_depths != nullptr) {
             engram_cpu.compute_hashes_tree(token_ids, tree_parents, tree_depths, M, start_pos, engram_hashes_buf);
         } else {
             engram_cpu.compute_hashes(token_ids, M, start_pos, nullptr, engram_hashes_buf);
@@ -1939,12 +2115,39 @@ struct Dsv41Runtime::Impl {
             launch_hc_init(c.d_x_bf16, c.d_h_bf16[0], c.d_pre_mix_f32[0], M, c.stream);
         }
 
+        const bool use_rtc = (!encoder_only && M <= kF32RingMaxM && dual_stream_overlap &&
+                              h_stage_rtc != nullptr && d_stage_rtc != nullptr &&
+                              p150_shm.ptr && p150_shm_pinned && d_p150_shm_ptr != nullptr &&
+                              !rarebal_collector && !sync_timers);
+        uint64_t p150_ns_before = 0ULL;
+        const double hsi_before = accum_hsi_ms;
+        if (use_rtc) {
+            std::memset(h_stage_rtc, 0, sizeof(Dsv41GpuStageRtc));
+            std::atomic_thread_fence(std::memory_order_release);
+            p150_ns_before = p150_shm.ptr->total_device_ns.load(std::memory_order_relaxed);
+            DSV41_HIP_CHECK(hipSetDevice(0));
+            launch_stamp_gpu_rtc(d_stage_rtc, ctx[0].stream);
+            rtc_active_in_chunk = true;
+        }
+
         const int stop_layer = encoder_only ? 20 : kNumLayers;
         int shared_k_comp = 0;
 
         for (int l = 0; l < stop_layer; ++l) {
-            if (l == 1)  forward_engram_layer(0, 0, h_slot, M);
-            if (l == 14) forward_engram_layer(1, 1, h_slot, M);
+            if (l == 1) {
+                forward_engram_layer(0, 0, h_slot, M);
+                if (use_rtc) {
+                    DSV41_HIP_CHECK(hipSetDevice(0));
+                    launch_stamp_gpu_rtc(d_stage_rtc, ctx[0].stream);
+                }
+            }
+            if (l == 14) {
+                forward_engram_layer(1, 1, h_slot, M);
+                if (use_rtc) {
+                    DSV41_HIP_CHECK(hipSetDevice(0));
+                    launch_stamp_gpu_rtc(d_stage_rtc, ctx[0].stream);
+                }
+            }
 
             // Capture DSpark target layer input mean (tp0<-L37, tp1<-L38, tp2<-L39) BEFORE layer forward!
             if (capture_dspark_hidden && l >= 37 && l <= 39) {
@@ -1974,7 +2177,7 @@ struct Dsv41Runtime::Impl {
 
             forward_backbone_attention(l, start_pos, M, h_slot, next_slot, chunk_swa_floor,
                                        commit_window_immediately, skip_global_kv_write, shared_k_comp,
-                                       tree_anc_mask64, tree_depth_nibbles, tree_parent_nibbles);
+                                       tree_anc_mask, tree_depth_nibbles, tree_parent_nibbles);
 
             // hc_mixes & fused hc_pre_rmsnorm + register WHT128 before MoE
             for (int tp = 0; tp < 3; ++tp) {
@@ -2004,10 +2207,13 @@ struct Dsv41Runtime::Impl {
             return;
         }
 
-        // Final Head: compute logits for last 1 row or all M<=6 rows into host_full_logits
+        // Final Head: compute logits for last 1 row or all M<=16 rows into host_full_logits
         if (compute_logits_rows > 0) {
             const int rows_out = std::min(compute_logits_rows, M);
             const int row_off = M - rows_out;
+            if (host_full_logits.size() < size_t(rows_out) * size_t(kVocabSize)) {
+                host_full_logits.resize(size_t(rows_out) * size_t(kVocabSize), 0.0f);
+            }
             for (int tp = 0; tp < 3; ++tp) {
                 DSV41_HIP_CHECK(hipSetDevice(tp));
                 auto& c = ctx[tp];
@@ -2034,6 +2240,26 @@ struct Dsv41Runtime::Impl {
                 DSV41_HIP_CHECK(hipSetDevice(tp));
                 DSV41_HIP_CHECK(hipStreamSynchronize(ctx[tp].stream));
             }
+        }
+
+        if (use_rtc) {
+            rtc_active_in_chunk = false;
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (p150_shm.ptr->status != 0) {
+                throw std::runtime_error("p150_dsv41_worker returned error status " + std::to_string(p150_shm.ptr->status));
+            }
+            const uint64_t p150_ns_after = p150_shm.ptr->total_device_ns.load(std::memory_order_acquire);
+            if (p150_ns_after >= p150_ns_before) {
+                accum_p150_dev_ms += double(p150_ns_after - p150_ns_before) * 1e-6;
+            }
+            const double att_gpu_ms   = double(h_stage_rtc->att_ticks) * inv_rtc_ticks_per_ms;
+            const double moe_gpu_ms   = double(h_stage_rtc->mi50_moe_ticks) * inv_rtc_ticks_per_ms;
+            const double p150w_gpu_ms = double(h_stage_rtc->p150_wait_ticks) * inv_rtc_ticks_per_ms;
+            const double ar_gpu_ms    = double(h_stage_rtc->ar_ticks) * inv_rtc_ticks_per_ms;
+            accum_attn_ms      += std::max(0.0, att_gpu_ms - std::max(0.0, accum_hsi_ms - hsi_before));
+            accum_mi50_moe_ms  += moe_gpu_ms;
+            accum_p150_wait_ms += p150w_gpu_ms;
+            accum_allreduce_ms += ar_gpu_ms;
         }
     }
 
@@ -2069,33 +2295,41 @@ struct Dsv41Runtime::Impl {
     }
 
     // Alias-free two-kernel GPU commit of ONLY the verified root-to-leaf path `accepted_nodes[0..accepted_A-1]`
-    // across all 40 SWA rings, Global FP4/UE8M0 KV + Indexer K (slots 0..3), r=2 compressor state,
-    // DSpark target hidden rows [8..8+accepted_A-1], and CPU Engram `seq_cache_`!
+    // across all 40 SWA rings, Global FP4/UE8M0 KV + Indexer K (slots 0..3 + DDR4 cold spill), r=2 compressor state,
+    // DSpark target hidden rows [kMaxTreeNodes..kMaxTreeNodes+accepted_A-1], and CPU Engram `seq_cache_`!
     void commit_verified_tree_backbone_state(
         int start_pos,
         int accepted_A,
         const uint32_t* accepted_nodes,
         const int32_t* accepted_tokens)
     {
-        uint32_t acc_nodes_nibbles = 0u;
+        uint64_t acc_nodes_nibbles = 0ULL;
         for (int d = 0; d < accepted_A; ++d) {
-            acc_nodes_nibbles |= ((accepted_nodes[d] & 0xFu) << (4 * d));
+            acc_nodes_nibbles |= (uint64_t(accepted_nodes[d] & 0xFu) << (4 * d));
         }
         for (int tp = 0; tp < 3; ++tp) {
             DSV41_HIP_CHECK(hipSetDevice(tp));
             auto& c = ctx[tp];
             launch_commit_tree_win_kv_and_hidden(
                 c.d_win_kv_slab, c.d_last_win_kv_slab, c.d_target_mean_bf16,
-                start_pos, accepted_A, acc_nodes_nibbles, c.stream);
-            launch_commit_tree_global_kv_and_r2(
-                c.d_comp_kv_fp4[0], c.d_comp_kv_e4m3[0], c.d_index_k_fp4[0], c.d_index_k_ue8m0[0],
-                c.d_comp_kv_fp4[1], c.d_comp_kv_e4m3[1], c.d_index_k_fp4[1], c.d_index_k_ue8m0[1],
-                c.d_comp_kv_fp4[2], c.d_comp_kv_e4m3[2], c.d_index_k_fp4[2], c.d_index_k_ue8m0[2],
-                c.d_comp_kv_fp4[3], c.d_comp_kv_e4m3[3], c.d_index_k_fp4[3], c.d_index_k_ue8m0[3],
-                c.d_comp_kv_state[0], c.d_comp_score_state[0], c.d_comp_kv_last[0], c.d_comp_score_last[0],
-                c.d_comp_kv_state[1], c.d_comp_score_state[1], c.d_comp_kv_last[1], c.d_comp_score_last[1],
-                c.d_comp_kv_state[2], c.d_comp_score_state[2], c.d_comp_kv_last[2], c.d_comp_score_last[2],
-                start_pos, accepted_A, acc_nodes_nibbles, c.stream);
+                start_pos, accepted_A, kMaxTreeNodes, acc_nodes_nibbles, c.stream);
+            TreeGlobalKvCommitArgs args{};
+            for (int s = 0; s < 4; ++s) {
+                args.comp_fp4[s]      = c.d_comp_kv_fp4[s];
+                args.comp_e4m3[s]     = c.d_comp_kv_e4m3[s];
+                args.ext_comp_fp4[s]  = c.d_ext_comp_kv_fp4[s];
+                args.ext_comp_e4m3[s] = c.d_ext_comp_kv_e4m3[s];
+                args.idx_fp4[s]       = c.d_index_k_fp4[s];
+                args.idx_ue8[s]       = c.d_index_k_ue8m0[s];
+                args.hot_comp_cap[s]  = c.hot_comp_cap[s];
+            }
+            for (int s = 0; s < 3; ++s) {
+                args.kv_state[s] = c.d_comp_kv_state[s];
+                args.sc_state[s] = c.d_comp_score_state[s];
+                args.kv_last[s]  = c.d_comp_kv_last[s];
+                args.sc_last[s]  = c.d_comp_score_last[s];
+            }
+            launch_commit_tree_global_kv_and_r2(args, start_pos, accepted_A, acc_nodes_nibbles, c.stream);
         }
         engram_cpu.commit_accepted_tokens(accepted_tokens, accepted_A, start_pos);
         for (int tp = 0; tp < 3; ++tp) {
@@ -2545,6 +2779,7 @@ struct Dsv41Runtime::Impl {
         auto run_span = [&](int span_begin, int span_end, bool check_done) {
             reset_kv();
             int rel_pos = 0;
+            int next_log_pos = span_begin + 16384;
             for (int gpos = span_begin; gpos + 16 <= span_end; ) {
                 if (check_done && rarebal_collector->targets_satisfied()) break;
                 const int chunk_m = std::min(256, ((span_end - gpos) / 2) * 2);
@@ -2554,19 +2789,32 @@ struct Dsv41Runtime::Impl {
                 rarebal_collector->set_batch_tokens(prompt_ids.data() + gpos, chunk_m);
                 forward_backbone_chunk(prompt_ids.data() + gpos, rel_pos, chunk_m, false, 0, true, true, 0, false);
 
-                int prev_seeded = 0;
-                for (int off = 4; off + 5 < chunk_m; off += 5) {
-                    const int seed_n = (off + 1) - prev_seeded;
-                    update_mtp_window_from_target_hidden(rel_pos + prev_seeded, seed_n, prev_seeded);
-                    prev_seeded = off + 1;
-                    rarebal_collector->set_batch_tokens(prompt_ids.data() + gpos + off + 1, 5);
-                    run_mtp_blocks_capture_only(prompt_ids[size_t(gpos + off)], rel_pos + off);
-                }
-                if (prev_seeded < chunk_m) {
-                    update_mtp_window_from_target_hidden(rel_pos + prev_seeded, chunk_m - prev_seeded, prev_seeded);
+                if (rarebal_collector->pass0_only || (rarebal_collector->block_need_mask & (7ULL << 40)) != 0ULL) {
+                    int prev_seeded = 0;
+                    for (int off = 4; off + 5 < chunk_m; off += 5) {
+                        const int seed_n = (off + 1) - prev_seeded;
+                        update_mtp_window_from_target_hidden(rel_pos + prev_seeded, seed_n, prev_seeded);
+                        prev_seeded = off + 1;
+                        rarebal_collector->set_batch_tokens(prompt_ids.data() + gpos + off + 1, 5);
+                        run_mtp_blocks_capture_only(prompt_ids[size_t(gpos + off)], rel_pos + off);
+                    }
+                    if (prev_seeded < chunk_m) {
+                        update_mtp_window_from_target_hidden(rel_pos + prev_seeded, chunk_m - prev_seeded, prev_seeded);
+                    }
                 }
                 rel_pos += chunk_m;
                 gpos += chunk_m;
+                if (check_done && gpos >= next_log_pos) {
+                    int m_ok = 0, p_ok = 0, mtp_ok = 0;
+                    (void)rarebal_collector->targets_satisfied(&m_ok, &p_ok, &mtp_ok);
+                    if (mtp_ok >= 56) {
+                        rarebal_collector->block_need_mask &= ~(7ULL << 40);
+                    }
+                    std::printf("[RAREBAL_CAL] Capture %d / %d toks | ready(>=11776): main=%d (p150_pinned=%d/%zu) mtp=%d (total=%d)\n",
+                                gpos, span_end, m_ok, p_ok, rarebal_collector->pinned_p150_pairs.size(), mtp_ok, m_ok + mtp_ok);
+                    std::fflush(stdout);
+                    next_log_pos = gpos + 16384;
+                }
                 if (on_progress) {
                     Dsv41ProgressUpdate upd{};
                     upd.phase = Dsv41ProgressPhase::PrefillChunk;
@@ -2579,7 +2827,12 @@ struct Dsv41Runtime::Impl {
         if (!rarebal_collector->candidates_locked) {
             rarebal_collector->active = true;
             rarebal_collector->pass0_only = true;
-            if (P >= 8192) {
+            if (P >= 32768) {
+                for (int q = 0; q < 4; ++q) {
+                    const int s0 = (q * P) / 4;
+                    run_span(s0, std::min(P, s0 + 2048), false);
+                }
+            } else if (P >= 8192) {
                 run_span(P / 4, P / 4 + 2048, false);
                 run_span((3 * P) / 4 - 2048, (3 * P) / 4, false);
             } else {
@@ -2599,7 +2852,7 @@ struct Dsv41Runtime::Impl {
     }
 
     // Run 3-stage DSpark draft blocks (mtp_0..2) from `anchor_token` at `cur_pos` (zero staging, zero MoE host sync!),
-    // with confidence-gated GPU-resident deterministic M=8 width-[3,2,1,1] causal-tree expansion when p_top1 < 0.72!
+    // with confidence-gated GPU-resident deterministic M=8 or M=16 causal-tree expansion!
     int forward_dspark_draft(
         int32_t anchor_token,
         int cur_pos,
@@ -2608,12 +2861,12 @@ struct Dsv41Runtime::Impl {
         float rep_penalty,
         std::mt19937_64& rng,
         std::array<int32_t, kDSparkBlockSize>& out_drafts,
-        bool allow_tree8 = false,
+        int target_tree_nodes = 0,
         int rem_budget = 0,
-        bool* out_used_tree8 = nullptr,
-        std::array<int32_t, kTree8NumNodes>* out_tree_tokens = nullptr)
+        int* out_used_tree_nodes = nullptr,
+        std::array<int32_t, kMaxTreeNodes>* out_tree_tokens = nullptr)
     {
-        if (out_used_tree8) *out_used_tree8 = false;
+        if (out_used_tree_nodes) *out_used_tree_nodes = 0;
         constexpr int B = kDSparkBlockSize;  // 5
         int32_t draft_in[B] = {anchor_token, kDSparkNoiseId, kDSparkNoiseId, kDSparkNoiseId, kDSparkNoiseId};
 
@@ -2695,8 +2948,9 @@ struct Dsv41Runtime::Impl {
             forward_block_moe(bid, B, next_slot, h_slot);
         }
 
-        // Base MTP head logits [5, vocab_rows] on GPU (also saves raw hc_pre in tp=0 d_sub_bf16 for ConfidenceHead
-        // and preserves unmutated rows [1..2] at offset +8*vocab_rows for zero-alloc M=8 causal-tree top-B expansion!)
+        // Base MTP head logits [5, vocab_rows] on GPU (saves raw hc_pre in tp=0 d_sub_bf16 for ConfidenceHead
+        // and preserves unmutated rows [1..2] or [1..4] at offset +8*vocab_rows for M=8 / M=16 causal-tree top-B!)
+        const int min_tree_budget = (target_tree_nodes == 16) ? 6 : 4;
         for (int tp = 0; tp < 3; ++tp) {
             DSV41_HIP_CHECK(hipSetDevice(tp));
             auto& c = ctx[tp];
@@ -2705,10 +2959,11 @@ struct Dsv41Runtime::Impl {
                                        c.d_x_bf16, (tp == 0) ? c.d_sub_bf16 : nullptr, B, kNormEps, c.stream);
             launch_bf16_gemm(c.d_x_bf16, c.d_head_w, nullptr, c.d_logits_part_f32,
                              B, c.vocab_rows, kDim, true, c.stream);
-            if (allow_tree8 && rem_budget >= 4) {
+            if (target_tree_nodes >= 8 && rem_budget >= min_tree_budget) {
+                const size_t save_rows = (target_tree_nodes == 16) ? 4u : 2u;
                 DSV41_HIP_CHECK(hipMemcpyAsync(c.d_logits_part_f32 + 8u * size_t(c.vocab_rows),
                                                c.d_logits_part_f32 + 1u * size_t(c.vocab_rows),
-                                               2u * size_t(c.vocab_rows) * sizeof(float),
+                                               save_rows * size_t(c.vocab_rows) * sizeof(float),
                                                hipMemcpyDeviceToDevice, c.stream));
             }
         }
@@ -2784,15 +3039,96 @@ struct Dsv41Runtime::Impl {
             const float p_root_top1 = (ctrl->out_root_top1_prob >= 0.0f)
                 ? ctrl->out_root_top1_prob
                 : (1.0f / (1.0f + std::exp(-ctrl->out_conf_logits[0])));
-            if (allow_tree8 && out_used_tree8 && out_tree_tokens &&
-                rem_budget >= 4 &&
-                p_root_top1 < kTree8Top1ConfThresh &&
+            const float tree_conf_thresh = (target_tree_nodes == 16) ? 0.85f : kTree8Top1ConfThresh;
+            if (target_tree_nodes >= 8 && out_used_tree_nodes && out_tree_tokens &&
+                rem_budget >= min_tree_budget &&
+                p_root_top1 < tree_conf_thresh &&
                 ctrl->out_drafts[0] != Dsv41SpecialTokens::kEos)
             {
-                // High-entropy confidence gate fired (p_root_top1 < 0.72): extract GPU-resident deterministic
-                // width-[3,2,1,1] M=8 causal tree across all 3 MI50 ranks with 1 single stream sync (32 B D2H)!
                 ctrl->tree_tokens[0] = anchor_token;
                 std::atomic_thread_fence(std::memory_order_release);
+                if (target_tree_nodes == 16) {
+                    // Balanced M = 16 depth-5 causal tree: kTree16Parents = {-1, 0, 0, 0, 0, 1, 1, 2, 2, 3, 4, 5, 6, 7, 11, 14}
+                    for (int tp = 0; tp < 3; ++tp) {
+                        DSV41_HIP_CHECK(hipSetDevice(tp));
+                        auto& c = ctx[tp];
+                        const auto& m2 = c.blocks[kNumLayers + 2];
+                        const size_t vr = size_t(c.vocab_rows);
+
+                        // Stage 0: root top-4 {t1, t2, t3, t4}
+                        launch_dspark_tree_topk_tp3(
+                            ctrl, c.d_logits_part_f32, nullptr,
+                            dseq, 0, 1, 4, 0u, 0, tp, c.vocab_offset, c.vocab_rows, c.stream);
+
+                        // Markov Batch 1 (M=4) for {t1, t2, t3, t4} -> Stages 1..4 (depth 2: {t5..t10})
+                        uint16_t* emb_b1 = c.d_markov_sum_bf16 + 8u * kMarkovRank;
+                        launch_dspark_prepare_tree_markov_emb(
+                            ctrl, h_markov_embed_mapped, emb_b1, dseq, 1u << 0, 0x4321u, 4, c.stream);
+                        launch_bf16_gemm(emb_b1, m2.d_markov_head_w,
+                                         nullptr, c.d_markov_logits_f32,
+                                         4, c.vocab_rows, kMarkovRank, true, c.stream);
+                        launch_dspark_tree_topk_tp3(
+                            ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32 + 0u * vr,
+                            dseq, 1, 5, 2, 0x1u, 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                        launch_dspark_tree_topk_tp3(
+                            ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32 + 1u * vr,
+                            dseq, 2, 7, 2, 0x2u, 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                        launch_dspark_tree_topk_tp3(
+                            ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32 + 2u * vr,
+                            dseq, 3, 9, 1, 0x3u, 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                        launch_dspark_tree_topk_tp3(
+                            ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32 + 3u * vr,
+                            dseq, 4, 10, 1, 0x4u, 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+
+                        // Markov Batch 2 (M=3) for {t5, t6, t7} -> Stages 5..7 (depth 3: {t11, t12, t13})
+                        uint16_t* emb_b2 = c.d_markov_sum_bf16 + 12u * kMarkovRank;
+                        launch_dspark_prepare_tree_markov_emb(
+                            ctrl, h_markov_embed_mapped, emb_b2, dseq, (1u << 1) | (1u << 2), 0x765u, 3, c.stream);
+                        launch_bf16_gemm(emb_b2, m2.d_markov_head_w,
+                                         nullptr, c.d_markov_logits_f32 + 4u * vr,
+                                         3, c.vocab_rows, kMarkovRank, true, c.stream);
+                        launch_dspark_tree_topk_tp3(
+                            ctrl, c.d_logits_part_f32 + 9u * vr, c.d_markov_logits_f32 + 4u * vr,
+                            dseq, 5, 11, 1, 0x51u, 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                        launch_dspark_tree_topk_tp3(
+                            ctrl, c.d_logits_part_f32 + 9u * vr, c.d_markov_logits_f32 + 5u * vr,
+                            dseq, 6, 12, 1, 0x61u, 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                        launch_dspark_tree_topk_tp3(
+                            ctrl, c.d_logits_part_f32 + 9u * vr, c.d_markov_logits_f32 + 6u * vr,
+                            dseq, 7, 13, 1, 0x72u, 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
+
+                        // Markov Batch 3 (M=1) for {t11} -> Stage 8 (depth 4: {t14})
+                        uint16_t* emb_b3 = c.d_markov_sum_bf16 + 15u * kMarkovRank;
+                        launch_dspark_prepare_tree_markov_emb(
+                            ctrl, h_markov_embed_mapped, emb_b3, dseq, 1u << 5, 0xBu, 1, c.stream);
+                        launch_bf16_gemm(emb_b3, m2.d_markov_head_w,
+                                         nullptr, c.d_markov_logits_f32 + 7u * vr,
+                                         1, c.vocab_rows, kMarkovRank, true, c.stream);
+                        launch_dspark_tree_topk_tp3(
+                            ctrl, c.d_logits_part_f32 + 10u * vr, c.d_markov_logits_f32 + 7u * vr,
+                            dseq, 8, 14, 1, 0xB51u, 3, tp, c.vocab_offset, c.vocab_rows, c.stream);
+
+                        // Markov Batch 4 (M=1) for {t14} -> Stage 9 (depth 5: {t15})
+                        uint16_t* emb_b4 = c.d_markov_sum_bf16 + 16u * kMarkovRank;
+                        launch_dspark_prepare_tree_markov_emb(
+                            ctrl, h_markov_embed_mapped, emb_b4, dseq, 1u << 8, 0xEu, 1, c.stream);
+                        launch_bf16_gemm(emb_b4, m2.d_markov_head_w,
+                                         nullptr, c.d_markov_logits_f32 + 8u * vr,
+                                         1, c.vocab_rows, kMarkovRank, true, c.stream);
+                        launch_dspark_tree_topk_tp3(
+                            ctrl, c.d_logits_part_f32 + 11u * vr, c.d_markov_logits_f32 + 8u * vr,
+                            dseq, 9, 15, 1, 0xEB51u, 4, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                    }
+                    DSV41_HIP_CHECK(hipSetDevice(0));
+                    DSV41_HIP_CHECK(hipStreamSynchronize(ctx[0].stream));
+                    for (int m = 0; m < kMaxTreeNodes; ++m) {
+                        (*out_tree_tokens)[size_t(m)] = ctrl->tree_tokens[m];
+                    }
+                    *out_used_tree_nodes = 16;
+                    return kMaxTreeNodes - 1;
+                }
+
+                // Width-[3,2,1,1] M = 8 causal tree across all 3 MI50 ranks with 1 single stream sync!
                 for (int tp = 0; tp < 3; ++tp) {
                     DSV41_HIP_CHECK(hipSetDevice(tp));
                     auto& c = ctx[tp];
@@ -2802,39 +3138,39 @@ struct Dsv41Runtime::Impl {
                     // Stage 0: root top-3 {t1, t2, t3} from row 0 (already contains base_0 + markov_0 + rep_penalty)
                     launch_dspark_tree_topk_tp3(
                         ctrl, c.d_logits_part_f32, nullptr,
-                        dseq, 0, 1, 3, -1, -1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                        dseq, 0, 1, 3, 0u, 0, tp, c.vocab_offset, c.vocab_rows, c.stream);
 
                     // Markov GEMM (M=2) for t1 and t2 -> Stages 1 & 2 ({t4, t5} under t1, {t6} under t2)
                     uint16_t* emb_t12 = c.d_markov_sum_bf16 + 8u * kMarkovRank;
                     launch_dspark_prepare_tree_markov_emb(
-                        ctrl, h_markov_embed_mapped, emb_t12, dseq, 0, 2, c.stream);
+                        ctrl, h_markov_embed_mapped, emb_t12, dseq, 1u << 0, 0x21u, 2, c.stream);
                     launch_bf16_gemm(emb_t12, m2.d_markov_head_w,
                                      nullptr, c.d_markov_logits_f32,
                                      2, c.vocab_rows, kMarkovRank, true, c.stream);
                     launch_dspark_tree_topk_tp3(
                         ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32,
-                        dseq, 1, 4, 2, 1, -1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                        dseq, 1, 4, 2, 0x1u, 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
                     launch_dspark_tree_topk_tp3(
                         ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32 + vr,
-                        dseq, 2, 6, 1, 2, -1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                        dseq, 2, 6, 1, 0x2u, 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
 
                     // Markov GEMM (M=1) for t4 -> Stage 3 ({t7} under t4)
                     uint16_t* emb_t4 = c.d_markov_sum_bf16 + 10u * kMarkovRank;
                     launch_dspark_prepare_tree_markov_emb(
-                        ctrl, h_markov_embed_mapped, emb_t4, dseq, 1, 1, c.stream);
+                        ctrl, h_markov_embed_mapped, emb_t4, dseq, 1u << 1, 0x4u, 1, c.stream);
                     launch_bf16_gemm(emb_t4, m2.d_markov_head_w,
                                      nullptr, c.d_markov_logits_f32 + 2u * vr,
                                      1, c.vocab_rows, kMarkovRank, true, c.stream);
                     launch_dspark_tree_topk_tp3(
                         ctrl, c.d_logits_part_f32 + 9u * vr, c.d_markov_logits_f32 + 2u * vr,
-                        dseq, 3, 7, 1, 1, 4, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                        dseq, 3, 7, 1, 0x41u, 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
                 }
                 DSV41_HIP_CHECK(hipSetDevice(0));
                 DSV41_HIP_CHECK(hipStreamSynchronize(ctx[0].stream));
                 for (int m = 0; m < kTree8NumNodes; ++m) {
                     (*out_tree_tokens)[size_t(m)] = ctrl->tree_tokens[m];
                 }
-                *out_used_tree8 = true;
+                *out_used_tree_nodes = 8;
                 return kTree8NumNodes - 1;  // 7 drafted tree candidates (M = 8 verify nodes)
             }
 
@@ -3061,12 +3397,21 @@ struct Dsv41Runtime::Impl {
                 for (int s = 0; s < 4; ++s) {
                     const size_t n_slots = (s < 3) ? 64u : 128u;
                     const size_t sb = size_t(blk) * n_slots;
-                    DSV41_HIP_CHECK(hipMemcpyAsync(c0.h_radix_stage + off, c0.d_comp_kv_fp4[s] + sb * 256u,
-                                                   n_slots * 256u, hipMemcpyDeviceToHost, c0.stream));
-                    off += n_slots * 256u;
-                    DSV41_HIP_CHECK(hipMemcpyAsync(c0.h_radix_stage + off, c0.d_comp_kv_e4m3[s] + sb * 32u,
-                                                   n_slots * 32u, hipMemcpyDeviceToHost, c0.stream));
-                    off += n_slots * 32u;
+                    const size_t hot_cap = size_t(c0.hot_comp_cap[s]);
+                    if (sb < hot_cap) {
+                        DSV41_HIP_CHECK(hipMemcpyAsync(c0.h_radix_stage + off, c0.d_comp_kv_fp4[s] + sb * 256u,
+                                                       n_slots * 256u, hipMemcpyDeviceToHost, c0.stream));
+                        off += n_slots * 256u;
+                        DSV41_HIP_CHECK(hipMemcpyAsync(c0.h_radix_stage + off, c0.d_comp_kv_e4m3[s] + sb * 32u,
+                                                       n_slots * 32u, hipMemcpyDeviceToHost, c0.stream));
+                        off += n_slots * 32u;
+                    } else {
+                        const size_t ext_sb = sb - hot_cap;
+                        std::memcpy(c0.h_radix_stage + off, c0.h_ext_comp_kv_fp4[s] + ext_sb * 256u, n_slots * 256u);
+                        off += n_slots * 256u;
+                        std::memcpy(c0.h_radix_stage + off, c0.h_ext_comp_kv_e4m3[s] + ext_sb * 32u, n_slots * 32u);
+                        off += n_slots * 32u;
+                    }
                     DSV41_HIP_CHECK(hipMemcpyAsync(c0.h_radix_stage + off, c0.d_index_k_fp4[s] + sb * 64u,
                                                    n_slots * 64u, hipMemcpyDeviceToHost, c0.stream));
                     off += n_slots * 64u;
@@ -3169,7 +3514,7 @@ struct Dsv41Runtime::Impl {
 
             const int b0 = cur;
             int nb = 0;
-            while (cur < num_blocks && nb < 64 && !is_clean(cur)) {
+            while (cur < num_blocks && nb < 64 && !is_clean(cur) && ((cur < 4096) == (b0 < 4096))) {
                 ++cur;
                 ++nb;
             }
@@ -3212,12 +3557,21 @@ struct Dsv41Runtime::Impl {
                 for (int s = 0; s < 4; ++s) {
                     const size_t n_slots = (s < 3) ? 64u : 128u;
                     const size_t sb = size_t(b0) * n_slots;
-                    DSV41_HIP_CHECK(hipMemcpyAsync(c.d_comp_kv_fp4[s] + sb * 256u, stage + slice_offs[q],
-                                                   slice_lens[q], hipMemcpyHostToDevice, c.stream));
-                    ++q;
-                    DSV41_HIP_CHECK(hipMemcpyAsync(c.d_comp_kv_e4m3[s] + sb * 32u, stage + slice_offs[q],
-                                                   slice_lens[q], hipMemcpyHostToDevice, c.stream));
-                    ++q;
+                    const size_t hot_cap = size_t(c.hot_comp_cap[s]);
+                    if (sb < hot_cap) {
+                        DSV41_HIP_CHECK(hipMemcpyAsync(c.d_comp_kv_fp4[s] + sb * 256u, stage + slice_offs[q],
+                                                       slice_lens[q], hipMemcpyHostToDevice, c.stream));
+                        ++q;
+                        DSV41_HIP_CHECK(hipMemcpyAsync(c.d_comp_kv_e4m3[s] + sb * 32u, stage + slice_offs[q],
+                                                       slice_lens[q], hipMemcpyHostToDevice, c.stream));
+                        ++q;
+                    } else {
+                        const size_t ext_sb = sb - hot_cap;
+                        std::memcpy(c.h_ext_comp_kv_fp4[s] + ext_sb * 256u, stage + slice_offs[q], slice_lens[q]);
+                        ++q;
+                        std::memcpy(c.h_ext_comp_kv_e4m3[s] + ext_sb * 32u, stage + slice_offs[q], slice_lens[q]);
+                        ++q;
+                    }
                     DSV41_HIP_CHECK(hipMemcpyAsync(c.d_index_k_fp4[s] + sb * 64u, stage + slice_offs[q],
                                                    slice_lens[q], hipMemcpyHostToDevice, c.stream));
                     ++q;
@@ -3263,6 +3617,26 @@ void Dsv41Runtime::set_sync_timers(bool enable) {
     std::lock_guard<std::mutex> lk(gen_mtx_);
     if (impl_) {
         impl_->sync_timers = enable;
+    }
+}
+
+void Dsv41Runtime::set_dual_stream_overlap(bool enable) {
+    std::lock_guard<std::mutex> lk(gen_mtx_);
+    if (impl_) {
+        impl_->dual_stream_overlap = enable;
+    }
+}
+
+void Dsv41Runtime::set_dspark_tree_width(int width_mode) {
+    std::lock_guard<std::mutex> lk(gen_mtx_);
+    if (impl_) {
+        if (width_mode == 8) {
+            impl_->tree_width_mode = Dsv41TreeWidthMode::Fixed8;
+        } else if (width_mode == 16) {
+            impl_->tree_width_mode = Dsv41TreeWidthMode::Fixed16;
+        } else {
+            impl_->tree_width_mode = Dsv41TreeWidthMode::Auto;
+        }
     }
 }
 
@@ -3337,6 +3711,17 @@ void Dsv41Runtime::init(
     impl_->h_ar_ring = static_cast<HostRingAllReduceSlot*>(ar_ring_ptr);
     impl_->host_ar_seq = 0u;
 
+    void* stage_rtc_ptr = nullptr;
+    DSV41_HIP_CHECK(hipHostMalloc(&stage_rtc_ptr, sizeof(Dsv41GpuStageRtc),
+                                  hipHostMallocMapped | hipHostMallocCoherent));
+    std::memset(stage_rtc_ptr, 0, sizeof(Dsv41GpuStageRtc));
+    impl_->h_stage_rtc = static_cast<Dsv41GpuStageRtc*>(stage_rtc_ptr);
+    {
+        void* d_rtc = nullptr;
+        DSV41_HIP_CHECK(hipHostGetDevicePointer(&d_rtc, stage_rtc_ptr, 0));
+        impl_->d_stage_rtc = static_cast<Dsv41GpuStageRtc*>(d_rtc);
+    }
+
     void* markov_emb_ptr = nullptr;
     const size_t markov_emb_bytes = size_t(kVocabSize) * size_t(kMarkovRank) * sizeof(uint16_t);
     DSV41_HIP_CHECK(hipHostMalloc(&markov_emb_ptr, markov_emb_bytes,
@@ -3351,7 +3736,8 @@ void Dsv41Runtime::init(
     impl_->h_dspark_ctrl = static_cast<DsparkGpuSampleSlot*>(dspark_ctrl_ptr);
 
     impl_->gpu_slot_radix_keys.assign(size_t(max_seq_len / kRadixBlockTokens + 16), RadixKey128{});
-    impl_->host_tree_probs_f64.assign(size_t(kTree8NumNodes) * size_t(kVocabSize), 0.0);
+    impl_->host_full_logits.assign(size_t(kMaxTreeNodes) * size_t(kVocabSize), 0.0f);
+    impl_->host_tree_probs_f64.assign(size_t(kMaxTreeNodes) * size_t(kVocabSize), 0.0);
     for (int b = 0; b < kDSparkBlockSize; ++b) {
         impl_->draft_q_probs[b].assign(kVocabSize, 0.0f);
     }
@@ -3396,6 +3782,32 @@ void Dsv41Runtime::init(
     for (int i = 0; i < 4; ++i) {
         if (load_err[i]) std::rethrow_exception(load_err[i]);
     }
+
+    // Calibrate gfx906 s_memrealtime reference clock rate on tp=0 (zero-stall stage telemetry)
+    {
+        DSV41_HIP_CHECK(hipSetDevice(0));
+        auto& c0 = impl_->ctx[0];
+        *c0.h_dpm_flag = 1u;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        launch_keep_dpm_warm(c0.d_dpm_flag, c0.d_dpm_uc_scratch, 16383u, c0.keep_warm_stream);
+        launch_stamp_gpu_rtc(impl_->d_stage_rtc, c0.stream);
+        DSV41_HIP_CHECK(hipStreamSynchronize(c0.stream));
+        const auto tp_cal0 = std::chrono::steady_clock::now();
+        const uint64_t rtc0 = impl_->h_stage_rtc->last_stamp;
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        launch_stamp_gpu_rtc(impl_->d_stage_rtc, c0.stream);
+        DSV41_HIP_CHECK(hipStreamSynchronize(c0.stream));
+        const auto tp_cal1 = std::chrono::steady_clock::now();
+        const uint64_t rtc1 = impl_->h_stage_rtc->last_stamp;
+        *c0.h_dpm_flag = 0u;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        DSV41_HIP_CHECK(hipStreamSynchronize(c0.keep_warm_stream));
+        const double cal_ms = std::chrono::duration<double, std::milli>(tp_cal1 - tp_cal0).count();
+        if (cal_ms > 50.0 && rtc1 > rtc0 + 10000ULL) {
+            impl_->inv_rtc_ticks_per_ms = cal_ms / double(rtc1 - rtc0);
+        }
+    }
+
     if (impl_->rarebal_overlay_mmap) {
         std::printf("[DSV41_RT] Patched %d MI50 + MTP hot experts (x3 TP3 shards, 0 B extra HBM2) from %s\n",
                     impl_->rarebal_mi50_patched_slots.load(std::memory_order_relaxed),
@@ -3449,11 +3861,20 @@ void Dsv41Runtime::init(
             DSV41_HIP_CHECK(hipSetDevice(tp));
             void* dp = nullptr;
             DSV41_HIP_CHECK(hipHostGetDevicePointer(&dp, impl_->p150_shm.ptr, 0));
-            impl_->d_p150_shm_y_out_bf16[tp] = static_cast<decltype(impl_->p150_shm.ptr)>(dp)->y_out_bf16;
+            auto* d_shm = static_cast<Dsv41P150ShmChannel*>(dp);
+            if (tp == 0) {
+                impl_->d_p150_shm_ptr = d_shm;
+            }
+            impl_->d_p150_shm_y_out_bf16[tp] = d_shm->y_out_bf16;
+            impl_->d_p150_resp_seq[tp] = reinterpret_cast<const uint32_t*>(&d_shm->resp_seq);
+            for (uint32_t rs = 0u; rs < DSV41_P150_FAST_RING_SLOTS; ++rs) {
+                impl_->d_p150_fast_y_out_bf16[tp][rs] = d_shm->fast_slots[rs].y_out_bf16;
+            }
         }
         DSV41_HIP_CHECK(hipSetDevice(0));
-        std::printf("[DSV41_RT] Pinned & mapped /dev/shm P150A mailbox (%zu KiB) across 3x MI50 (zero-SDMA ring enabled)!\n",
-                    sizeof(*impl_->p150_shm.ptr) / 1024u);
+        std::printf("[DSV41_RT] Pinned & mapped /dev/shm P150A mailbox (%zu KiB, %u fast slots, overlap=%d) across 3x MI50!\n",
+                    sizeof(*impl_->p150_shm.ptr) / 1024u, DSV41_P150_FAST_RING_SLOTS,
+                    impl_->dual_stream_overlap ? 1 : 0);
     } else {
         (void)hipGetLastError();
     }
@@ -3462,6 +3883,37 @@ void Dsv41Runtime::init(
     std::printf("[DSV41_RT] Heterogeneous 3x MI50 + 2x Blackhole P150A + Pre-Faulted 189 GiB Engram READY in %.2f s!\n", dt);
     std::fflush(stdout);
     ready_ = true;
+}
+
+bool Dsv41Runtime::capture_rarebal_corpus(const std::vector<int32_t>& corpus_ids) {
+    std::lock_guard<std::mutex> lk(gen_mtx_);
+    if (!ready_ || !impl_ || !impl_->rarebal_collector || corpus_ids.size() < 1024u) return false;
+
+    struct DpmWarmGuard {
+        Dsv41Runtime::Impl* impl;
+        explicit DpmWarmGuard(Dsv41Runtime::Impl* p) : impl(p) {
+            for (int tp = 0; tp < 3; ++tp) {
+                DSV41_HIP_CHECK(hipSetDevice(tp));
+                auto& c = impl->ctx[tp];
+                *c.h_dpm_flag = 1u;
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                launch_keep_dpm_warm(c.d_dpm_flag, c.d_dpm_uc_scratch, 16383u, c.keep_warm_stream);
+            }
+        }
+        ~DpmWarmGuard() {
+            for (int tp = 0; tp < 3; ++tp) {
+                *impl->ctx[tp].h_dpm_flag = 0u;
+            }
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            for (int tp = 0; tp < 3; ++tp) {
+                (void)hipSetDevice(tp);
+                (void)hipStreamSynchronize(impl->ctx[tp].keep_warm_stream);
+            }
+        }
+    } dpm_guard(impl_.get());
+
+    impl_->run_rarebal_capture_on_prompt(corpus_ids, nullptr);
+    return impl_->rarebal_collector->targets_satisfied();
 }
 
 std::vector<int32_t> Dsv41Runtime::generate(
@@ -3751,7 +4203,7 @@ std::vector<int32_t> Dsv41Runtime::generate(
     }
 
     const auto t_decode_start = std::chrono::steady_clock::now();
-    impl_->accum_p150_dev_ms = 0.0;
+    impl_->reset_stage_timers();
     Dsv41ThinkLoopGuard think_guard;
     bool pending_think_end_check = false;
     std::string pending_think_txt;
@@ -3917,14 +4369,15 @@ std::vector<int32_t> Dsv41Runtime::generate(
         return true;
     };
 
-    // 3. Decode Loop: 3-Stage DSpark Speculative Decoding (M <= 6 Chain / M = 8 Causal Tree) or Standard M=1 Fallback
+    // 3. Decode Loop: 3-Stage DSpark Speculative Decoding (M <= 6 Chain / Entropy-Adaptive M = 8 <-> M = 16 Causal Tree)
     std::uniform_real_distribution<float> uni01(0.0f, 1.0f);
     std::uniform_real_distribution<double> uni01_f64(0.0, 1.0);
     std::vector<float> residual_probs(kVocabSize);
+    Dsv41AdaptiveTreeWidthController tree_ctrl(impl_->tree_width_mode);
 
     while (keep_going && static_cast<int>(generated.size()) < params.max_new_tokens) {
         const int cur_pos = static_cast<int>(impl_->cached_tokens.size());
-        if (cur_pos + 8 >= impl_->max_seq_len) break;
+        if (cur_pos + kMaxTreeNodes + 2 >= impl_->max_seq_len) break;
 
         const int rem_budget = params.max_new_tokens - static_cast<int>(generated.size());
         const bool run_spec = params.enable_dspark && impl_->mtp_window_seeded && (rem_budget >= 2);
@@ -3958,61 +4411,63 @@ std::vector<int32_t> Dsv41Runtime::generate(
             continue;
         }
 
-        // A. Draft B (1..5) linear chain OR high-entropy M=8 width-[3,2,1,1] causal tree using 3-stage DSpark on 3x MI50!
-        bool used_tree8 = false;
-        std::array<int32_t, kTree8NumNodes> tree_verify_tokens{};
+        // A. Draft B (1..5) linear chain OR high-entropy M = 8 / M = 16 causal tree using 3-stage DSpark on 3x MI50!
+        const int desired_tree = tree_ctrl.select_width(think_guard.in_think());
+        const int target_tree_nodes = (rem_budget < 4) ? 0 : ((desired_tree == 16 && rem_budget >= 6) ? 16 : 8);
+        int used_tree_nodes = 0;
+        std::array<int32_t, kMaxTreeNodes> tree_verify_tokens{};
         const auto td0 = std::chrono::steady_clock::now();
         std::array<int32_t, kDSparkBlockSize> drafts{};
         int B = impl_->forward_dspark_draft(
             cur_anchor, cur_pos, params.temperature, params.top_p, params.repetition_penalty, rng, drafts,
-            /*allow_tree8=*/true, rem_budget, &used_tree8, &tree_verify_tokens);
+            target_tree_nodes, rem_budget, &used_tree_nodes, &tree_verify_tokens);
         const auto td1 = std::chrono::steady_clock::now();
         out_stats.dec_dspark_ms += std::chrono::duration<double, std::milli>(td1 - td0).count();
 
-        if (used_tree8) {
+        if (used_tree_nodes == 8 || used_tree_nodes == 16) {
+            const bool is_t16 = (used_tree_nodes == 16);
+            const int max_tree_depth = is_t16 ? 5 : 3;
             out_stats.dspark_steps += 1;
             out_stats.dspark_tree_steps += 1;
-            out_stats.dspark_drafted += 3;  // max root-to-leaf sequential draft depth = 3 (L in [1, 4])
+            if (is_t16) out_stats.dspark_tree16_steps += 1;
+            out_stats.dspark_drafted += uint64_t(max_tree_depth);
 
-            // B_tree. Verify all M=8 causal-tree nodes in ONE backbone pass across 3x MI50 + 2x P150A!
+            const int32_t*  tree_parents = is_t16 ? kTree16Parents.data() : kTree8Parents.data();
+            const uint32_t* tree_depths  = is_t16 ? kTree16Depths.data()  : kTree8Depths.data();
+            const TreeAncMask256 anc_mask = is_t16 ? kTree16AncMask256 : kTree8AncMask256;
+            const uint64_t depth_nib = is_t16 ? kTree16DepthNibbles64  : kTree8DepthNibbles64;
+            const uint64_t par_nib   = is_t16 ? kTree16ParentNibbles64 : kTree8ParentNibbles64;
+
+            // B_tree. Verify all M = 8 or M = 16 causal-tree nodes in ONE backbone pass across 3x MI50 + 2x P150A!
             const auto tb0 = std::chrono::steady_clock::now();
             impl_->forward_backbone_chunk(
                 tree_verify_tokens.data(),
                 cur_pos,
-                kTree8NumNodes,
+                used_tree_nodes,
                 false,
-                kTree8NumNodes,
+                used_tree_nodes,
                 false,  // commit_window_immediately = false -> deferred alias-free tree commit!
-                true,   // capture_dspark_hidden = true -> rows [0..7] captured in d_target_mean_bf16!
+                true,   // capture_dspark_hidden = true -> rows [0..used_tree_nodes-1] captured in d_target_mean_bf16!
                 0,
                 false,
-                kTree8AncMask64,
-                kTree8DepthNibbles,
-                kTree8ParentNibbles,
-                kTree8Parents.data(),
-                kTree8Depths.data()
+                anc_mask,
+                depth_nib,
+                par_nib,
+                tree_parents,
+                tree_depths
             );
             const auto tb1 = std::chrono::steady_clock::now();
             out_stats.dec_backbone_ms += std::chrono::duration<double, std::milli>(tb1 - tb0).count();
 
-            // C_tree. Lossless Kolmogorov Dirac causal-tree verification (TV <= 2e-16, strictly ancestor-only rep penalty!)
-            Dsv41SpecTree8 topo{};
-            (void)build_spec_tree_topology(
-                uint32_t(kTree8NumNodes),
-                uint32_t(cur_pos),
-                kTree8Parents.data(),
-                tree_verify_tokens.data(),
-                &topo
-            );
-
-            for (int u = 0; u < kTree8NumNodes; ++u) {
-                int32_t anc_toks[4]{};
+            // C_tree. Lossless Kolmogorov Dirac causal-tree verification (TV < 1e-15, strictly ancestor-only rep penalty!)
+            for (int u = 0; u < used_tree_nodes; ++u) {
+                int32_t anc_toks[6]{};
                 int p = u;
                 while (p >= 0) {
-                    anc_toks[kTree8Depths[size_t(p)]] = tree_verify_tokens[size_t(p)];
-                    p = kTree8Parents[size_t(p)];
+                    anc_toks[tree_depths[size_t(p)]] = tree_verify_tokens[size_t(p)];
+                    p = tree_parents[size_t(p)];
                 }
-                const size_t anc_len = size_t(kTree8Depths[size_t(u)] + 1u);
+                const size_t anc_len = size_t(tree_depths[size_t(u)] + 1u);
                 float* u_logits = impl_->host_full_logits.data() + size_t(u) * size_t(kVocabSize);
                 Impl::apply_rep_penalty_span(u_logits, impl_->cached_tokens, anc_toks, anc_len, params.repetition_penalty);
                 Impl::build_probs_f64_fast(
@@ -4023,28 +4478,50 @@ std::vector<int32_t> Dsv41Runtime::generate(
                 );
             }
 
-            std::array<double, kTree8NumNodes> u_draws{};
-            for (int d = 0; d < 4; ++d) {
+            std::array<double, kMaxTreeNodes> u_draws{};
+            for (int d = 0; d <= max_tree_depth; ++d) {
                 u_draws[size_t(d)] = (params.temperature > 1e-5f) ? uni01_f64(rng) : 0.0;
             }
-            const Dsv41TreeVerifyResult vr = verify_deterministic_tree_u01(
-                topo,
-                impl_->host_tree_probs_f64.data(),
-                size_t(kVocabSize),
-                u_draws.data()
-            );
+
+            uint32_t vr_num_emitted = 0u;
+            std::array<int32_t, kMaxTreeNodes> vr_emitted_tokens{};
+            std::array<uint32_t, kMaxTreeNodes> vr_accepted_nodes{};
+            if (is_t16) {
+                Dsv41SpecTree16 topo16{};
+                (void)build_spec_tree16_topology(
+                    uint32_t(kTree16NumNodes), uint32_t(cur_pos),
+                    kTree16Parents.data(), tree_verify_tokens.data(), &topo16);
+                const Dsv41Tree16VerifyResult vr16 = verify_deterministic_tree16_u01(
+                    topo16, impl_->host_tree_probs_f64.data(), size_t(kVocabSize), u_draws.data());
+                vr_num_emitted = vr16.num_emitted;
+                vr_emitted_tokens = vr16.emitted_tokens;
+                vr_accepted_nodes = vr16.accepted_nodes;
+            } else {
+                Dsv41SpecTree8 topo8{};
+                (void)build_spec_tree_topology(
+                    uint32_t(kTree8NumNodes), uint32_t(cur_pos),
+                    kTree8Parents.data(), tree_verify_tokens.data(), &topo8);
+                const Dsv41TreeVerifyResult vr8 = verify_deterministic_tree_u01(
+                    topo8, impl_->host_tree_probs_f64.data(), size_t(kVocabSize), u_draws.data());
+                vr_num_emitted = vr8.num_emitted;
+                for (size_t q = 0; q < vr8.emitted_tokens.size(); ++q) {
+                    vr_emitted_tokens[q] = vr8.emitted_tokens[q];
+                    vr_accepted_nodes[q] = vr8.accepted_nodes[q];
+                }
+            }
 
             int k_acc = 0;
             bool hit_stop = false;
             bool force_closed_in_burst = false;
             ThinkGuardDecision burst_guard_dec{};
-            const int n_draft_acc = std::max(0, int(vr.num_emitted) - 1);
+            const int n_draft_acc = std::max(0, int(vr_num_emitted) - 1);
 
             for (int d = 0; d < n_draft_acc; ++d) {
-                const int32_t d_tok = vr.emitted_tokens[size_t(d)];
+                const int32_t d_tok = vr_emitted_tokens[size_t(d)];
                 ++k_acc;
                 out_stats.dspark_accepted += 1;
                 out_stats.dspark_tree_accepted += 1;
+                if (is_t16) out_stats.dspark_tree16_accepted += 1;
                 generated.push_back(d_tok);
                 if (d_tok == Dsv41SpecialTokens::kEos || (on_token && !on_token(d_tok))) {
                     hit_stop = true;
@@ -4062,6 +4539,7 @@ std::vector<int32_t> Dsv41Runtime::generate(
                 if (!execute_force_close_think(burst_guard_dec)) {
                     break;
                 }
+                tree_ctrl.observe_step(1 + k_acc, think_guard.in_think());
                 continue;
             }
 
@@ -4069,14 +4547,14 @@ std::vector<int32_t> Dsv41Runtime::generate(
             const auto tc0 = std::chrono::steady_clock::now();
             out_stats.dec_sample_ms += std::chrono::duration<double, std::milli>(tc0 - tb1).count();
             const int accepted_A = 1 + k_acc;
-            int32_t accepted_prefix_toks[4]{};
+            int32_t accepted_prefix_toks[6]{};
             accepted_prefix_toks[0] = cur_anchor;
             for (int d = 0; d < k_acc; ++d) {
-                accepted_prefix_toks[1 + d] = vr.emitted_tokens[size_t(d)];
+                accepted_prefix_toks[1 + d] = vr_emitted_tokens[size_t(d)];
             }
             impl_->commit_verified_tree_backbone_state(
-                cur_pos, accepted_A, vr.accepted_nodes.data(), accepted_prefix_toks);
-            impl_->update_mtp_window_from_target_hidden(cur_pos, accepted_A, 8);
+                cur_pos, accepted_A, vr_accepted_nodes.data(), accepted_prefix_toks);
+            impl_->update_mtp_window_from_target_hidden(cur_pos, accepted_A, kMaxTreeNodes);
             const double commit_dt = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tc0).count();
             impl_->sub_commit_ms += commit_dt;
             out_stats.dec_backbone_ms += commit_dt;
@@ -4089,7 +4567,7 @@ std::vector<int32_t> Dsv41Runtime::generate(
                 break;
             }
 
-            const int32_t bonus_or_resampled = vr.emitted_tokens[size_t(vr.num_emitted - 1u)];
+            const int32_t bonus_or_resampled = vr_emitted_tokens[size_t(vr_num_emitted - 1u)];
             if (bonus_or_resampled >= 0 && static_cast<int>(generated.size()) < params.max_new_tokens) {
                 generated.push_back(bonus_or_resampled);
                 out_stats.completion_tokens = static_cast<int>(generated.size());
@@ -4103,6 +4581,7 @@ std::vector<int32_t> Dsv41Runtime::generate(
                         break;
                     }
                 }
+                tree_ctrl.observe_step(accepted_A, think_guard.in_think());
             } else {
                 out_stats.completion_tokens = static_cast<int>(generated.size());
                 break;
@@ -4246,6 +4725,7 @@ std::vector<int32_t> Dsv41Runtime::generate(
             if (!execute_force_close_think(burst_guard_dec)) {
                 break;
             }
+            tree_ctrl.observe_step(1 + k_acc, think_guard.in_think());
             continue;
         }
 
@@ -4288,6 +4768,7 @@ std::vector<int32_t> Dsv41Runtime::generate(
                     break;
                 }
             }
+            tree_ctrl.observe_step(accepted_A, think_guard.in_think());
         } else {
             out_stats.completion_tokens = static_cast<int>(generated.size());
             break;
@@ -4312,6 +4793,7 @@ std::vector<int32_t> Dsv41Runtime::generate(
     out_stats.t_p150_wait_ms = impl_->accum_p150_wait_ms;
     out_stats.t_allreduce_ms = impl_->accum_allreduce_ms;
     out_stats.t_engram_wait_ms = impl_->accum_engram_wait_ms;
+    out_stats.overlap_saved_ms = std::max(0.0, out_stats.dec_p150_dev_ms - out_stats.t_p150_wait_ms);
     if (impl_->sync_timers) {
         std::printf("[SUB_PROF] att[qkv=%.0fms sparse=%.0fms wo=%.0fms ar=%.0fms] | moe[sh_rtr=%.0fms hlut=%.0fms ar=%.0fms p150w=%.0fms] | commit=%.0fms\n",
                     impl_->sub_att_qkv_ms, impl_->sub_att_sparse_ms, impl_->sub_att_wo_ms, impl_->sub_att_ar_ms,

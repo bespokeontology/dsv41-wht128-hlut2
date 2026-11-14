@@ -69,6 +69,9 @@ struct JsonValue {
         static const std::string kEmpty;
         return (type == String) ? s_val : kEmpty;
     }
+    std::string as_str(const std::string& def) const {
+        return (type == String) ? s_val : def;
+    }
 
     bool has(const std::string& key) const {
         if (type != Object) return false;

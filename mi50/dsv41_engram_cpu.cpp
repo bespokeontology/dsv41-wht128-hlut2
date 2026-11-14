@@ -515,7 +515,7 @@ void Dsv41EngramEngine::compute_hashes_tree(
         seq_cache_.resize(size_t(start_pos + M + 4096), pad_compressed_id_);
     }
 
-    int32_t node_cid[16];
+    int32_t node_cid[32];
     for (int s = 0; s < M; ++s) {
         const int32_t tid = token_ids[s];
         node_cid[s] = (tid >= 0 && size_t(tid) < token_map_.size()) ? token_map_[size_t(tid)] : pad_compressed_id_;
@@ -524,12 +524,12 @@ void Dsv41EngramEngine::compute_hashes_tree(
     out_hashes.resize(size_t(M) * 2ULL * 24ULL);
 
     for (int s = 0; s < M; ++s) {
-        int32_t anc_cid[16];
-        for (int k = 0; k < 16; ++k) anc_cid[k] = pad_compressed_id_;
+        int32_t anc_cid[32];
+        for (int k = 0; k < 32; ++k) anc_cid[k] = pad_compressed_id_;
         int cur = s;
-        for (int guard = 0; cur >= 0 && guard < 16; ++guard) {
+        for (int guard = 0; cur >= 0 && guard < 32; ++guard) {
             const uint32_t cd = depths[cur];
-            if (cd < 16u) anc_cid[cd] = node_cid[cur];
+            if (cd < 32u) anc_cid[cd] = node_cid[cur];
             cur = parent_ids[cur];
         }
 
@@ -618,8 +618,8 @@ void Dsv41EngramEngine::gather_dequant_tp3(
     const uint8_t* __restrict__ s_base = tbl.scale_ue8m0;
     const int total_jobs = seqlen * 24;
 
-    // Small-M OpenMP Gate + Hardware MSHR Prefetch Burst (seqlen=1: 0 OpenMP barrier; seqlen<=8: 4 threads)
-    if (seqlen <= 8) {
+    // Small-M OpenMP Gate + Hardware MSHR Prefetch Burst (seqlen=1: 0 OpenMP barrier; seqlen<=16: 4..6 threads)
+    if (seqlen <= 16) {
         for (int job = 0; job < total_jobs; ++job) {
             const int s = job / 24;
             if (image_mask && image_mask[s]) continue;
@@ -648,7 +648,8 @@ void Dsv41EngramEngine::gather_dequant_tp3(
             return;
         }
 
-        #pragma omp parallel for num_threads(4) schedule(static)
+        const int nth = (seqlen <= 8) ? 4 : 6;
+        #pragma omp parallel for num_threads(nth) schedule(static)
         for (int job = 0; job < total_jobs; ++job) {
             const int s = job / 24;
             const int col = job % 24;

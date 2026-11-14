@@ -427,17 +427,21 @@ inline std::vector<float> build_rarebal_cholesky_rup(
                     for (int m = mb; m < mend; ++m) {
                         const float* xm = panel + size_t(m) * K;
                         const float v0 = xm[i0];
+                        #pragma omp simd
                         for (int j = i0; j < K; ++j) acc0[size_t(j)] += v0 * xm[j];
                         if (rcnt > 1) {
                             const float v1 = xm[i0 + 1];
+                            #pragma omp simd
                             for (int j = i0 + 1; j < K; ++j) acc1[size_t(j)] += v1 * xm[j];
                         }
                         if (rcnt > 2) {
                             const float v2 = xm[i0 + 2];
+                            #pragma omp simd
                             for (int j = i0 + 2; j < K; ++j) acc2[size_t(j)] += v2 * xm[j];
                         }
                         if (rcnt > 3) {
                             const float v3 = xm[i0 + 3];
+                            #pragma omp simd
                             for (int j = i0 + 3; j < K; ++j) acc3[size_t(j)] += v3 * xm[j];
                         }
                     }
@@ -504,6 +508,7 @@ inline std::vector<float> build_rarebal_cholesky_rup(
     for (int jr = 0; jr < K; ++jr) {
         double sum = H_rev[size_t(jr) * K + jr];
         const double* lj = H_rev.data() + size_t(jr) * K;
+        #pragma omp simd reduction(-:sum)
         for (int m = 0; m < jr; ++m) sum -= lj[m] * lj[m];
         if (sum <= 1e-18) sum = 1e-18;
         const double ljj = std::sqrt(sum);
@@ -513,6 +518,7 @@ inline std::vector<float> build_rarebal_cholesky_rup(
         for (int ir = jr + 1; ir < K; ++ir) {
             double s = H_rev[size_t(ir) * K + jr];
             const double* li = H_rev.data() + size_t(ir) * K;
+            #pragma omp simd reduction(-:s)
             for (int m = 0; m < jr; ++m) s -= li[m] * lj[m];
             H_rev[size_t(ir) * K + jr] = s * inv_ljj;
         }
@@ -571,6 +577,7 @@ inline Hlut2QuantMatrix apply_hlut2_ldlq_with_rup(
                 const float qv = sign_bit ? -mag_val : mag_val;
                 const float err = w_rot[size_t(r) * K + col] - qv;
                 const float* rrow = R_up.data() + size_t(col) * K;
+                #pragma omp simd
                 for (int k = col + 1; k < K; ++k) {
                     wr[k] += err * rrow[k];
                 }
