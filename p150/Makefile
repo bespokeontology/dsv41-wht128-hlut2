@@ -6,11 +6,11 @@ OBJ           ?= $(ROOT)/build/p150
 TT_METAL_HOME ?= /opt/tt-metal
 CXX           ?= clang++
 
-CXXFLAGS := -std=c++20 -O3 -mavx2 -mf16c -mfma -fPIC -DNTEST -DFMT_HEADER_ONLY -DSPDLOG_FMT_EXTERNAL
+CXXFLAGS := -std=c++20 -O3 -Wall -Wextra -Werror -mavx2 -mf16c -mfma -fPIC -DNTEST -DFMT_HEADER_ONLY -DSPDLOG_FMT_EXTERNAL
 ifdef P150_MAX_HOT_L1_SHARDS
 CXXFLAGS += -DP150_MAX_HOT_L1_SHARDS=$(P150_MAX_HOT_L1_SHARDS)
 endif
-CXXFLAGS += -I$(TT_METAL_HOME)/include -I$(TT_METAL_HOME)/include/ttnn -I$(ROOT)/src
+CXXFLAGS += -isystem $(TT_METAL_HOME)/include -isystem $(TT_METAL_HOME)/include/ttnn -I$(ROOT)/src
 
 ifdef TT_EXTRA_CXXFLAGS
 CXXFLAGS += $(TT_EXTRA_CXXFLAGS)

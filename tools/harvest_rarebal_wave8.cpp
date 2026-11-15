@@ -64,6 +64,88 @@ std::vector<std::string> load_sanitized_code_blocks(const std::string& src_root)
     return blocks;
 }
 
+bool looks_like_binary_or_b64(const std::string& s) {
+    if (s.size() < 48) return true;
+    if (s.find("data:image/") != std::string::npos) return true;
+    size_t max_run = 0, cur_run = 0;
+    for (unsigned char c : s) {
+        if (c > ' ') {
+            if (++cur_run > max_run) max_run = cur_run;
+        } else {
+            cur_run = 0;
+        }
+    }
+    return max_run > 220;
+}
+
+std::vector<std::string> load_sanitized_session_zstd_blocks(const std::vector<std::string>& zstd_paths) {
+    std::vector<std::string> blocks;
+    std::string accum;
+    accum.reserve(16384);
+    std::error_code ec;
+
+    for (const auto& zp : zstd_paths) {
+        if (zp.empty() || !std::filesystem::exists(zp, ec)) continue;
+        const std::string cmd = "/usr/bin/zstd -dc \"" + zp + "\" 2>/dev/null";
+        FILE* fp = ::popen(cmd.c_str(), "r");
+        if (!fp) continue;
+
+        std::vector<char> buf(65536);
+        bool in_str = false, esc = false, drop_str = false;
+        std::string cur;
+        cur.reserve(4096);
+        for (;;) {
+            const size_t n = std::fread(buf.data(), 1, buf.size(), fp);
+            if (n == 0) break;
+            for (size_t i = 0; i < n; ++i) {
+                const char ch = buf[i];
+                if (!in_str) {
+                    if (ch == '"') {
+                        in_str = true;
+                        esc = false;
+                        drop_str = false;
+                        cur.clear();
+                    }
+                } else {
+                    if (esc) {
+                        esc = false;
+                        if (!drop_str) {
+                            if (ch == 'n') cur.push_back('\n');
+                            else if (ch == 't') cur.push_back('\t');
+                            else if (ch == '"' || ch == '\\' || ch == '/') cur.push_back(ch);
+                        }
+                    } else if (ch == '\\') {
+                        esc = true;
+                    } else if (ch == '"') {
+                        in_str = false;
+                        if (!drop_str && !looks_like_binary_or_b64(cur)) {
+                            accum += sanitize_text(cur);
+                            accum.push_back('\n');
+                            if (accum.size() >= 8192) {
+                                blocks.push_back(std::move(accum));
+                                accum.clear();
+                                accum.reserve(16384);
+                            }
+                        }
+                    } else if (!drop_str) {
+                        if (cur.size() >= 32768) {
+                            drop_str = true;
+                            cur.clear();
+                        } else {
+                            cur.push_back(ch);
+                        }
+                    }
+                }
+            }
+        }
+        (void)::pclose(fp);
+    }
+    if (!accum.empty()) {
+        blocks.push_back(std::move(accum));
+    }
+    return blocks;
+}
+
 std::string build_math_and_dsml_segment(size_t idx) {
     const std::string dsml_open_calls  = "<\xEF\xBD\x9C" "DSML\xEF\xBD\x9C" "function_calls>";
     const std::string dsml_close_calls = "</\xEF\xBD\x9C" "DSML\xEF\xBD\x9C" "function_calls>";
@@ -166,15 +248,18 @@ std::string build_math_and_dsml_segment(size_t idx) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    ::setenv("OMP_WAIT_POLICY", "PASSIVE", 1);
+    ::setenv("GPU_MAX_HW_QUEUES", "8", 0);
     const std::string root_env = (std::getenv("DSV41_ROOT") != nullptr)
                                      ? std::string(std::getenv("DSV41_ROOT"))
                                      : std::string(".");
     std::string mi50_root  = root_env + "/packed_mi50";
     std::string tok_json   = root_env + "/hf_meta/tokenizer.json";
     std::string shm_name   = "/dsv41_p150_ipc";
-    std::string cal_dir    = "/dev/shm/dsv41_rarebal_cal_wave8";
+    std::string cal_dir    = "/dev/shm/dsv41_rarebal_cal_wave8_4";
     std::string src_root   = root_env;
-    size_t target_tokens   = 560000;
+    std::vector<std::string> session_zstds;
+    size_t target_tokens   = 640000;
     bool link_check        = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -184,6 +269,7 @@ int main(int argc, char** argv) {
         else if (a == "--p150-shm" && i + 1 < argc) shm_name = argv[++i];
         else if (a == "--cal-dir" && i + 1 < argc) cal_dir = argv[++i];
         else if (a == "--src-root" && i + 1 < argc) src_root = argv[++i];
+        else if (a == "--session-zstd" && i + 1 < argc) session_zstds.push_back(argv[++i]);
         else if (a == "--target-tokens" && i + 1 < argc) target_tokens = std::stoull(argv[++i]);
         else if (a == "--link-check") link_check = true;
     }
@@ -202,8 +288,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[HARVEST_RAREBAL_WAVE8] ERROR: No source files found under %s\n", src_root.c_str());
         return 1;
     }
+    std::vector<std::string> session_blocks = load_sanitized_session_zstd_blocks(session_zstds);
 
     dsv41::Dsv41Runtime rt;
+    rt.set_expert_perm_overlay("");  // Always record logical 0..383 expert IDs during harvest!
     rt.init(mi50_root, tok_json, shm_name, 16384, "", cal_dir);
     rt.set_dual_stream_overlap(true);
 
@@ -211,7 +299,12 @@ int main(int argc, char** argv) {
     corpus_ids.reserve(target_tokens + 16384);
     size_t seg_idx = 0;
     while (corpus_ids.size() < target_tokens) {
-        std::string chunk = code_blocks[seg_idx % code_blocks.size()];
+        std::string chunk;
+        if (!session_blocks.empty() && (seg_idx & 1u) == 0u) {
+            chunk = session_blocks[(seg_idx >> 1u) % session_blocks.size()];
+        } else {
+            chunk = code_blocks[seg_idx % code_blocks.size()];
+        }
         chunk += "\n";
         chunk += build_math_and_dsml_segment(seg_idx);
         const auto ids = rt.tokenizer().encode(chunk, false);
@@ -219,8 +312,8 @@ int main(int argc, char** argv) {
         ++seg_idx;
     }
 
-    std::printf("[HARVEST_RAREBAL_WAVE8] Built sanitized multi-domain corpus: %zu tokens across %zu interleaved segments (%zu code blocks)\n",
-                corpus_ids.size(), seg_idx, code_blocks.size());
+    std::printf("[HARVEST_RAREBAL_WAVE8] Built sanitized multi-domain + real-session corpus: %zu tokens across %zu interleaved segments (%zu code blocks, %zu session blocks)\n",
+                corpus_ids.size(), seg_idx, code_blocks.size(), session_blocks.size());
     std::fflush(stdout);
 
     const bool satisfied = rt.capture_rarebal_corpus(corpus_ids);

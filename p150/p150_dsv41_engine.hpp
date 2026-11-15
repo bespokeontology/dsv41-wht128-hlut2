@@ -18,11 +18,16 @@ public:
         const std::string& kernels_dir,
         bool enable_trace = true,
         const std::string& rarebal_overlay_path = "",
-        uint32_t hot_l1_shards = P150_MAX_HOT_L1_SHARDS);
+        uint32_t hot_l1_shards = kP150Wave84DefaultHotShards,
+        bool x16_relay = true);
     ~P150Dsv41Engine();
 
     P150Dsv41Engine(const P150Dsv41Engine&) = delete;
     P150Dsv41Engine& operator=(const P150Dsv41Engine&) = delete;
+
+    void set_x16_relay(bool enabled) noexcept;
+    bool x16_relay_enabled() const noexcept;
+    uint32_t active_hot_l1_shards() const noexcept;
 
     // Loads layer [0..39] if tp0 & tp1 .safetensors exist on disk and not yet loaded. Returns true if resident.
     bool ensure_layer_loaded(uint32_t layer);

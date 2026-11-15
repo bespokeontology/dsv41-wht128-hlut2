@@ -1281,6 +1281,8 @@ void run_live_runtime_gate() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    ::setenv("OMP_WAIT_POLICY", "PASSIVE", 1);
+    ::setenv("GPU_MAX_HW_QUEUES", "8", 0);
     bool live_runtime = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--live-runtime") == 0) live_runtime = true;

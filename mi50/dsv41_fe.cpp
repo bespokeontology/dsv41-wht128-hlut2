@@ -828,6 +828,7 @@ void handle_connection(int fd, dsv41::Dsv41Runtime* rt, const FeServerConfig& cf
 
 int main(int argc, char** argv) {
     ::setenv("OMP_WAIT_POLICY", "PASSIVE", 1);
+    ::setenv("GPU_MAX_HW_QUEUES", "8", 0);
     try {
         const std::string root_env = (std::getenv("DSV41_ROOT") != nullptr)
                                          ? std::string(std::getenv("DSV41_ROOT"))
@@ -838,6 +839,8 @@ int main(int argc, char** argv) {
         std::string tok_path  = root_env + "/hf_meta/tokenizer.json";
         std::string p150_shm  = "/dsv41_p150_ipc";
         std::string rarebal_overlay;
+        std::string expert_perm_overlay;
+        bool disable_expert_perm = false;
         std::string capture_rarebal_dir;
         std::string vit_weights;
         bool vit_explicit = false;
@@ -853,6 +856,7 @@ int main(int argc, char** argv) {
         int dspark_tree16_max_ctx = 0; // Wave 8.3A: default 0 (disables under-48K 4-batch M=16 drag)
         bool dspark_static_m8    = false;
         int dspark_dyn8_max_depth = 5;
+        bool csa2_shared_tree8   = true;
 
         FeServerConfig srv_cfg;
         for (const char* env_k : {"SEARCH_URL", "DSV41_SEARCH_URL", "DSV41_SEARXNG_URL"}) {
@@ -905,6 +909,16 @@ int main(int argc, char** argv) {
                 rarebal_overlay = argv[++i];
             } else if (arg == "--no-rarebal-overlay") {
                 rarebal_overlay.clear();
+            } else if (arg == "--expert-perm-overlay" && i + 1 < argc) {
+                expert_perm_overlay = argv[++i];
+                disable_expert_perm = false;
+            } else if (arg == "--no-expert-perm-overlay") {
+                expert_perm_overlay.clear();
+                disable_expert_perm = true;
+            } else if (arg == "--csa2-shared-tree8") {
+                csa2_shared_tree8 = true;
+            } else if (arg == "--no-csa2-shared-tree8") {
+                csa2_shared_tree8 = false;
             } else if (arg == "--capture-rarebal" && i + 1 < argc) {
                 capture_rarebal_dir = argv[++i];
             } else if (arg == "--vit-weights" && i + 1 < argc) {
@@ -949,6 +963,12 @@ int main(int argc, char** argv) {
 
         dsv41::Dsv41Runtime runtime;
         runtime.set_nvme_kv_cache(nvme_kv_cache_dir, nvme_kv_cache_gb);
+        if (disable_expert_perm) {
+            runtime.set_expert_perm_overlay("");
+        } else if (!expert_perm_overlay.empty()) {
+            runtime.set_expert_perm_overlay(expert_perm_overlay);
+        }
+        runtime.set_csa2_shared_tree8(csa2_shared_tree8);
         runtime.init(mi50_root, tok_path, p150_shm, srv_cfg.max_seq_len, rarebal_overlay, capture_rarebal_dir, vit_weights);
         runtime.set_dual_stream_overlap(dual_overlap);
         runtime.set_dspark_tree_width(dspark_tree_width);
@@ -979,12 +999,13 @@ int main(int argc, char** argv) {
             throw std::runtime_error("listen() failed");
         }
 
-        std::printf("[DSV41_FE] OpenAI + Anthropic HTTP/SSE server listening on http://%s:%d (/v1 + /anthropic/v1/messages, model=%s, max_seq_len=%d, effort=%d, max_out=%d/%d, dual_ovlp=%d, tree_w=%s, dyn_m8=%d[d<=%d,t16_ctx=%d], vit=%s, nvme_kv=%s(%.1fG), search=%s)\n",
+        std::printf("[DSV41_FE] OpenAI + Anthropic HTTP/SSE server listening on http://%s:%d (/v1 + /anthropic/v1/messages, model=%s, max_seq_len=%d, effort=%d, max_out=%d/%d, dual_ovlp=%d, tree_w=%s, dyn_m8=%d[d<=%d,t16_ctx=%d], csa2_sh8=%d, vit=%s, nvme_kv=%s(%.1fG), search=%s)\n",
                     host.c_str(), port, srv_cfg.default_model_id.c_str(), srv_cfg.max_seq_len,
                     srv_cfg.default_reasoning_effort, srv_cfg.default_max_tokens, srv_cfg.max_output_tokens,
                     int(dual_overlap),
                     (dspark_tree_width == 8 ? "8" : (dspark_tree_width == 16 ? "16" : "auto")),
                     dspark_static_m8 ? 0 : 1, dspark_dyn8_max_depth, dspark_tree16_max_ctx,
+                    int(csa2_shared_tree8),
                     runtime.vision_ready() ? "ready" : "off",
                     nvme_kv_cache_dir.empty() ? "off" : nvme_kv_cache_dir.c_str(),
                     nvme_kv_cache_gb,

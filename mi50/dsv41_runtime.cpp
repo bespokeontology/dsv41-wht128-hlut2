@@ -394,6 +394,7 @@ struct TpRankContext {
     float*          d_topk_weights    = nullptr; // [M, 6]
     uint16_t*       d_sh_gateup_bf16  = nullptr; // [M, 1536]
     uint16_t*       d_x_rot_f16       = nullptr; // [M, 5120]
+    uint16_t*       d_expert_perm     = nullptr; // [40, 384] U16 logical->physical expert LUT (30,720 B)
     Mi50RoutedPair* d_routed_pairs    = nullptr; // [M * 6]
     int32_t*        d_active_experts  = nullptr; // [256]
     int32_t*        d_csr_offsets     = nullptr; // [257]
@@ -453,6 +454,12 @@ struct Dsv41Runtime::Impl {
     int tree16_max_context = Dsv41AdaptiveTreeWidthController::kAutoTree16MaxContext;
     bool tree_static_m8 = false;
     int tree_dyn8_max_depth = 5;
+    bool csa2_shared_tree8 = true;
+    std::string expert_perm_overlay_path;
+    bool expert_perm_disabled = false;
+    bool expert_perm_active = false;
+    std::string mi50_packed_root_saved;
+    std::string rarebal_overlay_path_saved;
 
     // Coherent mapped pinned DDR4 Markov embedding [129280, 256] BF16 (63.1 MiB in DDR4 -> 0 B HBM2!) + GPU DSpark slot
     uint16_t* h_markov_embed_mapped = nullptr;
@@ -992,6 +999,56 @@ struct Dsv41Runtime::Impl {
         }
     }
 
+    void apply_identity_expert_perm_all_ranks() {
+        std::vector<uint16_t> id_perm(size_t(kNumLayers) * size_t(kBackboneExperts));
+        for (int l = 0; l < kNumLayers; ++l) {
+            for (int e = 0; e < kBackboneExperts; ++e) {
+                id_perm[size_t(l) * size_t(kBackboneExperts) + size_t(e)] = static_cast<uint16_t>(e);
+            }
+        }
+        for (int tp = 0; tp < kTpSize; ++tp) {
+            DSV41_HIP_CHECK(hipSetDevice(tp));
+            copy_h2d_fast(ctx[tp].d_expert_perm, id_perm.data(), id_perm.size() * sizeof(uint16_t));
+        }
+        DSV41_HIP_CHECK(hipSetDevice(0));
+        expert_perm_active = false;
+    }
+
+    void apply_expert_perm_from_safetensors(const SafetensorsMmap& st, const std::string& src_path) {
+        if (!st.contains("expert_perm_u16")) {
+            throw std::runtime_error("expert_perm_u16 tensor missing in " + src_path);
+        }
+        const auto& ti = st.at("expert_perm_u16");
+        const size_t expected_bytes = size_t(kNumLayers) * size_t(kBackboneExperts) * sizeof(uint16_t);
+        if (size_t(ti.byte_size()) != expected_bytes) {
+            throw std::runtime_error("expert_perm_u16 invalid byte size in " + src_path);
+        }
+        const auto* p = reinterpret_cast<const uint16_t*>(st.tensor_bytes("expert_perm_u16"));
+        int cross_swaps = 0;
+        for (int l = 0; l < kNumLayers; ++l) {
+            std::array<uint8_t, kBackboneExperts> seen{};
+            for (int e = 0; e < kBackboneExperts; ++e) {
+                const uint16_t pe = p[size_t(l) * size_t(kBackboneExperts) + size_t(e)];
+                if (pe >= kBackboneExperts || seen[pe] != 0u) {
+                    throw std::runtime_error("expert_perm_u16 is not a valid 384-bijection at layer " + std::to_string(l));
+                }
+                seen[pe] = 1u;
+                if ((e < kMi50BackboneExp) != (int(pe) < kMi50BackboneExp)) {
+                    ++cross_swaps;
+                }
+            }
+        }
+        for (int tp = 0; tp < kTpSize; ++tp) {
+            DSV41_HIP_CHECK(hipSetDevice(tp));
+            copy_h2d_fast(ctx[tp].d_expert_perm, p, expected_bytes);
+        }
+        DSV41_HIP_CHECK(hipSetDevice(0));
+        expert_perm_active = true;
+        std::printf("[DSV41_RT] Activated 40x384 frequency-balanced expert permutation LUT (%zu B/rank, cross_tier_moves=%d) from %s\n",
+                    expected_bytes, cross_swaps, src_path.c_str());
+        std::fflush(stdout);
+    }
+
     void init_tp_rank(int tp, const std::string& mi50_root, int vocab_offset_in) {
         DSV41_HIP_CHECK(hipSetDevice(tp));
         auto& c = ctx[tp];
@@ -1175,6 +1232,16 @@ struct Dsv41Runtime::Impl {
         // Alias MoE-only buffers onto strictly disjoint Attention-only d_o_bf16 (24 MiB) and d_q_bf16 (24 MiB), saving 21.0 MiB HBM2/GPU!
         c.d_sh_gateup_bf16  = c.d_o_bf16;
         c.d_x_rot_f16       = alloc_gpu_buf<uint16_t>(M * kDim, c.device_allocs);
+        c.d_expert_perm     = alloc_gpu_buf<uint16_t>(size_t(kNumLayers) * size_t(kBackboneExperts), c.device_allocs);
+        {
+            std::vector<uint16_t> id_perm(size_t(kNumLayers) * size_t(kBackboneExperts));
+            for (int l = 0; l < kNumLayers; ++l) {
+                for (int e = 0; e < kBackboneExperts; ++e) {
+                    id_perm[size_t(l) * size_t(kBackboneExperts) + size_t(e)] = static_cast<uint16_t>(e);
+                }
+            }
+            copy_h2d_fast(c.d_expert_perm, id_perm.data(), id_perm.size() * sizeof(uint16_t));
+        }
         c.d_routed_pairs    = alloc_gpu_buf<Mi50RoutedPair>(M * kBackboneTopk, c.device_allocs);
         c.d_active_experts  = alloc_gpu_buf<int32_t>(256u, c.device_allocs);
         c.d_csr_offsets     = alloc_gpu_buf<int32_t>(257u, c.device_allocs);
@@ -1564,7 +1631,8 @@ struct Dsv41Runtime::Impl {
                 tree_anc_mask, tree_depth_nibbles,
                 (active_k_comp > 0) ? c.d_ext_comp_kv_fp4[kv_slot] : nullptr,
                 (active_k_comp > 0) ? c.d_ext_comp_kv_e4m3[kv_slot] : nullptr,
-                (active_k_comp > 0) ? c.hot_comp_cap[kv_slot] : 0x7FFFFFFF);
+                (active_k_comp > 0) ? c.hot_comp_cap[kv_slot] : 0x7FFFFFFF,
+                csa2_shared_tree8 && (active_k_comp > 0 && T_comp > c.hot_comp_cap[kv_slot]));
 
             if (commit_window_immediately) {
                 write_ring_window_gpu(tp, l, c.d_kv_cur_bf16, start_pos, M);
@@ -1737,10 +1805,14 @@ struct Dsv41Runtime::Impl {
                 const auto& b = c.blocks[block_id];
                 launch_bf16_gemm(c.d_x_bf16, b.d_gate_w, nullptr, c.d_gate_logits_f32,
                                  M, b.n_routed_experts, kDim, true, c.stream);
+                const uint16_t* d_perm_row = (expert_perm_active && block_id < kNumLayers)
+                    ? (c.d_expert_perm + size_t(block_id) * size_t(kBackboneExperts))
+                    : nullptr;
                 launch_moe_gate(c.d_gate_logits_f32, b.d_gate_bias, b.d_gate_bias_vl,
                                 use_image_mask ? c.d_image_mask : nullptr,
                                 c.d_topk_ids, c.d_topk_weights,
-                                M, b.n_routed_experts, top_k, kRouteScale, c.stream);
+                                M, b.n_routed_experts, top_k, kRouteScale, c.stream,
+                                d_perm_row);
                 if (tp == 0) {
                     DSV41_HIP_CHECK(hipEventRecord(c.ev_router_done_ring[block_id], c.stream));
                     DSV41_HIP_CHECK(hipStreamWaitEvent(c.router_stream, c.ev_router_done_ring[block_id], 0));
@@ -1828,10 +1900,15 @@ struct Dsv41Runtime::Impl {
             DSV41_HIP_CHECK(hipStreamWaitEvent(c0.router_stream, c0.ev_x_ready, 0));
             launch_bf16_gemm(c0.d_x_bf16, bm0.d_gate_w, nullptr, c0.d_gate_logits_f32,
                              M, bm0.n_routed_experts, kDim, true, c0.router_stream);
+            const uint16_t* d_perm_row0 = (expert_perm_active && block_id < kNumLayers &&
+                                           !(rarebal_collector && rarebal_collector->active))
+                ? (c0.d_expert_perm + size_t(block_id) * size_t(kBackboneExperts))
+                : nullptr;
             launch_moe_gate(c0.d_gate_logits_f32, bm0.d_gate_bias, bm0.d_gate_bias_vl,
                             use_image_mask ? c0.d_image_mask : nullptr,
                             c0.d_topk_ids, c0.d_topk_weights,
-                            M, bm0.n_routed_experts, top_k, kRouteScale, c0.router_stream);
+                            M, bm0.n_routed_experts, top_k, kRouteScale, c0.router_stream,
+                            d_perm_row0);
             DSV41_HIP_CHECK(hipMemcpyAsync(c0.h_topk_ids, c0.d_topk_ids, size_t(M) * top_k * sizeof(int32_t),
                                            hipMemcpyDeviceToHost, c0.router_stream));
             DSV41_HIP_CHECK(hipMemcpyAsync(c0.h_topk_w, c0.d_topk_weights, size_t(M) * top_k * sizeof(float),
@@ -3101,9 +3178,6 @@ struct Dsv41Runtime::Impl {
                 if (check_done && gpos >= next_log_pos) {
                     int m_ok = 0, p_ok = 0, mtp_ok = 0;
                     (void)rarebal_collector->targets_satisfied(&m_ok, &p_ok, &mtp_ok);
-                    if (mtp_ok >= 56) {
-                        rarebal_collector->block_need_mask &= ~(7ULL << 40);
-                    }
                     std::printf("[RAREBAL_CAL] Capture %d / %d toks | ready(>=11776): main=%d (p150_pinned=%d/%zu) mtp=%d (total=%d)\n",
                                 gpos, span_end, m_ok, p_ok, rarebal_collector->pinned_p150_pairs.size(), mtp_ok, m_ok + mtp_ok);
                     std::fflush(stdout);
@@ -4351,6 +4425,38 @@ void Dsv41Runtime::set_dspark_dyn8_max_depth(int max_depth) {
     }
 }
 
+void Dsv41Runtime::set_expert_perm_overlay(const std::string& overlay_path) {
+    std::lock_guard<std::mutex> lk(gen_mtx_);
+    if (!impl_) return;
+    if (overlay_path.empty()) {
+        impl_->expert_perm_disabled = true;
+        impl_->expert_perm_overlay_path.clear();
+        if (ready_) {
+            impl_->apply_identity_expert_perm_all_ranks();
+            impl_->model_overlay_uuid = compute_model_overlay_uuid(
+                impl_->mi50_packed_root_saved, impl_->rarebal_overlay_path_saved, "");
+            impl_->exported_radix_key = impl_->model_overlay_uuid;
+        }
+    } else {
+        impl_->expert_perm_disabled = false;
+        impl_->expert_perm_overlay_path = overlay_path;
+        if (ready_) {
+            SafetensorsMmap st(overlay_path);
+            impl_->apply_expert_perm_from_safetensors(st, overlay_path);
+            impl_->model_overlay_uuid = compute_model_overlay_uuid(
+                impl_->mi50_packed_root_saved, impl_->rarebal_overlay_path_saved, overlay_path);
+            impl_->exported_radix_key = impl_->model_overlay_uuid;
+        }
+    }
+}
+
+void Dsv41Runtime::set_csa2_shared_tree8(bool enable) {
+    std::lock_guard<std::mutex> lk(gen_mtx_);
+    if (impl_) {
+        impl_->csa2_shared_tree8 = enable;
+    }
+}
+
 void Dsv41Runtime::set_nvme_kv_cache(const std::string& cache_dir, double max_gb) {
     std::lock_guard<std::mutex> lk(gen_mtx_);
     if (impl_) {
@@ -4415,7 +4521,11 @@ void Dsv41Runtime::init(
 {
     std::lock_guard<std::mutex> lk(gen_mtx_);
     impl_->max_seq_len = max_seq_len;
-    impl_->model_overlay_uuid = compute_model_overlay_uuid(mi50_packed_root, rarebal_overlay_path);
+    impl_->mi50_packed_root_saved = mi50_packed_root;
+    impl_->rarebal_overlay_path_saved = rarebal_overlay_path;
+    impl_->model_overlay_uuid = compute_model_overlay_uuid(
+        mi50_packed_root, rarebal_overlay_path,
+        impl_->expert_perm_disabled ? std::string() : impl_->expert_perm_overlay_path);
     impl_->exported_radix_key = impl_->model_overlay_uuid;
     if (!rarebal_overlay_path.empty()) {
         impl_->rarebal_overlay_mmap = std::make_unique<SafetensorsMmap>(rarebal_overlay_path);
@@ -4564,6 +4674,15 @@ void Dsv41Runtime::init(
         }
     }
 
+    if (!impl_->expert_perm_disabled) {
+        if (!impl_->expert_perm_overlay_path.empty() &&
+            impl_->expert_perm_overlay_path != rarebal_overlay_path) {
+            SafetensorsMmap perm_st(impl_->expert_perm_overlay_path);
+            impl_->apply_expert_perm_from_safetensors(perm_st, impl_->expert_perm_overlay_path);
+        } else if (impl_->rarebal_overlay_mmap && impl_->rarebal_overlay_mmap->contains("expert_perm_u16")) {
+            impl_->apply_expert_perm_from_safetensors(*impl_->rarebal_overlay_mmap, rarebal_overlay_path);
+        }
+    }
     if (impl_->rarebal_overlay_mmap) {
         std::printf("[DSV41_RT] Patched %d MI50 + MTP hot experts (x3 TP3 shards, 0 B extra HBM2) from %s\n",
                     impl_->rarebal_mi50_patched_slots.load(std::memory_order_relaxed),

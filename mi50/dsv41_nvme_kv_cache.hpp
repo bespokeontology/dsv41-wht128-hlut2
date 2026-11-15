@@ -314,7 +314,8 @@ inline uint64_t fnv1a64_init() noexcept {
 
 inline RadixKey128 compute_model_overlay_uuid(
     const std::string& mi50_packed_root,
-    const std::string& rarebal_overlay_path) noexcept
+    const std::string& rarebal_overlay_path,
+    const std::string& expert_perm_overlay_path = "") noexcept
 {
     uint64_t h1 = 0xCBF29CE484222325ULL;
     uint64_t h2 = 0x84222325CBF29CE4ULL;
@@ -340,6 +341,11 @@ inline RadixKey128 compute_model_overlay_uuid(
         mix_stat(rarebal_overlay_path);
     } else {
         mix_str("base_hlut2_no_overlay");
+    }
+    if (!expert_perm_overlay_path.empty() && expert_perm_overlay_path != rarebal_overlay_path) {
+        const size_t slash = expert_perm_overlay_path.find_last_of('/');
+        mix_str(slash == std::string::npos ? expert_perm_overlay_path : expert_perm_overlay_path.substr(slash + 1));
+        mix_stat(expert_perm_overlay_path);
     }
     if (h1 == 0ULL && h2 == 0ULL) h1 = 1ULL;
     return RadixKey128{h1, h2};

@@ -33,8 +33,9 @@ int main(int argc, char** argv) {
         uint32_t selfcheck_layer = 0u;
         bool enable_trace       = true;
         bool reuse_shm          = false;
+        bool x16_relay          = true;
         uint32_t max_layers     = 40u;
-        uint32_t hot_shards     = dsv41::kP150ConfiguredHotShards;
+        uint32_t hot_shards     = dsv41::kP150Wave84DefaultHotShards;
 
         for (int i = 1; i < argc; ++i) {
             const std::string arg(argv[i]);
@@ -45,7 +46,8 @@ int main(int argc, char** argv) {
                                  unsigned(hot_shards));
                     return 2;
                 }
-                std::cout << "[P150_DSV41] Link check OK (no devices opened)\n";
+                std::cout << "[P150_DSV41] Link check OK (no devices opened, hot_shards=" << hot_shards
+                          << ", x16_relay=" << int(x16_relay) << ")\n";
                 return 0;
             } else if (arg == "--model-dir" && i + 1 < argc) {
                 const std::string md = argv[++i];
@@ -69,13 +71,17 @@ int main(int argc, char** argv) {
                 enable_trace = false;
             } else if (arg == "--reuse-shm") {
                 reuse_shm = true;
-            } else if (arg == "--hot-shards" && i + 1 < argc) {
+            } else if ((arg == "--hot-shards" || arg == "--p150-l1-shards") && i + 1 < argc) {
                 hot_shards = std::clamp<uint32_t>(static_cast<uint32_t>(std::stoul(argv[++i])),
                                                   dsv41::kP150MinHotShards,
                                                   dsv41::kP150MaxHotL1Shards);
-            } else if (arg == "--rarebal-overlay" && i + 1 < argc) {
+            } else if (arg == "--p150-x16-relay") {
+                x16_relay = true;
+            } else if (arg == "--no-p150-x16-relay") {
+                x16_relay = false;
+            } else if ((arg == "--rarebal-overlay" || arg == "--expert-perm-overlay") && i + 1 < argc) {
                 rarebal_overlay = argv[++i];
-            } else if (arg == "--no-rarebal-overlay") {
+            } else if (arg == "--no-rarebal-overlay" || arg == "--no-expert-perm-overlay") {
                 rarebal_overlay.clear();
             }
         }
@@ -83,7 +89,7 @@ int main(int argc, char** argv) {
         std::signal(SIGINT, on_signal);
         std::signal(SIGTERM, on_signal);
 
-        dsv41::P150Dsv41Engine engine(packed_root, kernels_dir, enable_trace, rarebal_overlay, hot_shards);
+        dsv41::P150Dsv41Engine engine(packed_root, kernels_dir, enable_trace, rarebal_overlay, hot_shards, x16_relay);
 
         if (selfcheck_only) {
             const bool ok = engine.selfcheck_layer(selfcheck_layer);

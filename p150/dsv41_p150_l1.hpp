@@ -261,6 +261,40 @@ inline constexpr bool p150_hot_shards_fit(uint32_t requested) noexcept {
 static_assert(p150_hot_shards_fit(kP150ConfiguredHotShards),
               "P150_MAX_HOT_L1_SHARDS does not fit the exact per-Tensix L1 byte budget");
 
+// Wave 8.4C: 4-page streaming CB4/CB5 ring cuts peak static CB across all programs from 246,784 B -> 204,800 B,
+// allowing 18 hot shards/card (36 TP2 shards = 161.37 MiB pure L1 weights) while keeping x_decode [1,1,32,5120] BF16,
+// finish_decode[0..1], AND optional Card #0 -> FABRIC_1D relay staging (x_decode_src + slot_ids_src) 100% L1-resident!
+inline constexpr uint32_t kP150Wave84DefaultHotShards            = 18u;
+inline constexpr uint32_t kP150Wave84StreamedPeakStaticCbPerCore = 204'800u; // Prefill gate+up (cb0=65,536 + cb1=69,632 + cb4=16,384 + cb5=16,384 + cb6=4,096 + cb16=32,768)
+inline constexpr uint32_t kP150Wave84DownStaticCbPerCore         = 197'632u; // Down (cb0=40,960 + cb1=87,040 + cb4=16,384 + cb5=16,384 + cb6=4,096 + cb16=32,768)
+
+inline constexpr size_t p150_wave84_bank0_l1_bytes_at_18(bool x16_relay) noexcept {
+    const auto bank_pages = [](size_t pages, size_t page_bytes) constexpr -> size_t {
+        return ((pages + 109u) / 110u) * page_bytes;
+    };
+    size_t b =
+        bank_pages(1u, 640u) +                  // slot_ids
+        bank_pages(160u, 2048u) +               // x_decode (kept 100% L1-resident at 18 shards!)
+        bank_pages(5760u, 4096u) +              // gate_partials
+        bank_pages(5760u, 4096u) +              // up_partials
+        bank_pages(576u, 2048u) +               // z_rot_bf16
+        bank_pages(160u, 4096u) +               // combined_f32
+        bank_pages(40u, 512u) +                 // l1_slot_lut
+        2u * bank_pages(160u, 2048u) +          // finish_decode[0..1] (typecast + 4x800G FABRIC_1D all_reduce)
+        3u * bank_pages(18u * 360u, 4352u);     // 18 hot gate+up+down shards (36 TP2 shards = 161.37 MiB)
+    if (x16_relay) {
+        b += bank_pages(160u, 2048u) +          // x_decode_src (Card #0 PCIe x16 -> 4x800G FABRIC_1D relay)
+             bank_pages(1u, 640u);              // slot_ids_src
+    }
+    return b;
+}
+
+static_assert(p150_wave84_bank0_l1_bytes_at_18(true) + kP150Wave84StreamedPeakStaticCbPerCore <= kP150L1Fabric1DBankBytes,
+              "Wave 8.4C 18 hot shards + L1 x_decode + L1 finish_decode[0..1] + x16_relay L1 staging + 204,800 B peak CB must fit <= 1,459,200 B/bank (+11,264 B margin)");
+
+inline constexpr size_t kP150Wave84At18PureL1BytesPerCard =
+    kP150Tier1At17PureL1BytesPerCard + kP150HotShardBytes; // 134,627,968 B (128.391 MiB/card; +328,320 B with x16_relay)
+
 inline void p150_l1_geometry_report() noexcept {
     std::printf("[P150_L1GEOM] raw/core=%u firmware=%u usable/core=%u l1_small=%u fabric1d_bank=%u guard/core=%u cores/card=%u\n",
                 unsigned(kP150L1CoreRawBytes), unsigned(kP150L1FirmwareGuardBytes),

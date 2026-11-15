@@ -119,6 +119,8 @@ public:
     void set_dspark_tree16_max_context(int max_ctx);
     void set_dspark_static_m8(bool enable);
     void set_dspark_dyn8_max_depth(int max_depth);
+    void set_expert_perm_overlay(const std::string& overlay_path);
+    void set_csa2_shared_tree8(bool enable);
     void set_nvme_kv_cache(const std::string& cache_dir, double max_gb = 32.0);
     void flush_nvme_kv_cache();
     void clear_all_caches();

@@ -2521,8 +2521,8 @@ void k_indexer_score(
     out_score[size_t(m) * size_t(T_comp) + size_t(t)] = total;
 }
 
-// Multi-row FP4_E2M1 + UE8M0 HSI Lightning Indexer (reads each 68 B compressed key ONCE across MAX_M query rows = 6x HBM2 BW cut!):
-// Holds the 68 B key in 17 VGPRs and evaluates mr = 0..m_rows-1 sequentially with 11 accumulator VGPRs -> ScratchSize == 0!
+// Multi-row FP4_E2M1 + UE8M0 HSI Lightning Indexer (reads each 68 B compressed key ONCE across MAX_M query rows = 8x HBM2 BW cut!):
+// Uses 16-byte ds_read_b128 LDS Q tiles + lossless power-of-two per-group exponent scaling + gfx906 v_dot2_f32_f16 (ScratchSize == 0!).
 template <int MAX_M>
 __global__ __launch_bounds__(256, 2)
 void k_indexer_score_msplit(
@@ -2533,27 +2533,66 @@ void k_indexer_score_msplit(
     float* __restrict__ out_score,             // [M, T_comp]
     int M, int ih_cnt, int T_comp)
 {
-    __shared__ uint32_t s_q2[MAX_M][11][64];
-    __shared__ float s_w[MAX_M][11];
+    __shared__ uint4    s_q4[MAX_M][11][16];
+    __shared__ float    s_q_gsc[MAX_M][11][4];
+    __shared__ float    s_w[MAX_M][11];
+    __shared__ uint32_t s_fp4x2_lut[256];
 
-    const int t = int(blockIdx.x) * 256 + int(threadIdx.x);
+    const int t      = int(blockIdx.x) * 256 + int(threadIdx.x);
     const int m_base = int(blockIdx.y) * MAX_M;
     const int m_rows = min(MAX_M, M - m_base);
-    const int tid = int(threadIdx.x);
+    const int tid    = int(threadIdx.x);
 
-    const int total_q2 = m_rows * ih_cnt * 64;
-    for (int idx = tid; idx < total_q2; idx += 256) {
-        const int d2 = idx & 63;
-        const int mh = idx >> 6;
+    {
+        const float v_lo = d_fp4_e2m1_to_f32(uint8_t(tid & 0xFu));
+        const float v_hi = d_fp4_e2m1_to_f32(uint8_t((tid >> 4) & 0xFu));
+        s_fp4x2_lut[tid] = uint32_t(d_f32_to_fp16_bits(v_lo)) | (uint32_t(d_f32_to_fp16_bits(v_hi)) << 16);
+    }
+
+    const int total_grps = m_rows * ih_cnt * 4;
+    for (int grp = tid; grp < total_grps; grp += 256) {
+        const int g  = grp & 3;
+        const int mh = grp >> 2;
         const int mr = mh / ih_cnt;
-        const int h = mh - mr * ih_cnt;
-        const uint32_t* qp = reinterpret_cast<const uint32_t*>(
-            q_bf16 + (size_t(m_base + mr) * size_t(ih_cnt) + size_t(h)) * 128u);
-        s_q2[mr][h][d2] = qp[d2];
+        const int h  = mh - mr * ih_cnt;
+        const uint4* qp4 = reinterpret_cast<const uint4*>(
+            q_bf16 + (size_t(m_base + mr) * size_t(ih_cnt) + size_t(h)) * 128u + size_t(g) * 32u);
+        const uint4 raw[4] = {qp4[0], qp4[1], qp4[2], qp4[3]};
+        float amax = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            const uint32_t bw[4] = {raw[w].x, raw[w].y, raw[w].z, raw[w].w};
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                amax = fmaxf(amax, fabsf(__uint_as_float(bw[c] << 16)));
+                amax = fmaxf(amax, fabsf(__uint_as_float(bw[c] & 0xFFFF0000u)));
+            }
+        }
+        float gsc = 1.0f;
+        float inv_gsc = 1.0f;
+        if (amax > 0.0f) {
+            uint32_t eb = __float_as_uint(amax) & 0x7F800000u;
+            eb = max(0x01000000u, min(0x7E800000u, eb));
+            gsc     = __uint_as_float(eb);
+            inv_gsc = __uint_as_float(0x7F000000u - eb);
+        }
+        s_q_gsc[mr][h][g] = gsc;
+        #pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            const uint32_t bw[4] = {raw[w].x, raw[w].y, raw[w].z, raw[w].w};
+            uint32_t pk[4];
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                const float f0 = __uint_as_float(bw[c] << 16) * inv_gsc;
+                const float f1 = __uint_as_float(bw[c] & 0xFFFF0000u) * inv_gsc;
+                pk[c] = uint32_t(d_f32_to_fp16_bits(f0)) | (uint32_t(d_f32_to_fp16_bits(f1)) << 16);
+            }
+            s_q4[mr][h][g * 4 + w] = make_uint4(pk[0], pk[1], pk[2], pk[3]);
+        }
     }
     if (tid < m_rows * ih_cnt) {
         const int mr = tid / ih_cnt;
-        const int h = tid - mr * ih_cnt;
+        const int h  = tid - mr * ih_cnt;
         s_w[mr][h] = d_bf16_to_f32(weights_bf16[size_t(m_base + mr) * size_t(ih_cnt) + size_t(h)]) * 0.015625f;
     }
     __syncthreads();
@@ -2561,62 +2600,75 @@ void k_indexer_score_msplit(
     if (t >= T_comp) return;
 
     const uint32_t sc4 = *reinterpret_cast<const uint32_t*>(k_ue8m0 + size_t(t) * 4u);
-    const uint4* kp4 = reinterpret_cast<const uint4*>(k_fp4 + size_t(t) * 64u);
+    const uint4* kp4   = reinterpret_cast<const uint4*>(k_fp4 + size_t(t) * 64u);
+    const uint4 kr0 = kp4[0], kr1 = kp4[1], kr2 = kp4[2], kr3 = kp4[3];
 
-    float dots[MAX_M][11];
-    #pragma unroll
-    for (int mr = 0; mr < MAX_M; ++mr) {
+    constexpr int BM = (MAX_M < 4) ? MAX_M : 4;
+    for (int mb = 0; mb < m_rows; mb += BM) {
+        float dots[BM][11];
         #pragma unroll
-        for (int h = 0; h < 11; ++h) dots[mr][h] = 0.0f;
-    }
+        for (int mi = 0; mi < BM; ++mi) {
+            #pragma unroll
+            for (int h = 0; h < 11; ++h) dots[mi][h] = 0.0f;
+        }
 
-    #pragma unroll 1
-    for (int g = 0; g < 4; ++g) {
-        const float sc = d_ue8m0_to_f32(uint8_t((sc4 >> (g * 8)) & 0xFFu));
-        const uint4 q16 = kp4[g];
         #pragma unroll 1
-        for (int w = 0; w < 4; ++w) {
-            const uint32_t pk = (w == 0) ? q16.x : ((w == 1) ? q16.y : ((w == 2) ? q16.z : q16.w));
-            const int d2_base = g * 16 + w * 4;
-            const float kv0 = d_fp4_e2m1_to_f32(uint8_t((pk >>  0) & 0xFu)) * sc;
-            const float kv1 = d_fp4_e2m1_to_f32(uint8_t((pk >>  4) & 0xFu)) * sc;
-            const float kv2 = d_fp4_e2m1_to_f32(uint8_t((pk >>  8) & 0xFu)) * sc;
-            const float kv3 = d_fp4_e2m1_to_f32(uint8_t((pk >> 12) & 0xFu)) * sc;
-            const float kv4 = d_fp4_e2m1_to_f32(uint8_t((pk >> 16) & 0xFu)) * sc;
-            const float kv5 = d_fp4_e2m1_to_f32(uint8_t((pk >> 20) & 0xFu)) * sc;
-            const float kv6 = d_fp4_e2m1_to_f32(uint8_t((pk >> 24) & 0xFu)) * sc;
-            const float kv7 = d_fp4_e2m1_to_f32(uint8_t((pk >> 28) & 0xFu)) * sc;
+        for (int g = 0; g < 4; ++g) {
+            const float k_sc = d_ue8m0_to_f32(uint8_t((sc4 >> (g * 8)) & 0xFFu));
+            const uint4 q16  = (g == 0) ? kr0 : ((g == 1) ? kr1 : ((g == 2) ? kr2 : kr3));
+            const uint32_t kw[4] = {q16.x, q16.y, q16.z, q16.w};
+            f16x2_t kv[16];
+            #pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                const uint32_t u0 = s_fp4x2_lut[ kw[w]        & 0xFFu];
+                const uint32_t u1 = s_fp4x2_lut[(kw[w] >>  8) & 0xFFu];
+                const uint32_t u2 = s_fp4x2_lut[(kw[w] >> 16) & 0xFFu];
+                const uint32_t u3 = s_fp4x2_lut[(kw[w] >> 24) & 0xFFu];
+                __builtin_memcpy(&kv[w * 4 + 0], &u0, 4);
+                __builtin_memcpy(&kv[w * 4 + 1], &u1, 4);
+                __builtin_memcpy(&kv[w * 4 + 2], &u2, 4);
+                __builtin_memcpy(&kv[w * 4 + 3], &u3, 4);
+            }
 
             #pragma unroll
-            for (int mr = 0; mr < MAX_M; ++mr) {
+            for (int mi = 0; mi < BM; ++mi) {
+                const int mr = mb + mi;
                 if (mr < m_rows) {
                     #pragma unroll
                     for (int h = 0; h < 11; ++h) {
                         if (h < ih_cnt) {
-                            const uint32_t qp0 = s_q2[mr][h][d2_base + 0];
-                            const uint32_t qp1 = s_q2[mr][h][d2_base + 1];
-                            const uint32_t qp2 = s_q2[mr][h][d2_base + 2];
-                            const uint32_t qp3 = s_q2[mr][h][d2_base + 3];
-                            dots[mr][h] += __uint_as_float(qp0 << 16) * kv0 + __uint_as_float(qp0 & 0xFFFF0000u) * kv1 +
-                                           __uint_as_float(qp1 << 16) * kv2 + __uint_as_float(qp1 & 0xFFFF0000u) * kv3 +
-                                           __uint_as_float(qp2 << 16) * kv4 + __uint_as_float(qp2 & 0xFFFF0000u) * kv5 +
-                                           __uint_as_float(qp3 << 16) * kv6 + __uint_as_float(qp3 & 0xFFFF0000u) * kv7;
+                            float sub = 0.0f;
+                            #pragma unroll
+                            for (int w = 0; w < 4; ++w) {
+                                const uint4 qv4 = s_q4[mr][h][g * 4 + w];
+                                f16x2_t qv0, qv1, qv2, qv3;
+                                __builtin_memcpy(&qv0, &qv4.x, 4);
+                                __builtin_memcpy(&qv1, &qv4.y, 4);
+                                __builtin_memcpy(&qv2, &qv4.z, 4);
+                                __builtin_memcpy(&qv3, &qv4.w, 4);
+                                sub = __builtin_amdgcn_fdot2(qv0, kv[w * 4 + 0], sub, false);
+                                sub = __builtin_amdgcn_fdot2(qv1, kv[w * 4 + 1], sub, false);
+                                sub = __builtin_amdgcn_fdot2(qv2, kv[w * 4 + 2], sub, false);
+                                sub = __builtin_amdgcn_fdot2(qv3, kv[w * 4 + 3], sub, false);
+                            }
+                            dots[mi][h] += sub * (k_sc * s_q_gsc[mr][h][g]);
                         }
                     }
                 }
             }
         }
-    }
 
-    #pragma unroll
-    for (int mr = 0; mr < MAX_M; ++mr) {
-        if (mr < m_rows) {
-            float total = 0.0f;
-            #pragma unroll
-            for (int h = 0; h < 11; ++h) {
-                if (h < ih_cnt) total += fmaxf(dots[mr][h], 0.0f) * s_w[mr][h];
+        #pragma unroll
+        for (int mi = 0; mi < BM; ++mi) {
+            const int mr = mb + mi;
+            if (mr < m_rows) {
+                float total = 0.0f;
+                #pragma unroll
+                for (int h = 0; h < 11; ++h) {
+                    if (h < ih_cnt) total += fmaxf(dots[mi][h], 0.0f) * s_w[mr][h];
+                }
+                out_score[size_t(m_base + mr) * size_t(T_comp) + size_t(t)] = total;
             }
-            out_score[size_t(m_base + mr) * size_t(T_comp) + size_t(t)] = total;
         }
     }
 }
@@ -3401,10 +3453,386 @@ void k_sparse_attn_splitk(
     }
 }
 
-// Combine 8 Split-K partials + attention sink -> out_o_bf16 [M, h_cnt, 512]
+__device__ __forceinline__ int d_lower_bound_s32(const int32_t* arr, int n, int32_t target) {
+    int lo = 0, hi = n;
+    while (lo < hi) {
+        const int mid = (lo + hi) >> 1;
+        if (arr[mid] < target) lo = mid + 1;
+        else                   hi = mid;
+    }
+    return lo;
+}
+
+__device__ __forceinline__ int d_lower_bound_stride8_s32(const int32_t* arr, int n_blk, int32_t target) {
+    int lo = 0, hi = n_blk;
+    while (lo < hi) {
+        const int mid = (lo + hi) >> 1;
+        if (arr[mid << 3] < target) lo = mid + 1;
+        else                        hi = mid;
+    }
+    return lo;
+}
+
+__device__ __forceinline__ void d_sparse_attn_step_1kv_reg2q(
+    const float (&q0_reg)[16],
+    const float (&q1_reg)[16],
+    float (&acc0)[16],
+    float (&acc1)[16],
+    float& m_max0, float& l_sum0,
+    float& m_max1, float& l_sum1,
+    const uint32_t* kv_pak_slot,
+    int d_lane, uint32_t qs)
+{
+    constexpr float kScale = 0.04419417382415922f;
+    float dot0 = 0.0f, dot1 = 0.0f;
+    #pragma unroll
+    for (int p = 0; p < 8; ++p) {
+        const uint32_t u = kv_pak_slot[p * 32 + d_lane];
+        const float k0 = __uint_as_float(u << 16);
+        const float k1 = __uint_as_float(u & 0xFFFF0000u);
+        dot0 += q0_reg[2 * p + 0] * k0 + q0_reg[2 * p + 1] * k1;
+        dot1 += q1_reg[2 * p + 0] * k0 + q1_reg[2 * p + 1] * k1;
+    }
+    float w0 = 0.0f, w1 = 0.0f;
+    if (qs & 1u) {
+        dot0 = d_subwave_sum32(dot0) * kScale;
+        if (dot0 <= m_max0) {
+            const float p = __expf(dot0 - m_max0);
+            l_sum0 += p;
+            w0 = d_bf16_to_f32(d_f32_to_bf16_rne(p));
+        } else {
+            const float alpha = __expf(m_max0 - dot0);
+            l_sum0 = l_sum0 * alpha + 1.0f;
+            #pragma unroll
+            for (int j = 0; j < 16; ++j) acc0[j] *= alpha;
+            m_max0 = dot0;
+            w0 = 1.0f;
+        }
+    }
+    if (qs & 2u) {
+        dot1 = d_subwave_sum32(dot1) * kScale;
+        if (dot1 <= m_max1) {
+            const float p = __expf(dot1 - m_max1);
+            l_sum1 += p;
+            w1 = d_bf16_to_f32(d_f32_to_bf16_rne(p));
+        } else {
+            const float alpha = __expf(m_max1 - dot1);
+            l_sum1 = l_sum1 * alpha + 1.0f;
+            #pragma unroll
+            for (int j = 0; j < 16; ++j) acc1[j] *= alpha;
+            m_max1 = dot1;
+            w1 = 1.0f;
+        }
+    }
+    #pragma unroll
+    for (int p = 0; p < 8; ++p) {
+        const uint32_t u = kv_pak_slot[p * 32 + d_lane];
+        const float k0 = __uint_as_float(u << 16);
+        const float k1 = __uint_as_float(u & 0xFFFF0000u);
+        acc0[2 * p + 0] += w0 * k0;
+        acc0[2 * p + 1] += w0 * k1;
+        acc1[2 * p + 0] += w1 * k0;
+        acc1[2 * p + 1] += w1 * k1;
+    }
+}
+
+// Wave 8.4D Zero-Extra-Launch Fused 2-Query x 8-Head Shared-Prefix CSA2 10-Split Kernel (120 CTAs = exact 2 CTAs/CU on 60 CUs, ScratchSize == 0!):
+//   Wave-0 64-lane __ballot + __popcll block-8 merge (1 barrier, 0 atomics, 0 global traffic) with general 512-slot fallback +
+//   100% Register Q0/Q1 + unrolled branch-free dual-query online softmax + 100% 1-cycle DPP d_subwave_sum32!
+template <int kSplits = 10>
+__global__ __launch_bounds__(256, 2)
+void k_sparse_attn_shared_tree8_splitk(
+    const uint16_t* __restrict__ q_bf16,        // [M, h_cnt, 512]
+    const uint16_t* __restrict__ win_kv_ring,   // [128, 512]
+    const uint16_t* __restrict__ cur_kv_bf16,   // [M, 512]
+    int start_pos,
+    int swa_floor_pos,
+    const uint8_t*  __restrict__ comp_fp4,
+    const uint8_t*  __restrict__ comp_e4m3,
+    const int32_t*  __restrict__ comp_idxs,     // [M, n_comp] sorted ascending per query
+    int n_comp,
+    float*          __restrict__ split_scratch, // [M, kSplits, h_cnt, 514]
+    int M, int h_cnt,
+    TreeAncMask256 tree_anc_mask,
+    uint64_t tree_depth_nibbles,
+    const uint8_t*  __restrict__ ext_comp_fp4,
+    const uint8_t*  __restrict__ ext_comp_e4m3,
+    int hot_comp_cap)
+{
+    __shared__ uint32_t s_kv_pak[8][256];   // 8.0 KiB: 8 unique KV slots per iteration
+    __shared__ uint32_t s_union[1024];      // 4.0 KiB: merged unique (kv_idx << 2) | qmask2 (blocks if use_blk8, else slots)
+    __shared__ int32_t  s_a[512];           // 2.0 KiB: query m0 sorted indices
+    __shared__ int32_t  s_b[512];           // 2.0 KiB: query m1 sorted indices
+    __shared__ uint16_t s_lut[256];         // 0.5 KiB: E4M3 LUT
+    __shared__ uint32_t s_not_dup[16];      // 64 B: fallback slot bitmask
+    __shared__ int32_t  s_b_pref[17];       // 68 B: fallback exclusive popcount prefix
+    __shared__ int32_t  s_na_nb[2];         // 8 B
+    __shared__ uint32_t s_wave_ok[4];       // 16 B: block-8 alignment check per wave
+    __shared__ uint32_t s_qmask[8];         // 32 B (total LDS = 16.68 KiB <= 21.3 KiB!)
+
+    const int qb      = int(blockIdx.x);
+    const int m0      = qb * 2;
+    const int m1      = m0 + 1;
+    const bool has_m1 = (m1 < M);
+    const int h_base  = int(blockIdx.y) * 8;
+    const int split   = int(blockIdx.z); // 0..kSplits-1
+    const int tid     = int(threadIdx.x); // 0..255
+    const int h_local = tid >> 5;         // 0..7
+    const int d_lane  = tid & 31;         // 0..31
+    const int h       = h_base + h_local;
+
+    s_lut[tid] = d_fp8_e4m3_to_fp16_bits(uint8_t(tid));
+    if (tid < 16) s_not_dup[tid] = 0u;
+    if (tid < 2)  s_na_nb[tid] = 0;
+
+    const bool do_comp = (n_comp > 0 && n_comp <= 512 && comp_fp4 != nullptr && comp_e4m3 != nullptr && comp_idxs != nullptr);
+    bool ok_lane = do_comp && ((n_comp & 7) == 0);
+    if (do_comp) {
+        const int32_t* row0 = comp_idxs + size_t(m0) * size_t(n_comp);
+        const int32_t* row1 = has_m1 ? (comp_idxs + size_t(m1) * size_t(n_comp)) : nullptr;
+        for (int base_i = 0; base_i < n_comp; base_i += 256) {
+            const int i = base_i + tid;
+            const int32_t va = (i < n_comp) ? row0[i] : -1;
+            const int32_t vb = (row1 && i < n_comp) ? row1[i] : -1;
+            if (i < n_comp) {
+                s_a[i] = va;
+                s_b[i] = vb;
+            }
+            const int32_t ba0 = __shfl(va, 0, 8);
+            const int32_t bb0 = __shfl(vb, 0, 8);
+            if (i < n_comp) {
+                if (ba0 < 0 ? (va >= 0) : (va != ba0 + (i & 7))) ok_lane = false;
+                if (has_m1 && (bb0 < 0 ? (vb >= 0) : (vb != bb0 + (i & 7)))) ok_lane = false;
+            }
+        }
+    }
+    const unsigned long long bad_mask = __ballot(!ok_lane);
+    if ((tid & 63) == 0) s_wave_ok[tid >> 6] = (bad_mask == 0ULL) ? 1u : 0u;
+    __syncthreads();
+
+    bool use_blk8 = false;
+    int u_count = 0;
+    int comp_groups = 0;
+    if (do_comp) {
+        use_blk8 = ((s_wave_ok[0] & s_wave_ok[1] & s_wave_ok[2] & s_wave_ok[3]) != 0u);
+        if (use_blk8) {
+            if (tid < 64) {
+                const int n_blks = n_comp >> 3;
+                const int32_t va = (tid < n_blks) ? s_a[tid << 3] : -1;
+                const int32_t vb = (has_m1 && tid < n_blks) ? s_b[tid << 3] : -1;
+                const int na_b = __popcll(__ballot(va >= 0));
+                const int nb_b = __popcll(__ballot(vb >= 0));
+                bool b_not_in_a = false;
+                if (tid < nb_b) {
+                    const int la = d_lower_bound_stride8_s32(s_a, na_b, vb);
+                    b_not_in_a = !(la < na_b && s_a[la << 3] == vb);
+                }
+                const unsigned long long not_dup64 = __ballot(b_not_in_a);
+                if (tid < na_b) {
+                    const int lb = d_lower_bound_stride8_s32(s_b, nb_b, va);
+                    const bool in_b = (lb < nb_b && s_b[lb << 3] == va);
+                    const unsigned long long mask_lt = (lb >= 64) ? ~0ULL : ((1ULL << lb) - 1ULL);
+                    const int uniq_b_lt = __popcll(not_dup64 & mask_lt);
+                    s_union[tid + uniq_b_lt] = (uint32_t(va) << 2) | (in_b ? 3u : 1u);
+                }
+                if (b_not_in_a) {
+                    const int la = d_lower_bound_stride8_s32(s_a, na_b, vb);
+                    const unsigned long long mask_lt = (1ULL << tid) - 1ULL;
+                    const int uniq_b_lt = __popcll(not_dup64 & mask_lt);
+                    s_union[la + uniq_b_lt] = (uint32_t(vb) << 2) | 2u;
+                }
+                if (tid == 0) s_na_nb[0] = na_b + __popcll(not_dup64);
+            }
+            __syncthreads();
+            comp_groups = s_na_nb[0];
+            u_count = comp_groups << 3;
+        } else {
+            if (tid == 0) {
+                int lo = 0, hi = n_comp;
+                while (lo < hi) {
+                    const int mid = (lo + hi) >> 1;
+                    if (s_a[mid] >= 0) lo = mid + 1;
+                    else               hi = mid;
+                }
+                s_na_nb[0] = lo;
+            } else if (tid == 1) {
+                int lo = 0, hi = has_m1 ? n_comp : 0;
+                while (lo < hi) {
+                    const int mid = (lo + hi) >> 1;
+                    if (s_b[mid] >= 0) lo = mid + 1;
+                    else               hi = mid;
+                }
+                s_na_nb[1] = lo;
+            }
+            __syncthreads();
+
+            const int na = s_na_nb[0];
+            const int nb = s_na_nb[1];
+            for (int j = tid; j < nb; j += 256) {
+                const int32_t v = s_b[j];
+                const int la = d_lower_bound_s32(s_a, na, v);
+                if (!(la < na && s_a[la] == v)) {
+                    atomicOr(&s_not_dup[j >> 5], 1u << (j & 31));
+                }
+            }
+            __syncthreads();
+
+            if (tid < 17) {
+                int acc = 0;
+                for (int w = 0; w < tid; ++w) acc += __popc(s_not_dup[w]);
+                s_b_pref[tid] = acc;
+            }
+            __syncthreads();
+
+            u_count = na + s_b_pref[16];
+            comp_groups = (u_count + 7) >> 3;
+            for (int i = tid; i < na; i += 256) {
+                const int32_t v = s_a[i];
+                const int lb = d_lower_bound_s32(s_b, nb, v);
+                const bool in_b = (lb < nb && s_b[lb] == v);
+                const int uniq_b_lt = s_b_pref[lb >> 5] + __popc(s_not_dup[lb >> 5] & ((1u << (lb & 31)) - 1u));
+                s_union[i + uniq_b_lt] = (uint32_t(v) << 2) | (in_b ? 3u : 1u);
+            }
+            for (int j = tid; j < nb; j += 256) {
+                if ((s_not_dup[j >> 5] >> (j & 31)) & 1u) {
+                    const int32_t v = s_b[j];
+                    const int la = d_lower_bound_s32(s_a, na, v);
+                    const int uniq_b_lt = s_b_pref[j >> 5] + __popc(s_not_dup[j >> 5] & ((1u << (j & 31)) - 1u));
+                    s_union[la + uniq_b_lt] = (uint32_t(v) << 2) | 2u;
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    float q0_reg[16], q1_reg[16];
+    float acc0[16], acc1[16];
+    #pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        acc0[j] = 0.0f;
+        acc1[j] = 0.0f;
+        q0_reg[j] = (h < h_cnt)
+            ? d_bf16_to_f32(q_bf16[(size_t(m0) * size_t(h_cnt) + size_t(h)) * 512u + d_lane * 16 + j])
+            : 0.0f;
+        q1_reg[j] = (has_m1 && h < h_cnt)
+            ? d_bf16_to_f32(q_bf16[(size_t(m1) * size_t(h_cnt) + size_t(h)) * 512u + d_lane * 16 + j])
+            : 0.0f;
+    }
+
+    const bool has_tree = tree_anc_mask.active();
+    const int qp0 = has_tree ? (start_pos + d_tree_nibble64(tree_depth_nibbles, m0)) : (start_pos + m0);
+    const int wf0 = max(swa_floor_pos, max(0, qp0 - 127));
+    const uint32_t anc0 = has_tree ? d_tree_anc_row16(tree_anc_mask, m0) : 0u;
+
+    const int qp1 = has_m1 ? (has_tree ? (start_pos + d_tree_nibble64(tree_depth_nibbles, m1)) : (start_pos + m1)) : qp0;
+    const int wf1 = has_m1 ? max(swa_floor_pos, max(0, qp1 - 127)) : wf0;
+    const uint32_t anc1 = (has_m1 && has_tree) ? d_tree_anc_row16(tree_anc_mask, m1) : 0u;
+
+    const int min_wf       = min(wf0, wf1);
+    const int hist_valid   = max(0, start_pos - min_wf);
+    const int cur_lim      = has_tree ? M : (has_m1 ? (m1 + 1) : (m0 + 1));
+    const int n_win_all    = hist_valid + cur_lim;
+    const int win_groups   = (n_win_all + 7) >> 3;
+    const int total_groups = win_groups + comp_groups;
+
+    const int g_begin = (total_groups * split) / kSplits;
+    const int g_end   = (total_groups * (split + 1)) / kSplits;
+
+    float m_max0 = -1e30f, l_sum0 = 0.0f;
+    float m_max1 = -1e30f, l_sum1 = 0.0f;
+
+    for (int g_idx = g_begin; g_idx < g_end; ++g_idx) {
+        const int slot = h_local; // 0..7
+        if (g_idx < win_groups) {
+            const int kv_ord = g_idx * 8 + slot;
+            uint32_t qmask = 0u;
+            if (kv_ord < n_win_all) {
+                if (kv_ord < hist_valid) {
+                    const int p = min_wf + kv_ord;
+                    if (p >= wf0 && p <= qp0) qmask |= 1u;
+                    if (has_m1 && p >= wf1 && p <= qp1) qmask |= 2u;
+                    if (qmask != 0u) {
+                        const uint16_t* src = win_kv_ring + size_t(p & 127) * 512u + d_lane * 16;
+                        d_load_win_kv_pak(src, d_lane, s_kv_pak[slot]);
+                    }
+                } else {
+                    const int j = kv_ord - hist_valid;
+                    const int j_pos = has_tree
+                        ? (start_pos + d_tree_nibble64(tree_depth_nibbles, j))
+                        : (start_pos + j);
+                    if (j_pos >= wf0 && (has_tree ? (((anc0 >> j) & 1u) != 0u) : (j <= m0))) qmask |= 1u;
+                    if (has_m1 && j_pos >= wf1 && (has_tree ? (((anc1 >> j) & 1u) != 0u) : (j <= m1))) qmask |= 2u;
+                    if (qmask != 0u) {
+                        const uint16_t* src = cur_kv_bf16 + size_t(j) * 512u + d_lane * 16;
+                        d_load_win_kv_pak(src, d_lane, s_kv_pak[slot]);
+                    }
+                }
+            }
+            if (d_lane == 0) s_qmask[slot] = qmask;
+        } else if (use_blk8) {
+            const uint32_t pk = s_union[g_idx - win_groups];
+            const int32_t kv_idx = int32_t(pk >> 2) + slot;
+            const uint32_t qm = pk & 0x3u;
+            if (d_lane == 0) s_qmask[slot] = qm;
+            if (qm != 0u) {
+                d_load_comp_kv_pak(comp_fp4, comp_e4m3, ext_comp_fp4, ext_comp_e4m3, hot_comp_cap,
+                                   s_lut, kv_idx, d_lane, s_kv_pak[slot]);
+            }
+        } else {
+            const int u_idx = (g_idx - win_groups) * 8 + slot;
+            uint32_t qmask = 0u;
+            int32_t kv_idx = -1;
+            if (u_idx < u_count) {
+                const uint32_t pk = s_union[u_idx];
+                kv_idx = int32_t(pk >> 2);
+                qmask  = pk & 0x3u;
+            }
+            if (d_lane == 0) s_qmask[slot] = qmask;
+            if (qmask != 0u && kv_idx >= 0) {
+                d_load_comp_kv_pak(comp_fp4, comp_e4m3, ext_comp_fp4, ext_comp_e4m3, hot_comp_cap,
+                                   s_lut, kv_idx, d_lane, s_kv_pak[slot]);
+            }
+        }
+        __syncthreads();
+
+        if (h < h_cnt) {
+            #pragma unroll 1
+            for (int t = 0; t < 8; ++t) {
+                const uint32_t qs = s_qmask[t];
+                if (qs != 0u) {
+                    d_sparse_attn_step_1kv_reg2q(q0_reg, q1_reg, acc0, acc1, m_max0, l_sum0, m_max1, l_sum1,
+                                                 s_kv_pak[t], d_lane, qs);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (h < h_cnt) {
+        float* dst0 = split_scratch + ((size_t(m0) * size_t(kSplits) + size_t(split)) * size_t(h_cnt) + size_t(h)) * 514u;
+        #pragma unroll
+        for (int j = 0; j < 16; ++j) dst0[d_lane * 16 + j] = acc0[j];
+        if (d_lane == 0) {
+            dst0[512] = m_max0;
+            dst0[513] = l_sum0;
+        }
+        if (has_m1) {
+            float* dst1 = split_scratch + ((size_t(m1) * size_t(kSplits) + size_t(split)) * size_t(h_cnt) + size_t(h)) * 514u;
+            #pragma unroll
+            for (int j = 0; j < 16; ++j) dst1[d_lane * 16 + j] = acc1[j];
+            if (d_lane == 0) {
+                dst1[512] = m_max1;
+                dst1[513] = l_sum1;
+            }
+        }
+    }
+}
+
+// Combine kSplits (8 or 16) Split-K partials + attention sink -> out_o_bf16 [M, h_cnt, 512]
+template <int kSplits = 8>
 __global__ __launch_bounds__(256)
 void k_sparse_attn_reduce_splits(
-    const float* __restrict__ split_scratch, // [M, 8, h_cnt, 514]
+    const float* __restrict__ split_scratch, // [M, kSplits, h_cnt, 514]
     const float* __restrict__ attn_sink,     // [h_cnt]
     uint16_t*    __restrict__ out_o_bf16,    // [M, h_cnt, 512]
     int h_cnt)
@@ -3415,11 +3843,11 @@ void k_sparse_attn_reduce_splits(
 
     const float sink = attn_sink[h];
     float m_tot = sink;
-    float m_s[8];
-    float l_s[8];
+    float m_s[kSplits];
+    float l_s[kSplits];
     #pragma unroll
-    for (int s = 0; s < 8; ++s) {
-        const float* sp = split_scratch + ((size_t(m) * 8u + size_t(s)) * size_t(h_cnt) + size_t(h)) * 514u;
+    for (int s = 0; s < kSplits; ++s) {
+        const float* sp = split_scratch + ((size_t(m) * size_t(kSplits) + size_t(s)) * size_t(h_cnt) + size_t(h)) * 514u;
         m_s[s] = sp[512];
         l_s[s] = sp[513];
         if (l_s[s] > 0.0f) m_tot = fmaxf(m_tot, m_s[s]);
@@ -3429,10 +3857,10 @@ void k_sparse_attn_reduce_splits(
     float acc0 = 0.0f;
     float acc1 = 0.0f;
     #pragma unroll
-    for (int s = 0; s < 8; ++s) {
+    for (int s = 0; s < kSplits; ++s) {
         if (l_s[s] > 0.0f) {
             const float sc = __expf(m_s[s] - m_tot);
-            const float* sp = split_scratch + ((size_t(m) * 8u + size_t(s)) * size_t(h_cnt) + size_t(h)) * 514u;
+            const float* sp = split_scratch + ((size_t(m) * size_t(kSplits) + size_t(s)) * size_t(h_cnt) + size_t(h)) * 514u;
             l_tot += l_s[s] * sc;
             acc0 += sp[tid] * sc;
             acc1 += sp[256 + tid] * sc;
@@ -3456,7 +3884,8 @@ void k_moe_gate(
     const uint8_t* __restrict__ image_mask,
     int32_t* __restrict__ out_ids,
     float* __restrict__ out_weights,
-    int n_routed, int top_k, float route_scale)
+    int n_routed, int top_k, float route_scale,
+    const uint16_t* __restrict__ expert_perm_row)
 {
     __shared__ float s_raw[384];
     __shared__ float s_biased[384];
@@ -3496,7 +3925,8 @@ void k_moe_gate(
         }
         const float scale = (top_k > 1) ? (route_scale / (w_sum + 1e-20f)) : route_scale;
         for (int k = 0; k < top_k; ++k) {
-            out_ids[m * top_k + k] = picked_ids[k];
+            const int32_t logical_e = picked_ids[k];
+            out_ids[m * top_k + k] = expert_perm_row ? int32_t(expert_perm_row[logical_e]) : logical_e;
             out_weights[m * top_k + k] = picked_w[k] * scale;
         }
     }
@@ -5495,7 +5925,7 @@ void launch_indexer_score(
         hipLaunchKernelGGL((k_indexer_score_msplit<6>), dim3(tx, 1), dim3(256), 0, stream,
                            d_q_bf16, d_k_fp4, d_k_ue8m0, d_weights_bf16, d_out_score_f32, M, ih_cnt, T_comp);
     } else if (M <= 8) {
-        hipLaunchKernelGGL((k_indexer_score_msplit<4>), dim3(tx, 2), dim3(256), 0, stream,
+        hipLaunchKernelGGL((k_indexer_score_msplit<8>), dim3(tx, 1), dim3(256), 0, stream,
                            d_q_bf16, d_k_fp4, d_k_ue8m0, d_weights_bf16, d_out_score_f32, M, ih_cnt, T_comp);
     } else {
         hipLaunchKernelGGL((k_indexer_score_msplit<6>), dim3(tx, (M + 5) / 6), dim3(256), 0, stream,
@@ -5525,17 +5955,27 @@ void launch_sparse_attn(
     float* d_splitk_scratch,
     uint16_t* d_out_o_bf16, int M, int h_cnt, hipStream_t stream,
     TreeAncMask256 tree_anc_mask, uint64_t tree_depth_nibbles,
-    const uint8_t* d_ext_comp_fp4, const uint8_t* d_ext_comp_e4m3, int hot_comp_cap)
+    const uint8_t* d_ext_comp_fp4, const uint8_t* d_ext_comp_e4m3, int hot_comp_cap,
+    bool csa2_shared_tree8)
 {
     if (M <= 0 || h_cnt <= 0) return;
     const int max_win = std::min(128, std::max(0, start_pos + M - swa_floor_pos));
-    if (M <= 16 && !dspark_bidir && d_splitk_scratch != nullptr && (max_win + n_comp) >= 64) {
+    if (csa2_shared_tree8 && M >= 2 && M <= 8 && n_comp <= 512 && !dspark_bidir && d_splitk_scratch != nullptr && (max_win + n_comp) >= 64) {
+        const uint32_t q_pairs = uint32_t((M + 1) / 2);
+        hipLaunchKernelGGL((k_sparse_attn_shared_tree8_splitk<10>), dim3(q_pairs, (h_cnt + 7) / 8, 10), dim3(256), 0, stream,
+                           d_q_bf16, d_win_kv_ring, d_cur_kv_bf16, start_pos, swa_floor_pos,
+                           d_comp_fp4, d_comp_e4m3, d_comp_idxs, n_comp,
+                           d_splitk_scratch, M, h_cnt, tree_anc_mask, tree_depth_nibbles,
+                           d_ext_comp_fp4, d_ext_comp_e4m3, hot_comp_cap);
+        hipLaunchKernelGGL((k_sparse_attn_reduce_splits<10>), dim3(M, h_cnt), dim3(256), 0, stream,
+                           d_splitk_scratch, d_attn_sink_f32, d_out_o_bf16, h_cnt);
+    } else if (M <= 16 && !dspark_bidir && d_splitk_scratch != nullptr && (max_win + n_comp) >= 64) {
         hipLaunchKernelGGL(k_sparse_attn_splitk, dim3(M, (h_cnt + 7) / 8, 8), dim3(256), 0, stream,
                            d_q_bf16, d_win_kv_ring, d_cur_kv_bf16, start_pos, swa_floor_pos,
                            d_comp_fp4, d_comp_e4m3, d_comp_idxs, n_comp,
                            d_splitk_scratch, h_cnt, tree_anc_mask, tree_depth_nibbles,
                            d_ext_comp_fp4, d_ext_comp_e4m3, hot_comp_cap);
-        hipLaunchKernelGGL(k_sparse_attn_reduce_splits, dim3(M, h_cnt), dim3(256), 0, stream,
+        hipLaunchKernelGGL((k_sparse_attn_reduce_splits<8>), dim3(M, h_cnt), dim3(256), 0, stream,
                            d_splitk_scratch, d_attn_sink_f32, d_out_o_bf16, h_cnt);
     } else if (M > 16 && !dspark_bidir && !tree_anc_mask.active() && h_cnt >= 8) {
         hipLaunchKernelGGL(k_sparse_attn_allheads, dim3(M, (h_cnt + 7) / 8), dim3(256), 0, stream,
@@ -5576,12 +6016,14 @@ void launch_commit_tree_global_kv_and_r2(
 void launch_moe_gate(
     const float* d_logits_f32, const float* d_bias_f32, const float* d_bias_vl_f32,
     const uint8_t* d_image_mask, int32_t* d_out_ids, float* d_out_weights,
-    int M, int n_routed, int top_k, float route_scale, hipStream_t stream)
+    int M, int n_routed, int top_k, float route_scale, hipStream_t stream,
+    const uint16_t* d_expert_perm_row)
 {
     if (M <= 0) return;
     hipLaunchKernelGGL(k_moe_gate, dim3(M), dim3(256), 0, stream,
                        d_logits_f32, d_bias_f32, d_bias_vl_f32, d_image_mask,
-                       d_out_ids, d_out_weights, n_routed, top_k, route_scale);
+                       d_out_ids, d_out_weights, n_routed, top_k, route_scale,
+                       d_expert_perm_row);
 }
 
 __global__ __launch_bounds__(256, 4)

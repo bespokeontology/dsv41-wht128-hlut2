@@ -1,6 +1,6 @@
-# Top-Level Pure-C++ Makefile for DeepSeek-V4.1-Flash-1017 WHT128-HLUT2 (v1.3.0-wave8.3 Canonical)
+# Top-Level Pure-C++ Makefile for DeepSeek-V4.1-Flash-1017 WHT128-HLUT2 (v1.4.0-wave8.4 Canonical)
 # Lead Tier: 2x Tenstorrent Blackhole P150A (p150/) + 3x AMD Instinct MI50 (mi50/) + Offline Tools (tools/)
-# 100% Pure C++17 / gfx906 HIP / TT-Metal C++20 — Zero Python Anywhere.
+# 100% Pure C++17 / gfx906 HIP / TT-Metal C++20 — Zero Python Anywhere (99/99 runtime + ViT gfx906 ScratchSize == 0).
 
 ROOT          := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 BIN_DIR       := $(ROOT)/bin
@@ -20,6 +20,7 @@ TOOLS_BINS := \
 	$(BIN_DIR)/pack_dsv41_hlut2 \
 	$(BIN_DIR)/pack_dsv41_vit \
 	$(BIN_DIR)/repack_hot_experts_rarebal \
+	$(BIN_DIR)/build_wave8_4_expert_perm \
 	$(BIN_DIR)/harvest_rarebal_wave8 \
 	$(BIN_DIR)/bench_hlut2 \
 	$(BIN_DIR)/verify_wave5_all \
@@ -29,6 +30,7 @@ TOOLS_BINS := \
 	$(BIN_DIR)/verify_wave8_1_nvme_kv \
 	$(BIN_DIR)/verify_wave8_1_vit \
 	$(BIN_DIR)/verify_wave8_2_deepinfer \
+	$(BIN_DIR)/verify_wave8_4 \
 	$(BIN_DIR)/test_think_loop_guard \
 	$(BIN_DIR)/test_anthropic_messages_fe \
 	$(BIN_DIR)/dsv41_search_sidecar
@@ -60,6 +62,9 @@ $(BIN_DIR)/pack_dsv41_vit: $(ROOT)/tools/pack_dsv41_vit.cpp $(ROOT)/src/safetens
 	$(CXX) $(TOOL_CXXFLAGS) $< -o $@
 
 $(BIN_DIR)/repack_hot_experts_rarebal: $(ROOT)/tools/repack_hot_experts_rarebal.cpp $(ROOT)/tools/repack_rarebal_helpers.hpp $(ROOT)/src/hlut2_pack.hpp | $(BIN_DIR)
+	$(CXX) $(TOOL_CXXFLAGS) $< -L$(ROCM_PATH)/lib -Wl,-rpath,$(ROCM_PATH)/lib -lamdhip64 -lrocblas -o $@
+
+$(BIN_DIR)/build_wave8_4_expert_perm: $(ROOT)/tools/build_wave8_4_expert_perm.cpp $(ROOT)/tools/repack_rarebal_helpers.hpp $(ROOT)/src/dsv41_wave8_4_repack.hpp $(ROOT)/src/hlut2_pack.hpp | $(BIN_DIR)
 	$(CXX) $(TOOL_CXXFLAGS) $< -L$(ROCM_PATH)/lib -Wl,-rpath,$(ROCM_PATH)/lib -lamdhip64 -lrocblas -o $@
 
 $(BIN_DIR)/bench_hlut2: $(ROOT)/tools/bench_hlut2.cpp $(ROOT)/src/hlut2_pack.hpp | $(BIN_DIR)
@@ -101,6 +106,12 @@ $(BUILD_DIR)/tools/verify_wave8_2_deepinfer.o: $(ROOT)/tools/verify_wave8_2_deep
 $(BIN_DIR)/verify_wave8_2_deepinfer: mi50 $(BUILD_DIR)/tools/verify_wave8_2_deepinfer.o | $(BIN_DIR)
 	$(HIPCC) --gcc-install-dir=$(GCC_DIR) -O3 -std=c++17 --offload-arch=gfx906 $(BUILD_DIR)/tools/verify_wave8_2_deepinfer.o $(BUILD_DIR)/mi50/dsv41_runtime.o $(BUILD_DIR)/mi50/dsv41_vit.o $(BUILD_DIR)/mi50/dsv41_mi50_kernels.o $(BUILD_DIR)/mi50/dsv41_engram_cpu.o $(BUILD_DIR)/mi50/dsv41_tokenizer_dsml.o $(MI50_LDFLAGS) -o $@
 
+$(BUILD_DIR)/mi50/verify_wave8_4.o: $(ROOT)/tools/verify_wave8_4.cpp $(ROOT)/src/dsv41_wave8_4_repack.hpp $(ROOT)/p150/dsv41_p150_l1.hpp $(ROOT)/p150/dsv41_p150_shm.hpp $(ROOT)/mi50/dsv41_mi50_kernels.hpp $(ROOT)/mi50/dsv41_runtime.hpp | $(BUILD_DIR)/mi50
+	$(HIPCC) -x hip $(HIP_CXXFLAGS) -I$(ROOT)/src -I$(ROOT)/mi50 -I$(ROOT)/p150 -Wall -Wextra -Werror -Wno-unused-command-line-argument -c $< -o $@
+
+$(BIN_DIR)/verify_wave8_4: mi50 $(BUILD_DIR)/mi50/verify_wave8_4.o | $(BIN_DIR)
+	$(HIPCC) --gcc-install-dir=$(GCC_DIR) -O3 -std=c++17 --offload-arch=gfx906 $(BUILD_DIR)/mi50/verify_wave8_4.o $(BUILD_DIR)/mi50/dsv41_runtime.o $(BUILD_DIR)/mi50/dsv41_vit.o $(BUILD_DIR)/mi50/dsv41_mi50_kernels.o $(BUILD_DIR)/mi50/dsv41_engram_cpu.o $(BUILD_DIR)/mi50/dsv41_tokenizer_dsml.o $(MI50_LDFLAGS) -o $@
+
 $(BUILD_DIR)/tools/harvest_rarebal_wave8.o: $(ROOT)/tools/harvest_rarebal_wave8.cpp $(ROOT)/mi50/dsv41_runtime.hpp | $(BUILD_DIR)/tools
 	$(CXX) $(TOOL_CXXFLAGS) -c $< -o $@
 
@@ -123,30 +134,38 @@ check: mi50 $(TOOLS_BINS) audit-gfx906
 	$(BIN_DIR)/verify_wave5_all
 	$(BIN_DIR)/verify_wave6_math
 	$(BIN_DIR)/verify_wave7_opt
+	$(BIN_DIR)/verify_wave8_4 --link-check
 	$(BIN_DIR)/test_think_loop_guard
 	$(BIN_DIR)/test_anthropic_messages_fe
+	$(BIN_DIR)/build_wave8_4_expert_perm --link-check
 	$(BIN_DIR)/harvest_rarebal_wave8 --link-check
 	$(BIN_DIR)/pack_dsv41_vit --link-check
 	$(BIN_DIR)/dsv41_search_sidecar --link-check
 	$(BIN_DIR)/dsv41_fe --link-check
 
-check-gpu: $(BIN_DIR)/verify_wave8_opt $(BIN_DIR)/verify_wave8_1_nvme_kv $(BIN_DIR)/verify_wave8_1_vit $(BIN_DIR)/verify_wave8_2_deepinfer
+check-gpu: $(BIN_DIR)/verify_wave8_opt $(BIN_DIR)/verify_wave8_1_nvme_kv $(BIN_DIR)/verify_wave8_1_vit $(BIN_DIR)/verify_wave8_2_deepinfer $(BIN_DIR)/verify_wave8_4
 	$(BIN_DIR)/verify_wave8_opt
 	$(BIN_DIR)/verify_wave8_1_nvme_kv
 	$(BIN_DIR)/verify_wave8_1_vit
 	$(BIN_DIR)/verify_wave8_2_deepinfer
+	$(BIN_DIR)/verify_wave8_4
 
+# Zero-Scratch gfx906 ISA Audit: verifies 99/99 runtime + ViT kernels, 3/3 verify8 kernels, and 1/1 verify8_4 kernel at ScratchSize == 0
 audit-gfx906: | $(BUILD_DIR)/tools
 	$(HIPCC) $(HIP_CXXFLAGS) -S $(ROOT)/mi50/dsv41_mi50_kernels.hip -o $(BUILD_DIR)/tools/wave8_gfx906.s
 	$(HIPCC) -x hip $(HIP_CXXFLAGS) -S $(ROOT)/tools/verify_wave8_opt.cpp -o $(BUILD_DIR)/tools/verify_wave8_gfx906.s
+	$(HIPCC) -x hip $(HIP_CXXFLAGS) -I$(ROOT)/src -I$(ROOT)/mi50 -I$(ROOT)/p150 -S $(ROOT)/tools/verify_wave8_4.cpp -o $(BUILD_DIR)/tools/verify_wave8_4_gfx906.s
 	@echo "Total runtime gfx906 kernels: $$(grep -cE 'ScratchSize:[[:space:]]+' $(BUILD_DIR)/tools/wave8_gfx906.s)"
 	@echo "Zero-scratch runtime kernels: $$(grep -cE 'ScratchSize:[[:space:]]+0$$' $(BUILD_DIR)/tools/wave8_gfx906.s)"
 	@echo "Total verify8 gfx906 kernels: $$(grep -cE 'ScratchSize:[[:space:]]+' $(BUILD_DIR)/tools/verify_wave8_gfx906.s)"
 	@echo "Zero-scratch verify8 kernels: $$(grep -cE 'ScratchSize:[[:space:]]+0$$' $(BUILD_DIR)/tools/verify_wave8_gfx906.s)"
-	@echo "Device trig instructions (v_sin_f32/v_cos_f32): $$(grep -cE 'v_sin_f32|v_cos_f32' $(BUILD_DIR)/tools/wave8_gfx906.s $(BUILD_DIR)/tools/verify_wave8_gfx906.s | awk -F: '{s+=$$NF} END {print s+0}')"
+	@echo "Total verify8_4 gfx906 kernels: $$(grep -cE 'ScratchSize:[[:space:]]+' $(BUILD_DIR)/tools/verify_wave8_4_gfx906.s)"
+	@echo "Zero-scratch verify8_4 kernels: $$(grep -cE 'ScratchSize:[[:space:]]+0$$' $(BUILD_DIR)/tools/verify_wave8_4_gfx906.s)"
+	@echo "Device trig instructions (v_sin_f32/v_cos_f32): $$(grep -cE 'v_sin_f32|v_cos_f32' $(BUILD_DIR)/tools/wave8_gfx906.s $(BUILD_DIR)/tools/verify_wave8_gfx906.s $(BUILD_DIR)/tools/verify_wave8_4_gfx906.s | awk -F: '{s+=$$NF} END {print s+0}')"
 	@test "$$(grep -cE 'ScratchSize:[[:space:]]+' $(BUILD_DIR)/tools/wave8_gfx906.s)" -eq "$$(grep -cE 'ScratchSize:[[:space:]]+0$$' $(BUILD_DIR)/tools/wave8_gfx906.s)"
 	@test "$$(grep -cE 'ScratchSize:[[:space:]]+' $(BUILD_DIR)/tools/verify_wave8_gfx906.s)" -eq "$$(grep -cE 'ScratchSize:[[:space:]]+0$$' $(BUILD_DIR)/tools/verify_wave8_gfx906.s)"
-	@! grep -qE "v_sin_f32|v_cos_f32" $(BUILD_DIR)/tools/wave8_gfx906.s $(BUILD_DIR)/tools/verify_wave8_gfx906.s
+	@test "$$(grep -cE 'ScratchSize:[[:space:]]+' $(BUILD_DIR)/tools/verify_wave8_4_gfx906.s)" -eq "$$(grep -cE 'ScratchSize:[[:space:]]+0$$' $(BUILD_DIR)/tools/verify_wave8_4_gfx906.s)"
+	@! grep -qE "v_sin_f32|v_cos_f32" $(BUILD_DIR)/tools/wave8_gfx906.s $(BUILD_DIR)/tools/verify_wave8_gfx906.s $(BUILD_DIR)/tools/verify_wave8_4_gfx906.s
 	@! grep -rn "hipDeviceEnablePeerAccess" $(ROOT)/mi50 $(ROOT)/src $(ROOT)/p150 $(ROOT)/tools
 	@test "$$(find $(ROOT) -not -path '$(ROOT)/.git*' -name '*.py' -print | wc -l)" -eq 0
 

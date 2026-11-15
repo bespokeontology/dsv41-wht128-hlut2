@@ -449,7 +449,8 @@ void launch_sparse_attn(
     uint64_t tree_depth_nibbles = 0ULL,
     const uint8_t* d_ext_comp_fp4 = nullptr,
     const uint8_t* d_ext_comp_e4m3 = nullptr,
-    int hot_comp_cap = 0x7FFFFFFF);
+    int hot_comp_cap = 0x7FFFFFFF,
+    bool csa2_shared_tree8 = false);
 
 // Accepted-branch gather & Global KV / r=2 state compaction for M <= 16 causal-tree verification (0 extra HBM2!)
 void launch_commit_tree_win_kv_and_hidden(
@@ -478,7 +479,8 @@ void launch_moe_gate(
     int32_t* d_out_ids,           // [M, top_k]
     float* d_out_weights,         // [M, top_k]
     int M, int n_routed, int top_k, float route_scale,
-    hipStream_t stream);
+    hipStream_t stream,
+    const uint16_t* d_expert_perm_row = nullptr);
 
 // Wave 8A Direct GPU->PCIe->/dev/shm Fast-Ring Stager & Doorbell Armer (zero host sync / zero CPU relay!)
 void launch_stage_and_arm_p150_shm(

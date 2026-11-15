@@ -81,9 +81,9 @@ void kernel_main() {
     const uint32_t cent_l1       = scratch_ptr + 640u;
     const uint32_t raw_scales_0  = scratch_ptr + 704u;
     const uint32_t col_tile_base = nb4 * 4u;
-    uint32_t ring_half           = 0u;
-    bool tail_zeroed[2]          = {false, false};
-    bool full_zeroed[2]          = {false, false};
+    uint32_t cb_wr_idx           = 0u;
+    bool page_tail_zeroed[4]     = {false, false, false, false};
+    bool page_full_zeroed[4]     = {false, false, false, false};
 
     auto drain_out_step = [&](uint32_t b_done, uint32_t p_done) __attribute__((always_inline)) {
         cb_wait_front(16, 4);
@@ -112,22 +112,34 @@ void kernel_main() {
 
         if (expert_slot >= 0xFFFEu) {
             for (uint32_t p = 0; p < num_projs; ++p) {
-                cb_reserve_back(4, num_sb);
-                cb_reserve_back(5, num_sb);
-                if (!full_zeroed[ring_half]) {
-                    uint64_t* cu64 = reinterpret_cast<uint64_t*>(get_write_ptr(4));
-                    uint64_t* su64 = reinterpret_cast<uint64_t*>(get_write_ptr(5));
-                    const uint32_t total_u64 = num_sb * 512u;
-                    for (uint32_t idx = 0; idx < total_u64; ++idx) {
-                        cu64[idx] = 0ULL;
-                        su64[idx] = 0ULL;
+                for (uint32_t sb0 = 0u; sb0 < num_sb; ) {
+                    const uint32_t rem        = num_sb - sb0;
+                    const uint32_t max_contig = 4u - cb_wr_idx;
+                    const uint32_t chunk      = (rem < max_contig ? rem : max_contig) < 2u
+                                                    ? (rem < max_contig ? rem : max_contig)
+                                                    : 2u;
+                    cb_reserve_back(4, chunk);
+                    cb_reserve_back(5, chunk);
+                    const uint32_t codes_base  = get_write_ptr(4);
+                    const uint32_t scales_base = get_write_ptr(5);
+                    for (uint32_t c = 0u; c < chunk; ++c) {
+                        const uint32_t pg = cb_wr_idx + c;
+                        if (!page_full_zeroed[pg]) {
+                            uint64_t* cu64 = reinterpret_cast<uint64_t*>(codes_base + c * 4096u);
+                            uint64_t* su64 = reinterpret_cast<uint64_t*>(scales_base + c * 4096u);
+                            for (uint32_t idx = 0; idx < 512u; ++idx) {
+                                cu64[idx] = 0ULL;
+                                su64[idx] = 0ULL;
+                            }
+                            page_full_zeroed[pg] = true;
+                            page_tail_zeroed[pg] = true;
+                        }
                     }
-                    full_zeroed[ring_half] = true;
-                    tail_zeroed[ring_half] = true;
+                    cb_push_back(4, chunk);
+                    cb_push_back(5, chunk);
+                    cb_wr_idx = (cb_wr_idx + chunk) & 3u;
+                    sb0 += chunk;
                 }
-                cb_push_back(4, num_sb);
-                cb_push_back(5, num_sb);
-                ring_half ^= 1u;
 
                 if (has_prev) {
                     drain_out_step(prev_b, prev_p);
@@ -146,96 +158,116 @@ void kernel_main() {
         const uint32_t hot_sb_base  = (hot_slot >= 0) ? (uint32_t(hot_slot) * 360u + local_sb_off) : 0u;
 
         for (uint32_t p = 0; p < num_projs; ++p) {
-            // Priority 2: Reserve full num_sb half of 2*num_sb-deep CB4/CB5 ring & issue single pipelined burst!
-            cb_reserve_back(4, num_sb);
-            cb_reserve_back(5, num_sb);
-            full_zeroed[ring_half] = false;
-            const uint32_t codes_base  = get_write_ptr(4);
-            const uint32_t scales_base = get_write_ptr(5);
-
-            if (p == 0u) {
-                noc_async_read(centroids_acc.get_noc_addr(expert_slot, 0), cent_l1, 64u);
-                if (hot_slot >= 0) {
-                    for (uint32_t sb = 0; sb < num_sb; ++sb) {
-                        const uint32_t hot_pid = hot_sb_base + sb;
-                        noc_async_read(hot_acc0.get_noc_addr(hot_pid, 0), codes_base + sb * 4096u, 4096u);
-                        noc_async_read(hot_acc0.get_noc_addr(hot_pid, 4096u), raw_scales_0 + sb * 256u, 256u);
-                    }
-                } else {
-                    for (uint32_t sb = 0; sb < num_sb; ++sb) {
-                        const uint32_t page_id = dram_sb_base + sb;
-                        noc_async_read(pages_acc0.get_noc_addr(page_id, 0), codes_base + sb * 4096u, 4096u);
-                        noc_async_read(pages_acc0.get_noc_addr(page_id, 4096u), raw_scales_0 + sb * 256u, 256u);
-                    }
-                }
-            } else {
-                if (hot_slot >= 0) {
-                    for (uint32_t sb = 0; sb < num_sb; ++sb) {
-                        const uint32_t hot_pid = hot_sb_base + sb;
-                        noc_async_read(hot_acc1.get_noc_addr(hot_pid, 0), codes_base + sb * 4096u, 4096u);
-                        noc_async_read(hot_acc1.get_noc_addr(hot_pid, 4096u), raw_scales_0 + sb * 256u, 256u);
-                    }
-                } else {
-                    for (uint32_t sb = 0; sb < num_sb; ++sb) {
-                        const uint32_t page_id = dram_sb_base + sb;
-                        noc_async_read(pages_acc1.get_noc_addr(page_id, 0), codes_base + sb * 4096u, 4096u);
-                        noc_async_read(pages_acc1.get_noc_addr(page_id, 4096u), raw_scales_0 + sb * 256u, 256u);
-                    }
-                }
-            }
-            noc_async_read_barrier();
-
             const uint32_t cur_proj = base_proj + p;
-            const volatile uint32_t* cent_u32 = reinterpret_cast<const volatile uint32_t*>(cent_l1);
-            const uint32_t c0_u32 = cent_u32[cur_proj * 2u + 0u];
-            const uint32_t dc_u32 = cent_u32[cur_proj * 2u + 1u];
-            const uint64_t c0_u64 = uint64_t(c0_u32) | (uint64_t(c0_u32) << 32);
-            const uint64_t dc_u64 = uint64_t(dc_u32) | (uint64_t(dc_u32) << 32);
-            const bool need_tail_zero = !tail_zeroed[ring_half];
+            uint64_t c0_u64 = 0ULL;
+            uint64_t dc_u64 = 0ULL;
 
-            for (uint32_t sb = 0; sb < num_sb; ++sb) {
-                const volatile uint32_t* hs32 = reinterpret_cast<const volatile uint32_t*>(raw_scales_0 + sb * 256u);
-                uint64_t* su64 = reinterpret_cast<uint64_t*>(scales_base + sb * 4096u);
+            // Wave 8.4C: Stream <= 2 contiguous superblocks per burst over 4-page CB4/CB5 ring (frees 49 KiB/core L1!)
+            for (uint32_t sb0 = 0u; sb0 < num_sb; ) {
+                const uint32_t rem        = num_sb - sb0;
+                const uint32_t max_contig = 4u - cb_wr_idx;
+                const uint32_t chunk      = (rem < max_contig ? rem : max_contig) < 2u
+                                                ? (rem < max_contig ? rem : max_contig)
+                                                : 2u;
+                cb_reserve_back(4, chunk);
+                cb_reserve_back(5, chunk);
+                const uint32_t codes_base  = get_write_ptr(4);
+                const uint32_t scales_base = get_write_ptr(5);
 
-                for (uint32_t nt_sub = 0; nt_sub < 4u; ++nt_sub) {
-                    uint64_t* f0_row = su64 + (nt_sub * 4u) * 8u;
-                    uint64_t* f1_row = su64 + 128u + (nt_sub * 4u) * 8u;
-                    const volatile uint32_t* hs_lo32 = hs32 + nt_sub * 16u;
-                    const volatile uint32_t* hs_hi32 = hs_lo32 + 8u;
-                    #pragma GCC unroll 8
-                    for (uint32_t c2 = 0; c2 < 8u; ++c2) {
-                        const uint32_t plo = hs_lo32[c2];
-                        const uint32_t phi = hs_hi32[c2];
-                        const uint64_t ulo = uint64_t(fp16_to_f32_bits_fast(plo & 0xFFFFu)) |
-                                             (uint64_t(fp16_to_f32_bits_fast(plo >> 16)) << 32);
-                        const uint64_t uhi = uint64_t(fp16_to_f32_bits_fast(phi & 0xFFFFu)) |
-                                             (uint64_t(fp16_to_f32_bits_fast(phi >> 16)) << 32);
-                        f0_row[0u  + c2] = ulo;
-                        f0_row[8u  + c2] = ulo;
-                        f0_row[16u + c2] = ulo;
-                        f0_row[24u + c2] = ulo;
-                        f1_row[0u  + c2] = uhi;
-                        f1_row[8u  + c2] = uhi;
-                        f1_row[16u + c2] = uhi;
-                        f1_row[24u + c2] = uhi;
+                if (p == 0u && sb0 == 0u) {
+                    noc_async_read(centroids_acc.get_noc_addr(expert_slot, 0), cent_l1, 64u);
+                }
+                if (p == 0u) {
+                    if (hot_slot >= 0) {
+                        for (uint32_t c = 0u; c < chunk; ++c) {
+                            const uint32_t sb = sb0 + c;
+                            const uint32_t hot_pid = hot_sb_base + sb;
+                            noc_async_read(hot_acc0.get_noc_addr(hot_pid, 0), codes_base + c * 4096u, 4096u);
+                            noc_async_read(hot_acc0.get_noc_addr(hot_pid, 4096u), raw_scales_0 + sb * 256u, 256u);
+                        }
+                    } else {
+                        for (uint32_t c = 0u; c < chunk; ++c) {
+                            const uint32_t sb = sb0 + c;
+                            const uint32_t page_id = dram_sb_base + sb;
+                            noc_async_read(pages_acc0.get_noc_addr(page_id, 0), codes_base + c * 4096u, 4096u);
+                            noc_async_read(pages_acc0.get_noc_addr(page_id, 4096u), raw_scales_0 + sb * 256u, 256u);
+                        }
+                    }
+                } else {
+                    if (hot_slot >= 0) {
+                        for (uint32_t c = 0u; c < chunk; ++c) {
+                            const uint32_t sb = sb0 + c;
+                            const uint32_t hot_pid = hot_sb_base + sb;
+                            noc_async_read(hot_acc1.get_noc_addr(hot_pid, 0), codes_base + c * 4096u, 4096u);
+                            noc_async_read(hot_acc1.get_noc_addr(hot_pid, 4096u), raw_scales_0 + sb * 256u, 256u);
+                        }
+                    } else {
+                        for (uint32_t c = 0u; c < chunk; ++c) {
+                            const uint32_t sb = sb0 + c;
+                            const uint32_t page_id = dram_sb_base + sb;
+                            noc_async_read(pages_acc1.get_noc_addr(page_id, 0), codes_base + c * 4096u, 4096u);
+                            noc_async_read(pages_acc1.get_noc_addr(page_id, 4096u), raw_scales_0 + sb * 256u, 256u);
+                        }
                     }
                 }
+                noc_async_read_barrier();
 
-                uint64_t* f2 = su64 + 256u;
-                for (uint32_t idx = 0; idx < 32u; ++idx) {
-                    f2[idx]       = c0_u64;
-                    f2[32u + idx] = dc_u64;
+                if (sb0 == 0u) {
+                    const volatile uint32_t* cent_u32 = reinterpret_cast<const volatile uint32_t*>(cent_l1);
+                    const uint32_t c0_u32 = cent_u32[cur_proj * 2u + 0u];
+                    const uint32_t dc_u32 = cent_u32[cur_proj * 2u + 1u];
+                    c0_u64 = uint64_t(c0_u32) | (uint64_t(c0_u32) << 32);
+                    dc_u64 = uint64_t(dc_u32) | (uint64_t(dc_u32) << 32);
                 }
-                if (need_tail_zero) {
-                    for (uint32_t idx = 320u; idx < 512u; ++idx) {
-                        su64[idx] = 0ULL;
+
+                for (uint32_t c = 0u; c < chunk; ++c) {
+                    const uint32_t sb = sb0 + c;
+                    const uint32_t pg = cb_wr_idx + c;
+                    page_full_zeroed[pg] = false;
+                    const volatile uint32_t* hs32 = reinterpret_cast<const volatile uint32_t*>(raw_scales_0 + sb * 256u);
+                    uint64_t* su64 = reinterpret_cast<uint64_t*>(scales_base + c * 4096u);
+
+                    for (uint32_t nt_sub = 0; nt_sub < 4u; ++nt_sub) {
+                        uint64_t* f0_row = su64 + (nt_sub * 4u) * 8u;
+                        uint64_t* f1_row = su64 + 128u + (nt_sub * 4u) * 8u;
+                        const volatile uint32_t* hs_lo32 = hs32 + nt_sub * 16u;
+                        const volatile uint32_t* hs_hi32 = hs_lo32 + 8u;
+                        #pragma GCC unroll 8
+                        for (uint32_t c2 = 0; c2 < 8u; ++c2) {
+                            const uint32_t plo = hs_lo32[c2];
+                            const uint32_t phi = hs_hi32[c2];
+                            const uint64_t ulo = uint64_t(fp16_to_f32_bits_fast(plo & 0xFFFFu)) |
+                                                 (uint64_t(fp16_to_f32_bits_fast(plo >> 16)) << 32);
+                            const uint64_t uhi = uint64_t(fp16_to_f32_bits_fast(phi & 0xFFFFu)) |
+                                                 (uint64_t(fp16_to_f32_bits_fast(phi >> 16)) << 32);
+                            f0_row[0u  + c2] = ulo;
+                            f0_row[8u  + c2] = ulo;
+                            f0_row[16u + c2] = ulo;
+                            f0_row[24u + c2] = ulo;
+                            f1_row[0u  + c2] = uhi;
+                            f1_row[8u  + c2] = uhi;
+                            f1_row[16u + c2] = uhi;
+                            f1_row[24u + c2] = uhi;
+                        }
+                    }
+
+                    uint64_t* f2 = su64 + 256u;
+                    for (uint32_t idx = 0; idx < 32u; ++idx) {
+                        f2[idx]       = c0_u64;
+                        f2[32u + idx] = dc_u64;
+                    }
+                    if (!page_tail_zeroed[pg]) {
+                        for (uint32_t idx = 320u; idx < 512u; ++idx) {
+                            su64[idx] = 0ULL;
+                        }
+                        page_tail_zeroed[pg] = true;
                     }
                 }
+                cb_push_back(4, chunk);
+                cb_push_back(5, chunk);
+                cb_wr_idx = (cb_wr_idx + chunk) & 3u;
+                sb0 += chunk;
             }
-            tail_zeroed[ring_half] = true;
-            cb_push_back(4, num_sb);
-            cb_push_back(5, num_sb);
-            ring_half ^= 1u;
 
             if (has_prev) {
                 drain_out_step(prev_b, prev_p);
