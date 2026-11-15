@@ -6,15 +6,19 @@
 #include "dsv41_json.hpp"
 #include "dsv41_runtime.hpp"
 #include "dsv41_tokenizer_dsml.hpp"
+#include "dsv41_vit.hpp"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -27,16 +31,273 @@
 
 namespace dsv41 {
 
+// Exact UTF-8 special tokens & V4.1 Reasoning Effort prefix from hf_meta/encoding/encoding.py:
+static constexpr const char* kDsv41SystemSpToken   = "<\xef\xbd\x9cSystem\xef\xbd\x9c>"; // "<｜System｜>" (id=128799)
+static constexpr const char* kDsv41UserSpToken     = "<\xef\xbd\x9cUser\xef\xbd\x9c>";   // "<｜User｜>" (id=128803)
+static constexpr const char* kDsv41AssistantToken  = "<\xef\xbd\x9c" "Assistant\xef\xbd\x9c>"; // "<｜Assistant｜>" (id=128804)
+static constexpr const char* kDsv41ReminderSpToken = "<\xef\xbd\x9c" "latest_reminder\xef\xbd\x9c>"; // "<｜latest_reminder｜>" (id=128828)
+static constexpr const char* kDsv41BosToken        = "<\xef\xbd\x9c" "begin\xe2\x96\x81of\xe2\x96\x81sentence\xef\xbd\x9c>"; // (id=0)
+
+static constexpr int kDsv41DefaultMaxTokens       = 262144;
+static constexpr int kDsv41ArchMaxOutputTokens    = 393216;
+static constexpr int kDsv41DefaultReasoningEffort = 100;
+
+inline std::string format_dsv41_reasoning_effort_prefix(int effort_budget) {
+    if (effort_budget < 1) return {};
+    if (effort_budget > 100) effort_budget = 100;
+    return "Reasoning Effort: " + std::to_string(effort_budget) +
+           " (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
+}
+
+struct ResolvedReasoningEffort {
+    bool thinking_enabled = true;
+    int effort = kDsv41DefaultReasoningEffort; // 1..100 when thinking_enabled, 0 when disabled
+};
+
+inline bool parse_reasoning_effort_string(const std::string& raw, ResolvedReasoningEffort& out) {
+    size_t a = 0;
+    while (a < raw.size() && std::isspace(static_cast<unsigned char>(raw[a]))) ++a;
+    size_t b = raw.size();
+    while (b > a && std::isspace(static_cast<unsigned char>(raw[b - 1]))) --b;
+    if (a >= b) return false;
+
+    std::string s = raw.substr(a, b - a);
+    for (char& c : s) c = char(std::tolower(static_cast<unsigned char>(c)));
+
+    if (s == "none" || s == "off" || s == "disabled" || s == "false" || s == "chat" || s == "0") {
+        out.thinking_enabled = false;
+        out.effort = 0;
+        return true;
+    }
+    if (s == "minimal") {
+        out.thinking_enabled = true;
+        out.effort = 35;
+        return true;
+    }
+    if (s == "low") {
+        out.thinking_enabled = true;
+        out.effort = 50;
+        return true;
+    }
+    if (s == "medium" || s == "med") {
+        out.thinking_enabled = true;
+        out.effort = 65;
+        return true;
+    }
+    if (s == "high") {
+        out.thinking_enabled = true;
+        out.effort = 75;
+        return true;
+    }
+    if (s == "xhigh" || s == "x-high" || s == "very_high") {
+        out.thinking_enabled = true;
+        out.effort = 90;
+        return true;
+    }
+    if (s == "max" || s == "ultrathink") {
+        out.thinking_enabled = true;
+        out.effort = 100;
+        return true;
+    }
+    char* endp = nullptr;
+    const long iv = std::strtol(s.c_str(), &endp, 10);
+    if (endp && *endp == '\0') {
+        if (iv <= 0) {
+            out.thinking_enabled = false;
+            out.effort = 0;
+        } else {
+            out.thinking_enabled = true;
+            out.effort = static_cast<int>(std::clamp<long>(iv, 1L, 100L));
+        }
+        return true;
+    }
+    return false;
+}
+
+inline bool parse_reasoning_effort_scalar(const JsonValue* v, ResolvedReasoningEffort& out) {
+    if (!v || v->is_null()) return false;
+    if (v->is_bool()) {
+        out.thinking_enabled = v->b_val;
+        out.effort = v->b_val ? 100 : 0;
+        return true;
+    }
+    if (v->is_int() || v->is_number()) {
+        const int iv = static_cast<int>(v->as_int(0));
+        if (iv <= 0) {
+            out.thinking_enabled = false;
+            out.effort = 0;
+        } else {
+            out.thinking_enabled = true;
+            out.effort = std::clamp(iv, 1, 100);
+        }
+        return true;
+    }
+    if (v->is_string()) {
+        return parse_reasoning_effort_string(v->s_val, out);
+    }
+    return false;
+}
+
+inline int parse_reasoning_effort_cli(const std::string& arg) {
+    ResolvedReasoningEffort res;
+    if (!parse_reasoning_effort_string(arg, res)) {
+        throw std::runtime_error("Invalid --default-reasoning-effort value: '" + arg +
+                                 "' (expected 1..100, low, medium, high, xhigh, max, or none)");
+    }
+    return res.thinking_enabled ? res.effort : 0;
+}
+
+inline int map_anthropic_budget_to_effort(int64_t budget_tokens) {
+    if (budget_tokens <= 0) return 0;
+    if (budget_tokens >= 31999) return 100;
+    if (budget_tokens >= 16000) return 85;
+    if (budget_tokens >= 4096) return 75;
+    return 50;
+}
+
+inline ResolvedReasoningEffort make_default_reasoning_effort(int default_reasoning_effort) {
+    ResolvedReasoningEffort r;
+    if (default_reasoning_effort <= 0) {
+        r.thinking_enabled = false;
+        r.effort = 0;
+    } else {
+        r.thinking_enabled = true;
+        r.effort = std::clamp(default_reasoning_effort, 1, 100);
+    }
+    return r;
+}
+
+inline ResolvedReasoningEffort parse_anthropic_reasoning_effort(
+    const JsonValue& body,
+    int default_reasoning_effort = kDsv41DefaultReasoningEffort)
+{
+    ResolvedReasoningEffort res;
+    // 1. Explicit reasoning_effort / output_config.effort / thinking.effort wins
+    if (parse_reasoning_effort_scalar(body.find("reasoning_effort"), res)) return res;
+    if (const JsonValue* oc = body.find("output_config")) {
+        if (oc->is_object() && parse_reasoning_effort_scalar(oc->find("effort"), res)) return res;
+    }
+    const JsonValue* th = body.find("thinking");
+    if (th && th->is_object() && parse_reasoning_effort_scalar(th->find("effort"), res)) {
+        return res;
+    }
+    // 2 & 3. Anthropic thinking object: {"type": "disabled"|"enabled"|"adaptive", "budget_tokens": B}
+    if (th && th->is_object()) {
+        std::string ttype = th->get("type").as_str("enabled");
+        for (char& c : ttype) c = char(std::tolower(static_cast<unsigned char>(c)));
+        if (ttype == "disabled" || ttype == "off" || ttype == "none") {
+            res.thinking_enabled = false;
+            res.effort = 0;
+            return res;
+        }
+        if (th->has("budget_tokens") && !th->get("budget_tokens").is_null()) {
+            const int mapped = map_anthropic_budget_to_effort(th->get("budget_tokens").as_int(0));
+            if (mapped <= 0) {
+                res.thinking_enabled = false;
+                res.effort = 0;
+            } else {
+                res.thinking_enabled = true;
+                res.effort = mapped;
+            }
+            return res;
+        }
+        res.thinking_enabled = true;
+        res.effort = (default_reasoning_effort > 0) ? std::clamp(default_reasoning_effort, 1, 100) : 100;
+        return res;
+    }
+    if (th && parse_reasoning_effort_scalar(th, res)) {
+        return res;
+    }
+    // 4. Omitted thinking -> use server --default-reasoning-effort (100 = Max)
+    return make_default_reasoning_effort(default_reasoning_effort);
+}
+
+inline ResolvedReasoningEffort parse_openai_reasoning_effort(
+    const JsonValue& body,
+    int default_reasoning_effort = kDsv41DefaultReasoningEffort)
+{
+    ResolvedReasoningEffort res;
+    if (parse_reasoning_effort_scalar(body.find("reasoning_effort"), res)) return res;
+    if (const JsonValue* oc = body.find("output_config")) {
+        if (oc->is_object() && parse_reasoning_effort_scalar(oc->find("effort"), res)) return res;
+    }
+    if (const JsonValue* th = body.find("thinking")) {
+        if (th->is_object()) {
+            if (parse_reasoning_effort_scalar(th->find("effort"), res)) return res;
+            std::string ttype = th->get("type").as_str("enabled");
+            for (char& c : ttype) c = char(std::tolower(static_cast<unsigned char>(c)));
+            if (ttype == "disabled" || ttype == "off" || ttype == "none") {
+                res.thinking_enabled = false;
+                res.effort = 0;
+                return res;
+            }
+            if (th->has("budget_tokens") && !th->get("budget_tokens").is_null()) {
+                const int mapped = map_anthropic_budget_to_effort(th->get("budget_tokens").as_int(0));
+                res.thinking_enabled = (mapped > 0);
+                res.effort = std::max(0, mapped);
+                return res;
+            }
+            res.thinking_enabled = true;
+            res.effort = (default_reasoning_effort > 0) ? std::clamp(default_reasoning_effort, 1, 100) : 100;
+            return res;
+        }
+        if (parse_reasoning_effort_scalar(th, res)) return res;
+    }
+    if (const JsonValue* ctk = body.find("chat_template_kwargs")) {
+        if (ctk->is_object()) {
+            if (ctk->has("enable_thinking") && ctk->get("enable_thinking").is_bool() &&
+                !ctk->get("enable_thinking").as_bool()) {
+                res.thinking_enabled = false;
+                res.effort = 0;
+                return res;
+            }
+            if (ctk->has("thinking_mode") && ctk->get("thinking_mode").is_string() &&
+                ctk->get("thinking_mode").as_str() == "chat") {
+                res.thinking_enabled = false;
+                res.effort = 0;
+                return res;
+            }
+            if (parse_reasoning_effort_scalar(ctk->find("reasoning_effort"), res)) return res;
+            if (ctk->has("enable_thinking") && ctk->get("enable_thinking").is_bool() &&
+                ctk->get("enable_thinking").as_bool()) {
+                res.thinking_enabled = true;
+                res.effort = (default_reasoning_effort > 0) ? std::clamp(default_reasoning_effort, 1, 100) : 100;
+                return res;
+            }
+        }
+    }
+    if (body.has("thinking_mode") && body.get("thinking_mode").is_string() &&
+        body.get("thinking_mode").as_str() == "chat") {
+        res.thinking_enabled = false;
+        res.effort = 0;
+        return res;
+    }
+    return make_default_reasoning_effort(default_reasoning_effort);
+}
+
+inline int clamp_max_new_tokens_to_context(
+    int requested_max_tokens,
+    int prompt_tokens,
+    int max_seq_len = 1048576,
+    int max_output_tokens_cap = kDsv41ArchMaxOutputTokens)
+{
+    const int cap = std::clamp(max_output_tokens_cap, 1, kDsv41ArchMaxOutputTokens);
+    const int req = std::clamp(requested_max_tokens, 1, cap);
+    const int ctx_avail = std::max(1, max_seq_len - prompt_tokens - 32);
+    return std::min(req, ctx_avail);
+}
+
 struct AnthropicTranslatedRequest {
     std::string model = "DeepSeek-V4.1-Flash-1017-WHT128-HLUT2";
-    int max_tokens = 16384;
-    float temperature = 0.6f;
+    int max_tokens = kDsv41DefaultMaxTokens;
+    float temperature = 1.0f;
     float top_p = 0.95f;
     bool has_explicit_temperature = false;
     bool stream = false;
     uint64_t seed = 0;
+    bool thinking_enabled = true;
+    int reasoning_effort = kDsv41DefaultReasoningEffort;
     std::string thinking_mode = "thinking";
-    JsonValue reasoning_effort = JsonValue::make_int(55);
     JsonValue openai_messages = JsonValue::make_array();
     JsonValue openai_tools = JsonValue::make_array();
     std::vector<std::string> stop_sequences;
@@ -119,35 +380,69 @@ inline std::string decode_chunked_body(const std::string& raw) {
     return out;
 }
 
-inline bool posix_http_get(const std::string& host, int port, const std::string& path_and_query,
-                           int& out_status, std::string& out_body, int timeout_sec = 10)
+inline int connect_with_timeout_ms(const std::string& host, int port,
+                                   int connect_timeout_ms = 1500,
+                                   int io_timeout_ms = 4500)
 {
-    out_status = 0;
-    out_body.clear();
-
     struct addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     struct addrinfo* res = nullptr;
     const std::string port_str = std::to_string(port);
     if (::getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res) != 0 || !res) {
-        return false;
+        return -1;
     }
 
     int fd = -1;
     for (struct addrinfo* p = res; p != nullptr; p = p->ai_next) {
         fd = ::socket(p->ai_family, p->ai_socktype, p->ai_protocol);
         if (fd < 0) continue;
-        struct timeval tv{};
-        tv.tv_sec = timeout_sec;
-        tv.tv_usec = 0;
-        (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        (void)::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-        if (::connect(fd, p->ai_addr, p->ai_addrlen) == 0) break;
+        const int orig_flags = ::fcntl(fd, F_GETFL, 0);
+        if (orig_flags >= 0) {
+            (void)::fcntl(fd, F_SETFL, orig_flags | O_NONBLOCK);
+        }
+        const int rc = ::connect(fd, p->ai_addr, p->ai_addrlen);
+        bool connected = (rc == 0);
+        if (!connected && errno == EINPROGRESS) {
+            struct pollfd pfd{};
+            pfd.fd = fd;
+            pfd.events = POLLOUT;
+            const int prc = ::poll(&pfd, 1, std::max(1, connect_timeout_ms));
+            if (prc > 0 && (pfd.revents & (POLLOUT | POLLERR | POLLHUP)) != 0) {
+                int so_err = 0;
+                socklen_t slen = sizeof(so_err);
+                if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &slen) == 0 && so_err == 0) {
+                    connected = true;
+                }
+            }
+        }
+        if (connected) {
+            if (orig_flags >= 0) {
+                (void)::fcntl(fd, F_SETFL, orig_flags);
+            }
+            struct timeval tv{};
+            tv.tv_sec = std::max(0, io_timeout_ms) / 1000;
+            tv.tv_usec = (std::max(0, io_timeout_ms) % 1000) * 1000;
+            (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            (void)::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            break;
+        }
         ::close(fd);
         fd = -1;
     }
     ::freeaddrinfo(res);
+    return fd;
+}
+
+inline bool posix_http_get(const std::string& host, int port, const std::string& path_and_query,
+                           int& out_status, std::string& out_body,
+                           int connect_timeout_ms = 1500, int read_timeout_ms = 4500)
+{
+    out_status = 0;
+    out_body.clear();
+
+    const std::string port_str = std::to_string(port);
+    const int fd = connect_with_timeout_ms(host, port, connect_timeout_ms, read_timeout_ms);
     if (fd < 0) return false;
 
     std::string req = "GET " + (path_and_query.empty() ? std::string("/") : path_and_query) +
@@ -277,28 +572,31 @@ inline JsonValue make_builtin_read_url_schema(const std::string& fn_name) {
     return tool;
 }
 
-inline int map_anthropic_budget_to_effort(int64_t budget_tokens) {
-    if (budget_tokens <= 0) return 0;
-    if (budget_tokens <= 1536) return 35;
-    if (budget_tokens <= 4096) return 50;
-    if (budget_tokens <= 8192) return 55;
-    if (budget_tokens <= 16384) return 75;
-    return 100;
-}
-
 }  // namespace detail_anthropic
 
 inline AnthropicTranslatedRequest translate_anthropic_to_dsv41(
     const JsonValue& req,
-    const std::string& default_model_id)
+    const std::string& default_model_id,
+    int default_reasoning_effort = kDsv41DefaultReasoningEffort,
+    int max_output_tokens_cap = kDsv41ArchMaxOutputTokens,
+    int default_max_tokens = kDsv41DefaultMaxTokens,
+    int min_thinking_max_tokens = 0)
 {
     AnthropicTranslatedRequest out;
     out.model = req.get("model").as_str(default_model_id);
     if (out.model.empty()) out.model = default_model_id;
-    out.max_tokens = std::max(1, int(req.get("max_tokens").as_int(16384)));
+
+    const int cap = std::clamp(max_output_tokens_cap, 1, kDsv41ArchMaxOutputTokens);
+    const int def_max = std::clamp(default_max_tokens, 1, cap);
+    if (req.has("max_tokens") && !req.get("max_tokens").is_null()) {
+        out.max_tokens = static_cast<int>(std::clamp<int64_t>(req.get("max_tokens").as_int(def_max), 1, cap));
+    } else {
+        out.max_tokens = def_max;
+    }
+
     out.stream = req.get("stream").as_bool(false);
     if (req.has("temperature") && !req.get("temperature").is_null()) {
-        out.temperature = float(req.get("temperature").as_number(0.6));
+        out.temperature = float(req.get("temperature").as_number(1.0));
         out.has_explicit_temperature = true;
     }
     out.top_p = float(req.get("top_p").as_number(0.95));
@@ -311,23 +609,24 @@ inline AnthropicTranslatedRequest translate_anthropic_to_dsv41(
         }
     }
 
-    // Thinking mode resolution:
-    //   - Anthropic `thinking: {"type": "enabled", "budget_tokens": N}` -> thinking mode with mapped effort
-    //   - Anthropic `thinking: {"type": "disabled"}` -> chat mode (`effort = 0`)
-    //   - Omitted `thinking`: default to DeepSeek-V4.1 thinking mode (effort=55) unless tool_choice forces specific non-thinking
-    if (req.get("thinking").is_object()) {
+    // Unified DeepSeek-V4.1 Reasoning Effort & Thinking Mode resolution
+    const ResolvedReasoningEffort resolved = parse_anthropic_reasoning_effort(req, default_reasoning_effort);
+    out.thinking_enabled = resolved.thinking_enabled;
+    out.reasoning_effort = resolved.effort;
+    out.thinking_mode = resolved.thinking_enabled ? "thinking" : "chat";
+
+    // Auto-lift max_tokens above thinking.budget_tokens so Max <think> traces never starve text/DSML tool output
+    if (out.thinking_enabled && req.get("thinking").is_object()) {
         const JsonValue& th = req.get("thinking");
-        const std::string ttype = th.get("type").as_str("enabled");
-        if (ttype == "disabled" || ttype == "off" || ttype == "none") {
-            out.thinking_mode = "chat";
-            out.reasoning_effort = JsonValue::make_int(0);
-        } else {
-            out.thinking_mode = "thinking";
-            const int64_t btok = th.get("budget_tokens").as_int(8192);
-            out.reasoning_effort = JsonValue::make_int(detail_anthropic::map_anthropic_budget_to_effort(btok));
+        if (th.has("budget_tokens") && !th.get("budget_tokens").is_null()) {
+            const int64_t btok = th.get("budget_tokens").as_int(0);
+            if (btok > 0 && int64_t(out.max_tokens) <= btok) {
+                out.max_tokens = static_cast<int>(std::min<int64_t>(cap, btok + 32768));
+            }
         }
-    } else if (req.has("reasoning_effort")) {
-        out.reasoning_effort = req.get("reasoning_effort");
+    }
+    if (out.thinking_enabled && min_thinking_max_tokens > 0) {
+        out.max_tokens = std::min(cap, std::max(out.max_tokens, min_thinking_max_tokens));
     }
 
     // 1. System prompt
@@ -447,17 +746,55 @@ inline AnthropicTranslatedRequest translate_anthropic_to_dsv41(
                             JsonValue tr = JsonValue::make_object();
                             tr.set("type", JsonValue::make_string("tool_result"));
                             tr.set("tool_use_id", JsonValue::make_string(b.get("tool_use_id").as_str()));
-                            std::string txt = detail_anthropic::extract_anthropic_block_text(b.get("content"));
-                            if (b.get("is_error").as_bool(false) && !txt.empty()) {
-                                txt = "Error: " + txt;
+                            const JsonValue& raw_tr_c = b.get("content");
+                            bool has_nested_img = false;
+                            if (raw_tr_c.is_array()) {
+                                for (const auto& sb : raw_tr_c.arr_val) {
+                                    if (sb.is_object()) {
+                                        const std::string& sbt = sb.get("type").as_str();
+                                        if (sbt == "image" || sbt == "image_url" || sbt == "input_image") {
+                                            has_nested_img = true;
+                                            break;
+                                        }
+                                    }
+                                }
                             }
-                            tr.set("content", JsonValue::make_string(std::move(txt)));
+                            if (has_nested_img) {
+                                JsonValue sub_arr = JsonValue::make_array();
+                                bool prefixed_err = false;
+                                for (const auto& sb : raw_tr_c.arr_val) {
+                                    if (!sb.is_object()) continue;
+                                    const std::string& sbt = sb.get("type").as_str();
+                                    if (sbt == "image" || sbt == "image_url" || sbt == "input_image") {
+                                        sub_arr.push(sb);
+                                    } else if (sbt == "text") {
+                                        std::string stxt = sb.get("text").as_str();
+                                        if (b.get("is_error").as_bool(false) && !prefixed_err && !stxt.empty()) {
+                                            stxt = "Error: " + stxt;
+                                            prefixed_err = true;
+                                        }
+                                        JsonValue tb = JsonValue::make_object();
+                                        tb.set("type", JsonValue::make_string("text"));
+                                        tb.set("text", JsonValue::make_string(std::move(stxt)));
+                                        sub_arr.push(std::move(tb));
+                                    }
+                                }
+                                tr.set("content", std::move(sub_arr));
+                            } else {
+                                std::string txt = detail_anthropic::extract_anthropic_block_text(raw_tr_c);
+                                if (b.get("is_error").as_bool(false) && !txt.empty()) {
+                                    txt = "Error: " + txt;
+                                }
+                                tr.set("content", JsonValue::make_string(std::move(txt)));
+                            }
                             cbs.push(std::move(tr));
                         } else if (bt == "text") {
                             JsonValue tb = JsonValue::make_object();
                             tb.set("type", JsonValue::make_string("text"));
                             tb.set("text", JsonValue::make_string(b.get("text").as_str()));
                             cbs.push(std::move(tb));
+                        } else if (bt == "image" || bt == "image_url" || bt == "input_image") {
+                            cbs.push(b);
                         }
                     }
                     JsonValue um = JsonValue::make_object();
@@ -552,6 +889,18 @@ inline bool is_builtin_server_search_name(const std::string& name) {
 
 inline bool is_builtin_server_read_name(const std::string& name) {
     return name == "deepseek_read_url" || name == "read_url" || name == "web_fetch";
+}
+
+inline bool is_search_backend_online(const std::string& search_base_url, int connect_timeout_ms = 250) {
+    if (search_base_url.empty()) return false;
+    std::string host;
+    int port = 80;
+    std::string base_path;
+    if (!detail_anthropic::parse_http_url(search_base_url, host, port, base_path)) return false;
+    const int fd = detail_anthropic::connect_with_timeout_ms(host, port, connect_timeout_ms, connect_timeout_ms);
+    if (fd < 0) return false;
+    ::close(fd);
+    return true;
 }
 
 inline ServerSearchResult execute_server_search_or_read(
@@ -775,18 +1124,22 @@ public:
         return send_(format_anthropic_sse_event("content_block_start", ev));
     }
 
+    bool emit_tool_input_json_delta(const std::string& partial_json) {
+        if (open_kind_ != BlockKind::Tool) return true;
+        if (partial_json.empty()) return true;
+        JsonValue ev = JsonValue::make_object();
+        ev.set("type", JsonValue::make_string("content_block_delta"));
+        ev.set("index", JsonValue::make_int(cur_idx_));
+        JsonValue d = JsonValue::make_object();
+        d.set("type", JsonValue::make_string("input_json_delta"));
+        d.set("partial_json", JsonValue::make_string(partial_json));
+        ev.set("delta", std::move(d));
+        return send_(format_anthropic_sse_event("content_block_delta", ev));
+    }
+
     bool emit_tool_input_json_and_close(const std::string& partial_json) {
         if (open_kind_ != BlockKind::Tool) return true;
-        if (!partial_json.empty()) {
-            JsonValue ev = JsonValue::make_object();
-            ev.set("type", JsonValue::make_string("content_block_delta"));
-            ev.set("index", JsonValue::make_int(cur_idx_));
-            JsonValue d = JsonValue::make_object();
-            d.set("type", JsonValue::make_string("input_json_delta"));
-            d.set("partial_json", JsonValue::make_string(partial_json));
-            ev.set("delta", std::move(d));
-            if (!send_(format_anthropic_sse_event("content_block_delta", ev))) return false;
-        }
+        if (!emit_tool_input_json_delta(partial_json)) return false;
         return close_open_block();
     }
 
@@ -871,42 +1224,73 @@ private:
     int next_idx_ = 0;
 };
 
-// Appends exact DeepSeek-V4.1 tool-continuation suffix onto `prompt_str` after a mid-turn server-side tool call,
-// preserving 100% token-level prefix identity with Dsv41Runtime::active_seq_ids_ (0 re-prefill penalty!).
-inline void append_dsv41_midturn_tool_observation(
-    std::string& prompt_str,
-    const std::string& raw_step_completion,
+// Segment-structured mid-turn tool observation continuation (deepseek-recipe anti-injection):
+// Web search / read payloads inside `<tool_result>` are encoded strictly as OrdinaryText (`parse_special = false`).
+inline void append_dsv41_midturn_tool_observation_segments(
+    std::vector<PromptSegment>& prompt_segs,
+    const std::vector<PromptSegment>& assistant_step_segs,
     const std::vector<std::string>& observations,
     const std::string& thinking_mode)
 {
-    static const char* kEosTok       = "<\xEF\xBD\x9C" "end\xE2\x96\x81of\xE2\x96\x81sentence\xEF\xBD\x9C>";
-    static const char* kUserTok      = "<\xEF\xBD\x9C" "User\xEF\xBD\x9C>";
-    static const char* kAssistantTok = "<\xEF\xBD\x9C" "Assistant\xEF\xBD\x9C>";
-    const std::string eos(kEosTok);
+    auto push_tok = [&](int32_t id) {
+        if (!prompt_segs.empty() && prompt_segs.back().kind == PromptSegment::Kind::TokenId &&
+            prompt_segs.back().token_id == id) {
+            prompt_segs.back().repeat += 1;
+        } else {
+            prompt_segs.push_back(PromptSegment::tok(id, 1));
+        }
+    };
+    auto push_txt = [&](std::string_view sv) {
+        if (sv.empty()) return;
+        if (!prompt_segs.empty() && prompt_segs.back().kind == PromptSegment::Kind::OrdinaryText) {
+            prompt_segs.back().text.append(sv.data(), sv.size());
+        } else {
+            prompt_segs.push_back(PromptSegment::txt(std::string(sv)));
+        }
+    };
 
-    std::string clean_raw = raw_step_completion;
-    if (clean_raw.size() >= eos.size() &&
-        clean_raw.compare(clean_raw.size() - eos.size(), eos.size(), eos) == 0) {
-        clean_raw.erase(clean_raw.size() - eos.size());
+    for (const auto& s : assistant_step_segs) {
+        if (s.kind == PromptSegment::Kind::TokenId) {
+            if (s.token_id == Dsv41SpecialTokens::kEos) continue;
+            for (int r = 0; r < s.repeat; ++r) push_tok(s.token_id);
+        } else {
+            push_txt(s.text);
+        }
     }
-    prompt_str += clean_raw;
-    prompt_str += kEosTok;
-    prompt_str += kUserTok;
+    push_tok(Dsv41SpecialTokens::kEos);
+    push_tok(Dsv41SpecialTokens::kUser);
     for (size_t i = 0; i < observations.size(); ++i) {
-        if (i) prompt_str += "\n\n";
-        prompt_str += "<tool_result>";
-        prompt_str += observations[i];
-        prompt_str += "</tool_result>";
+        if (i) push_txt("\n\n");
+        push_txt("<tool_result>");
+        push_txt(observations[i]);
+        push_txt("</tool_result>");
     }
-    prompt_str += kAssistantTok;
-    prompt_str += (thinking_mode == "thinking") ? "<think>" : "</think>";
+    push_tok(Dsv41SpecialTokens::kAssistant);
+    push_tok((thinking_mode == "thinking") ? Dsv41SpecialTokens::kThinkOpen : Dsv41SpecialTokens::kThinkEnd);
+}
+
+inline std::vector<PromptSegment> build_dsv41_prompt_segments(
+    const AnthropicTranslatedRequest& treq,
+    std::string& out_thinking_mode,
+    int& out_thinking_budget,
+    std::vector<Dsv41ImageSource>* out_images = nullptr)
+{
+    out_thinking_mode = treq.thinking_enabled ? "thinking" : "chat";
+    const JsonValue effort_jv = treq.thinking_enabled
+        ? JsonValue::make_int(std::clamp(treq.reasoning_effort, 1, 100))
+        : JsonValue::make_string("none");
+    const JsonValue* tools_ptr = treq.openai_tools.arr_val.empty() ? nullptr : &treq.openai_tools;
+    return render_dsv41_chat_segments(
+        treq.openai_messages, tools_ptr, nullptr, &effort_jv,
+        out_thinking_mode, out_thinking_budget, out_images);
 }
 
 using AnthropicGenerateStepFn = std::function<std::vector<int32_t>(
     const std::vector<int32_t>& prompt_ids,
     int max_new_tokens,
     TokenStreamCallback on_token,
-    Dsv41GenStats& out_stats)>;
+    Dsv41GenStats& out_stats,
+    const std::vector<Dsv41ImageSource>* images)>;
 
 inline bool run_anthropic_messages_turn(
     const AnthropicTranslatedRequest& treq,
@@ -928,35 +1312,16 @@ inline bool run_anthropic_messages_turn(
     out_total_tools = 0;
 
     std::string thinking_mode = treq.thinking_mode;
-    int thinking_budget = 55;
-    const JsonValue* tools_ptr = treq.openai_tools.arr_val.empty() ? nullptr : &treq.openai_tools;
-    std::string prompt_str = render_dsv41_chat_prompt(
-        treq.openai_messages, tools_ptr, nullptr, &treq.reasoning_effort,
-        thinking_mode, thinking_budget);
+    int thinking_budget = treq.reasoning_effort;
+    std::vector<Dsv41ImageSource> prompt_images;
+    std::vector<PromptSegment> prompt_segs =
+        build_dsv41_prompt_segments(treq, thinking_mode, thinking_budget, &prompt_images);
 
-    auto pop_utf8 = [](std::string& pending_bytes) -> std::string {
-        if (pending_bytes.empty()) return {};
-        const size_t n = pending_bytes.size();
-        size_t check = n;
-        for (size_t back = 1; back <= 3 && back <= n; ++back) {
-            const uint8_t b = static_cast<uint8_t>(pending_bytes[n - back]);
-            if ((b & 0x80u) == 0u) break;
-            if ((b & 0xC0u) == 0xC0u) {
-                size_t expected = 1;
-                if ((b & 0xE0u) == 0xC0u) expected = 2;
-                else if ((b & 0xF0u) == 0xE0u) expected = 3;
-                else if ((b & 0xF8u) == 0xF0u) expected = 4;
-                if (back < expected) check = n - back;
-                break;
-            }
-        }
-        std::string res = pending_bytes.substr(0, check);
-        pending_bytes.erase(0, check);
-        return res;
-    };
+    const std::string active_search_url =
+        (!search_url.empty() && is_search_backend_online(search_url)) ? search_url : std::string();
 
     auto resolve_tool = [&](const std::string& dsml_name) -> std::pair<std::string, bool> {
-        const bool srv = !search_url.empty() &&
+        const bool srv = !active_search_url.empty() &&
                          (is_builtin_server_search_name(dsml_name) || is_builtin_server_read_name(dsml_name));
         auto it = treq.server_tool_public_names.find(dsml_name);
         const std::string pub = (it != treq.server_tool_public_names.end()) ? it->second : dsml_name;
@@ -971,12 +1336,11 @@ inline bool run_anthropic_messages_turn(
     bool has_matched_stop_seq = false;
 
     for (int sub = 0; sub < 8 && remaining_tokens > 0; ++sub) {
-        const std::vector<int32_t> prompt_ids = tokenizer.encode(prompt_str, true);
+        const std::vector<int32_t> prompt_ids = tokenizer.encode_segments(prompt_segs);
         const int step_budget = remaining_tokens;
         const uint64_t step_seed = call_seed_base + uint64_t(sub) * 16ULL;
 
         Dsv41StreamParser sp(thinking_mode);
-        std::string utf8_pending;
         std::string step_content_accum;
         std::vector<Dsv41ToolStreamDelta> tool_deltas;
         Dsv41GenStats step_stats{};
@@ -987,8 +1351,10 @@ inline bool run_anthropic_messages_turn(
                 auto [pub_name, is_srv] = resolve_tool(td.name);
                 if (td.is_start) {
                     if (!sse.emit_tool_start(td.id, pub_name, is_srv)) return false;
-                } else {
+                } else if (td.is_end) {
                     if (!sse.emit_tool_input_json_and_close(td.arguments_delta)) return false;
+                } else {
+                    if (!sse.emit_tool_input_json_delta(td.arguments_delta)) return false;
                 }
             }
             return true;
@@ -1009,9 +1375,6 @@ inline bool run_anthropic_messages_turn(
                         return false;
                     }
                 }
-                if (tok_id == Dsv41SpecialTokens::kThinkEnd && !utf8_pending.empty()) {
-                    utf8_pending.clear();
-                }
                 if (step_stats.think_guard_triggered &&
                     tok_id == Dsv41SpecialTokens::kThinkEnd &&
                     sp.in_thinking())
@@ -1025,65 +1388,51 @@ inline bool run_anthropic_messages_turn(
                     return true;
                 }
 
-                utf8_pending += tokenizer.decode_single(tok_id, false);
-                const std::string piece = pop_utf8(utf8_pending);
-                if (!piece.empty()) {
-                    std::string r_delta, c_delta;
-                    sp.feed(piece, r_delta, c_delta, &tool_deltas, step_seed);
-                    if (treq.stream && !r_delta.empty() && !sse.emit_thinking_delta(r_delta)) {
-                        client_abort = true;
-                        return false;
-                    }
-                    if (!c_delta.empty()) {
-                        step_content_accum += c_delta;
-                        for (const auto& sseq : treq.stop_sequences) {
-                            const size_t pos = step_content_accum.find(sseq);
-                            if (pos != std::string::npos) {
-                                has_matched_stop_seq = true;
-                                matched_stop_seq = sseq;
-                                const size_t prev_len = step_content_accum.size() - c_delta.size();
-                                if (pos > prev_len) {
-                                    c_delta.resize(pos - prev_len);
-                                } else {
-                                    c_delta.clear();
-                                }
-                                break;
+                std::string r_delta, c_delta;
+                sp.feed_token(tok_id, tokenizer.raw_bytes_single(tok_id, false), r_delta, c_delta, &tool_deltas, step_seed);
+                if (treq.stream && !r_delta.empty() && !sse.emit_thinking_delta(r_delta)) {
+                    client_abort = true;
+                    return false;
+                }
+                if (!c_delta.empty()) {
+                    step_content_accum += c_delta;
+                    for (const auto& sseq : treq.stop_sequences) {
+                        const size_t pos = step_content_accum.find(sseq);
+                        if (pos != std::string::npos) {
+                            has_matched_stop_seq = true;
+                            matched_stop_seq = sseq;
+                            const size_t prev_len = step_content_accum.size() - c_delta.size();
+                            if (pos > prev_len) {
+                                c_delta.resize(pos - prev_len);
+                            } else {
+                                c_delta.clear();
                             }
+                            break;
                         }
-                        if (treq.stream && !c_delta.empty() && !sse.emit_text_delta(c_delta)) {
-                            client_abort = true;
-                            return false;
-                        }
-                        if (has_matched_stop_seq) return false;
                     }
-                    if (treq.stream && !tool_deltas.empty() && !emit_td_list(tool_deltas)) {
+                    if (treq.stream && !c_delta.empty() && !sse.emit_text_delta(c_delta)) {
                         client_abort = true;
                         return false;
                     }
-                    if (sp.should_stop_generation()) {
-                        return false;
-                    }
+                    if (has_matched_stop_seq) return false;
+                }
+                if (treq.stream && !tool_deltas.empty() && !emit_td_list(tool_deltas)) {
+                    client_abort = true;
+                    return false;
+                }
+                if (sp.should_stop_generation()) {
+                    return false;
                 }
                 return true;
             },
-            step_stats);
+            step_stats,
+            prompt_images.empty() ? nullptr : &prompt_images);
 
         if (client_abort || is_aborted()) return false;
 
         if (treq.stream && !sse.is_started()) {
             const int p_toks = (step_stats.prompt_tokens > 0) ? step_stats.prompt_tokens : int(prompt_ids.size());
             if (!sse.emit_message_start(p_toks, step_stats.cached_prefix_tokens)) return false;
-        }
-
-        if (!utf8_pending.empty()) {
-            std::string r_d, c_d;
-            sp.feed(utf8_pending, r_d, c_d, &tool_deltas, step_seed);
-            utf8_pending.clear();
-            if (treq.stream) {
-                if (!r_d.empty() && !sse.emit_thinking_delta(r_d)) return false;
-                if (!c_d.empty() && !has_matched_stop_seq && !sse.emit_text_delta(c_d)) return false;
-                if (!tool_deltas.empty() && !emit_td_list(tool_deltas)) return false;
-            }
         }
 
         std::string r_fin, c_fin;
@@ -1100,13 +1449,17 @@ inline bool run_anthropic_messages_turn(
             out_agg_stats.prompt_tokens        = (step_stats.prompt_tokens > 0) ? step_stats.prompt_tokens : int(prompt_ids.size());
             out_agg_stats.cached_prefix_tokens = step_stats.cached_prefix_tokens;
             out_agg_stats.radix_hit_tokens     = step_stats.radix_hit_tokens;
+            out_agg_stats.nvme_hit_tokens      = step_stats.nvme_hit_tokens;
             out_agg_stats.swa_replay_tokens    = step_stats.swa_replay_tokens;
             out_agg_stats.prefilled_tokens     = step_stats.prefilled_tokens;
+            out_agg_stats.nvme_hydrate_ms      = step_stats.nvme_hydrate_ms;
             out_agg_stats.prefix_reuse_ms      = step_stats.prefix_reuse_ms;
             out_agg_stats.fresh_prefill_ms     = step_stats.fresh_prefill_ms;
             out_agg_stats.prefill_ms           = step_stats.prefill_ms;
         }
         out_agg_stats.completion_tokens     += step_stats.completion_tokens;
+        out_agg_stats.images_encoded        += step_stats.images_encoded;
+        out_agg_stats.vit_encode_ms         += step_stats.vit_encode_ms;
         out_agg_stats.decode_ms             += step_stats.decode_ms;
         out_agg_stats.dec_dspark_ms         += step_stats.dec_dspark_ms;
         out_agg_stats.dec_backbone_ms       += step_stats.dec_backbone_ms;
@@ -1122,10 +1475,12 @@ inline bool run_anthropic_messages_turn(
         out_agg_stats.dspark_steps          += step_stats.dspark_steps;
         out_agg_stats.dspark_drafted        += step_stats.dspark_drafted;
         out_agg_stats.dspark_accepted       += step_stats.dspark_accepted;
-        out_agg_stats.dspark_tree_steps     += step_stats.dspark_tree_steps;
-        out_agg_stats.dspark_tree_accepted  += step_stats.dspark_tree_accepted;
-        out_agg_stats.dspark_tree16_steps    += step_stats.dspark_tree16_steps;
-        out_agg_stats.dspark_tree16_accepted += step_stats.dspark_tree16_accepted;
+        out_agg_stats.dspark_tree_steps         += step_stats.dspark_tree_steps;
+        out_agg_stats.dspark_tree_accepted      += step_stats.dspark_tree_accepted;
+        out_agg_stats.dspark_tree_dyn8_steps    += step_stats.dspark_tree_dyn8_steps;
+        out_agg_stats.dspark_tree_dyn8_accepted += step_stats.dspark_tree_dyn8_accepted;
+        out_agg_stats.dspark_tree16_steps       += step_stats.dspark_tree16_steps;
+        out_agg_stats.dspark_tree16_accepted    += step_stats.dspark_tree16_accepted;
         if (step_stats.think_guard_triggered) {
             out_agg_stats.think_guard_triggered = true;
             out_agg_stats.think_guard_period    = step_stats.think_guard_period;
@@ -1180,8 +1535,8 @@ inline bool run_anthropic_messages_turn(
             break;
         }
 
-        // Check if all invoked tools in this step are server-side search/read tools with --search-url configured
-        bool all_server_tools = !search_url.empty();
+        // Check if all invoked tools in this step are server-side search/read tools with --search-url online
+        bool all_server_tools = !active_search_url.empty();
         for (const auto& tc : parsed_step.tool_calls) {
             if (!resolve_tool(tc.name).second) {
                 all_server_tools = false;
@@ -1197,7 +1552,7 @@ inline bool run_anthropic_messages_turn(
         std::vector<std::string> observations;
         observations.reserve(parsed_step.tool_calls.size());
         for (const auto& tc : parsed_step.tool_calls) {
-            const ServerSearchResult sr = execute_server_search_or_read(search_url, tc.name, tc.arguments_json);
+            const ServerSearchResult sr = execute_server_search_or_read(active_search_url, tc.name, tc.arguments_json);
             ++out_server_search_reqs;
             observations.push_back(sr.tool_result_text);
             if (treq.stream) {
@@ -1217,7 +1572,7 @@ inline bool run_anthropic_messages_turn(
                 sync_blocks.push(std::move(wr));
             }
         }
-        append_dsv41_midturn_tool_observation(prompt_str, sp.raw_accumulated(), observations, thinking_mode);
+        append_dsv41_midturn_tool_observation_segments(prompt_segs, sp.assistant_segments(), observations, thinking_mode);
     }
 
     if (treq.stream) {
@@ -1243,6 +1598,589 @@ inline bool run_anthropic_messages_turn(
         usage.set("server_tool_use", std::move(stu));
     }
     root.set("usage", std::move(usage));
+    out_sync_json = root.dumps_compact();
+    return true;
+}
+
+struct OpenAiTranslatedRequest {
+    std::string model = "DeepSeek-V4.1-Flash-1017";
+    int max_tokens = kDsv41DefaultMaxTokens;
+    float temperature = 1.0f;
+    float top_p = 0.95f;
+    float repetition_penalty = 1.0f;
+    bool stream = false;
+    bool include_usage = true;
+    bool enable_dspark = true;
+    bool enable_think_loop_guard = true;
+    uint64_t seed = 0;
+    bool thinking_enabled = true;
+    int reasoning_effort = kDsv41DefaultReasoningEffort;
+    std::string thinking_mode = "thinking";
+    JsonValue messages = JsonValue::make_array();
+    JsonValue tools = JsonValue::make_array();
+    bool has_tools = false;
+    JsonValue response_format = JsonValue::make_object();
+    bool has_response_format = false;
+    std::vector<std::string> stop_sequences;
+};
+
+inline OpenAiTranslatedRequest translate_openai_to_dsv41(
+    const JsonValue& body,
+    const std::string& default_model_id,
+    int default_reasoning_effort = kDsv41DefaultReasoningEffort,
+    int max_output_tokens_cap = kDsv41ArchMaxOutputTokens,
+    int default_max_tokens = kDsv41DefaultMaxTokens,
+    int min_thinking_max_tokens = 0)
+{
+    OpenAiTranslatedRequest out;
+    out.model = body.get("model").as_str(default_model_id);
+    if (out.model.empty()) out.model = default_model_id;
+
+    const int cap = std::clamp(max_output_tokens_cap, 1, kDsv41ArchMaxOutputTokens);
+    const int def_max = std::clamp(default_max_tokens, 1, cap);
+    if (body.has("max_completion_tokens") && !body.get("max_completion_tokens").is_null()) {
+        out.max_tokens = static_cast<int>(std::clamp<int64_t>(body.get("max_completion_tokens").as_int(def_max), 1, cap));
+    } else if (body.has("max_tokens") && !body.get("max_tokens").is_null()) {
+        out.max_tokens = static_cast<int>(std::clamp<int64_t>(body.get("max_tokens").as_int(def_max), 1, cap));
+    } else {
+        out.max_tokens = def_max;
+    }
+
+    if (body.has("temperature") && body.get("temperature").is_number()) {
+        out.temperature = static_cast<float>(std::max(0.0, body.get("temperature").as_number(1.0)));
+    }
+    if (body.has("top_p") && body.get("top_p").is_number()) {
+        out.top_p = static_cast<float>(std::clamp(body.get("top_p").as_number(0.95), 0.01, 1.0));
+    }
+    if (body.has("repetition_penalty") && body.get("repetition_penalty").is_number()) {
+        out.repetition_penalty = static_cast<float>(std::max(1.0, body.get("repetition_penalty").as_number(1.0)));
+    }
+    if (body.has("seed") && body.get("seed").is_number()) {
+        out.seed = static_cast<uint64_t>(body.get("seed").as_int(0));
+    }
+    if (body.has("dspark") && body.get("dspark").is_bool()) {
+        out.enable_dspark = body.get("dspark").as_bool();
+    }
+    if (body.has("think_loop_guard") && body.get("think_loop_guard").is_bool()) {
+        out.enable_think_loop_guard = body.get("think_loop_guard").as_bool();
+    }
+    out.stream = body.get("stream").as_bool(false);
+    if (body.get("stream_options").is_object()) {
+        const JsonValue& so = body.get("stream_options");
+        if (so.has("include_usage") && so.get("include_usage").is_bool()) {
+            out.include_usage = so.get("include_usage").as_bool();
+        }
+    }
+
+    if (body.has("stop")) {
+        const JsonValue& st = body.get("stop");
+        if (st.is_string() && !st.s_val.empty()) {
+            out.stop_sequences.push_back(st.s_val);
+        } else if (st.is_array()) {
+            for (const auto& s : st.arr_val) {
+                if (s.is_string() && !s.s_val.empty()) out.stop_sequences.push_back(s.s_val);
+            }
+        }
+    }
+
+    const ResolvedReasoningEffort resolved = parse_openai_reasoning_effort(body, default_reasoning_effort);
+    out.thinking_enabled = resolved.thinking_enabled;
+    out.reasoning_effort = resolved.effort;
+    out.thinking_mode = resolved.thinking_enabled ? "thinking" : "chat";
+
+    if (out.thinking_enabled && body.get("thinking").is_object()) {
+        const JsonValue& th = body.get("thinking");
+        if (th.has("budget_tokens") && !th.get("budget_tokens").is_null()) {
+            const int64_t btok = th.get("budget_tokens").as_int(0);
+            if (btok > 0 && int64_t(out.max_tokens) <= btok) {
+                out.max_tokens = static_cast<int>(std::min<int64_t>(cap, btok + 32768));
+            }
+        }
+    }
+    if (out.thinking_enabled && min_thinking_max_tokens > 0) {
+        out.max_tokens = std::min(cap, std::max(out.max_tokens, min_thinking_max_tokens));
+    }
+
+    if (body.get("messages").is_array()) {
+        out.messages = body.get("messages");
+    }
+
+    const bool tool_choice_none = body.has("tool_choice") && body.get("tool_choice").is_string() &&
+                                  body.get("tool_choice").as_str() == "none";
+    if (!tool_choice_none) {
+        std::unordered_set<std::string> seen_tools;
+        if (body.get("tools").is_array()) {
+            for (const auto& t : body.get("tools").arr_val) {
+                if (!t.is_object()) continue;
+                if (t.has("function") && t.get("function").is_object()) {
+                    const std::string fn_n = t.get("function").get("name").as_str();
+                    if (!fn_n.empty() && seen_tools.insert(fn_n).second) {
+                        out.tools.push(t);
+                    }
+                    continue;
+                }
+                const std::string ttype = t.get("type").as_str();
+                const std::string tname = t.get("name").as_str();
+                if (ttype == "deepseek_web_search" || tname == "deepseek_web_search" ||
+                    ttype.rfind("web_search", 0) == 0 || tname == "web_search") {
+                    const std::string dsml_name = (tname == "web_search" && ttype != "deepseek_web_search")
+                        ? "deepseek_web_search" : (tname.empty() ? "deepseek_web_search" : tname);
+                    if (seen_tools.insert(dsml_name).second) {
+                        out.tools.push(detail_anthropic::make_builtin_search_schema(dsml_name));
+                    }
+                } else if (ttype == "deepseek_read_url" || tname == "deepseek_read_url" ||
+                           ttype.rfind("web_fetch", 0) == 0 || tname == "read_url") {
+                    const std::string dsml_name = tname.empty() ? "deepseek_read_url" : tname;
+                    if (seen_tools.insert(dsml_name).second) {
+                        out.tools.push(detail_anthropic::make_builtin_read_url_schema(dsml_name));
+                    }
+                }
+            }
+        }
+        if (body.get("enable_web_search").as_bool(false) && seen_tools.insert("deepseek_web_search").second) {
+            out.tools.push(detail_anthropic::make_builtin_search_schema("deepseek_web_search"));
+        }
+        out.has_tools = !out.tools.arr_val.empty();
+    }
+
+    if (body.get("response_format").is_object() && !body.get("response_format").obj_val.empty()) {
+        out.response_format = body.get("response_format");
+        out.has_response_format = true;
+    }
+
+    return out;
+}
+
+inline std::vector<PromptSegment> build_dsv41_openai_prompt_segments(
+    const OpenAiTranslatedRequest& oreq,
+    std::string& out_thinking_mode,
+    int& out_thinking_budget,
+    std::vector<Dsv41ImageSource>* out_images = nullptr)
+{
+    out_thinking_mode = oreq.thinking_enabled ? "thinking" : "chat";
+    const JsonValue effort_jv = oreq.thinking_enabled
+        ? JsonValue::make_int(std::clamp(oreq.reasoning_effort, 1, 100))
+        : JsonValue::make_string("none");
+    const JsonValue* tools_ptr = oreq.has_tools ? &oreq.tools : nullptr;
+    const JsonValue* rf_ptr = oreq.has_response_format ? &oreq.response_format : nullptr;
+    return render_dsv41_chat_segments(
+        oreq.messages, tools_ptr, rf_ptr, &effort_jv,
+        out_thinking_mode, out_thinking_budget, out_images);
+}
+
+inline JsonValue make_openai_usage_json(int64_t prompt_toks, int64_t completion_toks, int64_t cached_toks,
+                                        int server_web_search_reqs = 0)
+{
+    const int64_t clamped_cached = std::clamp<int64_t>(cached_toks, 0, std::max<int64_t>(0, prompt_toks));
+    const int64_t miss_toks = std::max<int64_t>(0, prompt_toks - clamped_cached);
+
+    JsonValue details = JsonValue::make_object();
+    details.set_key("cached_tokens", JsonValue::make_int(clamped_cached));
+
+    JsonValue u = JsonValue::make_object();
+    u.set_key("prompt_tokens", JsonValue::make_int(prompt_toks));
+    u.set_key("completion_tokens", JsonValue::make_int(completion_toks));
+    u.set_key("total_tokens", JsonValue::make_int(prompt_toks + completion_toks));
+    u.set_key("prompt_tokens_details", std::move(details));
+    u.set_key("prompt_cache_hit_tokens", JsonValue::make_int(clamped_cached));
+    u.set_key("prompt_cache_miss_tokens", JsonValue::make_int(miss_toks));
+    if (server_web_search_reqs > 0) {
+        JsonValue stu = JsonValue::make_object();
+        stu.set_key("web_search_requests", JsonValue::make_int(server_web_search_reqs));
+        u.set_key("server_tool_use", std::move(stu));
+    }
+    return u;
+}
+
+inline bool run_openai_chat_completions_turn(
+    const OpenAiTranslatedRequest& oreq,
+    const Dsv41Tokenizer& tokenizer,
+    const std::string& search_url,
+    const std::string& cmpl_id,
+    int64_t created_ts,
+    uint64_t call_seed_base,
+    const AnthropicGenerateStepFn& generate_step,
+    const std::function<bool()>& is_aborted,
+    const AnthropicSseStateMachine::SendFn& sse_send,
+    std::string& out_sync_json,
+    Dsv41GenStats& out_agg_stats,
+    int& out_server_search_reqs,
+    size_t& out_total_tools,
+    const std::function<void()>& on_before_final_sse_chunks = nullptr)
+{
+    out_sync_json.clear();
+    out_agg_stats = Dsv41GenStats{};
+    out_server_search_reqs = 0;
+    out_total_tools = 0;
+
+    std::string thinking_mode = oreq.thinking_mode;
+    int thinking_budget = oreq.reasoning_effort;
+    std::vector<Dsv41ImageSource> prompt_images;
+    std::vector<PromptSegment> prompt_segs =
+        build_dsv41_openai_prompt_segments(oreq, thinking_mode, thinking_budget, &prompt_images);
+
+    const std::string active_search_url =
+        (!search_url.empty() && is_search_backend_online(search_url)) ? search_url : std::string();
+
+    auto is_srv_tool = [&](const std::string& name) -> bool {
+        return !active_search_url.empty() &&
+               (is_builtin_server_search_name(name) || is_builtin_server_read_name(name));
+    };
+
+    auto make_chunk_envelope = [&](JsonValue delta, const char* finish_reason) -> std::string {
+        JsonValue choice = JsonValue::make_object();
+        choice.set_key("index", int64_t(0));
+        choice.set_key("delta", std::move(delta));
+        if (finish_reason) choice.set_key("finish_reason", std::string(finish_reason));
+        else choice.set_key("finish_reason", JsonValue());
+
+        JsonValue choices = JsonValue::make_array();
+        choices.push_back(std::move(choice));
+
+        JsonValue env = JsonValue::make_object();
+        env.set_key("id", cmpl_id);
+        env.set_key("object", "chat.completion.chunk");
+        env.set_key("created", created_ts);
+        env.set_key("model", oreq.model);
+        env.set_key("choices", std::move(choices));
+        return "data: " + env.dumps_compact() + "\n\n";
+    };
+
+    int remaining_tokens = std::max(1, oreq.max_tokens);
+    std::string sync_reasoning_accum;
+    std::string sync_content_accum;
+    std::vector<Dsv41ParsedToolCall> final_client_tool_calls;
+    bool any_streamed_client_tools = false;
+    size_t streamed_client_tool_cnt = 0;
+    bool hit_max_tokens = false;
+    bool has_matched_stop_seq = false;
+    std::string matched_stop_seq;
+
+    for (int sub = 0; sub < 8 && remaining_tokens > 0; ++sub) {
+        const std::vector<int32_t> prompt_ids = tokenizer.encode_segments(prompt_segs);
+        const int step_budget = remaining_tokens;
+        const uint64_t step_seed = call_seed_base + uint64_t(sub) * 16ULL;
+
+        Dsv41StreamParser sp(thinking_mode);
+        std::string step_content_accum;
+        std::vector<Dsv41ToolStreamDelta> tool_deltas;
+        Dsv41GenStats step_stats{};
+        bool client_abort = false;
+
+        auto emit_client_td_list = [&](const std::vector<Dsv41ToolStreamDelta>& deltas) -> bool {
+            for (const auto& td : deltas) {
+                if (is_srv_tool(td.name)) continue;
+                if (!td.is_start && td.arguments_delta.empty()) continue;
+                any_streamed_client_tools = true;
+                if (td.index + 1 > streamed_client_tool_cnt) streamed_client_tool_cnt = td.index + 1;
+
+                JsonValue fn = JsonValue::make_object();
+                if (td.is_start) {
+                    fn.set_key("name", td.name);
+                    fn.set_key("arguments", "");
+                } else {
+                    fn.set_key("arguments", td.arguments_delta);
+                }
+
+                JsonValue item = JsonValue::make_object();
+                item.set_key("index", int64_t(td.index));
+                if (td.is_start) {
+                    item.set_key("id", td.id);
+                    item.set_key("type", "function");
+                }
+                item.set_key("function", std::move(fn));
+
+                JsonValue tc_arr = JsonValue::make_array();
+                tc_arr.push_back(std::move(item));
+
+                JsonValue d = JsonValue::make_object();
+                d.set_key("tool_calls", std::move(tc_arr));
+                if (!sse_send(make_chunk_envelope(std::move(d), nullptr))) return false;
+            }
+            return true;
+        };
+
+        (void)generate_step(
+            prompt_ids,
+            step_budget,
+            [&](int32_t tok_id) -> bool {
+                if (is_aborted()) {
+                    client_abort = true;
+                    return false;
+                }
+                if (step_stats.think_guard_triggered &&
+                    tok_id == Dsv41SpecialTokens::kThinkEnd &&
+                    sp.in_thinking())
+                {
+                    std::string r_delta;
+                    sp.force_close_thinking(r_delta);
+                    if (oreq.stream && !r_delta.empty()) {
+                        JsonValue d = JsonValue::make_object();
+                        d.set_key("reasoning_content", r_delta);
+                        if (!sse_send(make_chunk_envelope(std::move(d), nullptr))) {
+                            client_abort = true;
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+
+                std::string r_delta, c_delta;
+                sp.feed_token(tok_id, tokenizer.raw_bytes_single(tok_id, false), r_delta, c_delta, &tool_deltas, step_seed);
+                if (oreq.stream && !r_delta.empty()) {
+                    JsonValue d = JsonValue::make_object();
+                    d.set_key("reasoning_content", r_delta);
+                    if (!sse_send(make_chunk_envelope(std::move(d), nullptr))) {
+                        client_abort = true;
+                        return false;
+                    }
+                }
+                if (!c_delta.empty()) {
+                    step_content_accum += c_delta;
+                    for (const auto& sseq : oreq.stop_sequences) {
+                        const size_t pos = step_content_accum.find(sseq);
+                        if (pos != std::string::npos) {
+                            has_matched_stop_seq = true;
+                            matched_stop_seq = sseq;
+                            const size_t prev_len = step_content_accum.size() - c_delta.size();
+                            if (pos > prev_len) c_delta.resize(pos - prev_len);
+                            else c_delta.clear();
+                            break;
+                        }
+                    }
+                    if (oreq.stream && !c_delta.empty()) {
+                        JsonValue d = JsonValue::make_object();
+                        d.set_key("content", c_delta);
+                        if (!sse_send(make_chunk_envelope(std::move(d), nullptr))) {
+                            client_abort = true;
+                            return false;
+                        }
+                    }
+                    if (has_matched_stop_seq) return false;
+                }
+                if (oreq.stream && !tool_deltas.empty() && !emit_client_td_list(tool_deltas)) {
+                    client_abort = true;
+                    return false;
+                }
+                if (sp.should_stop_generation()) return false;
+                return true;
+            },
+            step_stats,
+            prompt_images.empty() ? nullptr : &prompt_images);
+
+        if (client_abort || is_aborted()) return false;
+
+        std::string r_fin, c_fin;
+        Dsv41ParsedCompletion parsed_step;
+        sp.finish(r_fin, c_fin, parsed_step, step_seed, &tool_deltas);
+        if (oreq.stream) {
+            if (!r_fin.empty()) {
+                JsonValue d = JsonValue::make_object();
+                d.set_key("reasoning_content", r_fin);
+                if (!sse_send(make_chunk_envelope(std::move(d), nullptr))) return false;
+            }
+            if (!c_fin.empty() && !has_matched_stop_seq) {
+                JsonValue d = JsonValue::make_object();
+                d.set_key("content", c_fin);
+                if (!sse_send(make_chunk_envelope(std::move(d), nullptr))) return false;
+            }
+            if (!tool_deltas.empty() && !emit_client_td_list(tool_deltas)) return false;
+        }
+
+        if (sub == 0) {
+            out_agg_stats.prompt_tokens        = (step_stats.prompt_tokens > 0) ? step_stats.prompt_tokens : int(prompt_ids.size());
+            out_agg_stats.cached_prefix_tokens = step_stats.cached_prefix_tokens;
+            out_agg_stats.radix_hit_tokens     = step_stats.radix_hit_tokens;
+            out_agg_stats.nvme_hit_tokens      = step_stats.nvme_hit_tokens;
+            out_agg_stats.swa_replay_tokens    = step_stats.swa_replay_tokens;
+            out_agg_stats.prefilled_tokens     = step_stats.prefilled_tokens;
+            out_agg_stats.nvme_hydrate_ms      = step_stats.nvme_hydrate_ms;
+            out_agg_stats.prefix_reuse_ms      = step_stats.prefix_reuse_ms;
+            out_agg_stats.fresh_prefill_ms     = step_stats.fresh_prefill_ms;
+            out_agg_stats.prefill_ms           = step_stats.prefill_ms;
+        }
+        out_agg_stats.completion_tokens     += step_stats.completion_tokens;
+        out_agg_stats.images_encoded        += step_stats.images_encoded;
+        out_agg_stats.vit_encode_ms         += step_stats.vit_encode_ms;
+        out_agg_stats.decode_ms             += step_stats.decode_ms;
+        out_agg_stats.dec_dspark_ms         += step_stats.dec_dspark_ms;
+        out_agg_stats.dec_backbone_ms       += step_stats.dec_backbone_ms;
+        out_agg_stats.dec_p150_dev_ms       += step_stats.dec_p150_dev_ms;
+        out_agg_stats.dec_sample_ms         += step_stats.dec_sample_ms;
+        out_agg_stats.t_attn_ms             += step_stats.t_attn_ms;
+        out_agg_stats.t_hsi_index_ms        += step_stats.t_hsi_index_ms;
+        out_agg_stats.t_mi50_moe_ms         += step_stats.t_mi50_moe_ms;
+        out_agg_stats.t_p150_wait_ms        += step_stats.t_p150_wait_ms;
+        out_agg_stats.t_allreduce_ms        += step_stats.t_allreduce_ms;
+        out_agg_stats.t_engram_wait_ms      += step_stats.t_engram_wait_ms;
+        out_agg_stats.overlap_saved_ms      += step_stats.overlap_saved_ms;
+        out_agg_stats.dspark_steps          += step_stats.dspark_steps;
+        out_agg_stats.dspark_drafted        += step_stats.dspark_drafted;
+        out_agg_stats.dspark_accepted       += step_stats.dspark_accepted;
+        out_agg_stats.dspark_tree_steps         += step_stats.dspark_tree_steps;
+        out_agg_stats.dspark_tree_accepted      += step_stats.dspark_tree_accepted;
+        out_agg_stats.dspark_tree_dyn8_steps    += step_stats.dspark_tree_dyn8_steps;
+        out_agg_stats.dspark_tree_dyn8_accepted += step_stats.dspark_tree_dyn8_accepted;
+        out_agg_stats.dspark_tree16_steps       += step_stats.dspark_tree16_steps;
+        out_agg_stats.dspark_tree16_accepted    += step_stats.dspark_tree16_accepted;
+        if (step_stats.think_guard_triggered) {
+            out_agg_stats.think_guard_triggered = true;
+            out_agg_stats.think_guard_period    = step_stats.think_guard_period;
+            out_agg_stats.think_guard_rewound  += step_stats.think_guard_rewound;
+        }
+
+        remaining_tokens -= step_stats.completion_tokens;
+        out_total_tools += parsed_step.tool_calls.size();
+
+        if (!parsed_step.reasoning_content.empty()) {
+            if (!sync_reasoning_accum.empty()) sync_reasoning_accum += "\n\n";
+            sync_reasoning_accum += parsed_step.reasoning_content;
+        }
+        std::string txt = parsed_step.content;
+        if (has_matched_stop_seq) {
+            const size_t p = txt.find(matched_stop_seq);
+            if (p != std::string::npos) txt.resize(p);
+        }
+        sync_content_accum += txt;
+
+        if (has_matched_stop_seq) break;
+        if (parsed_step.tool_calls.empty()) {
+            if (step_stats.completion_tokens >= step_budget) hit_max_tokens = true;
+            break;
+        }
+
+        bool all_server_tools = !active_search_url.empty() && !any_streamed_client_tools;
+        for (const auto& tc : parsed_step.tool_calls) {
+            if (!is_srv_tool(tc.name)) {
+                all_server_tools = false;
+                break;
+            }
+        }
+        if (!all_server_tools || remaining_tokens <= 0) {
+            for (const auto& tc : parsed_step.tool_calls) {
+                if (!is_srv_tool(tc.name) || active_search_url.empty()) {
+                    final_client_tool_calls.push_back(tc);
+                } else {
+                    final_client_tool_calls.push_back(tc);
+                }
+            }
+            break;
+        }
+
+        std::vector<std::string> observations;
+        observations.reserve(parsed_step.tool_calls.size());
+        for (const auto& tc : parsed_step.tool_calls) {
+            const ServerSearchResult sr = execute_server_search_or_read(active_search_url, tc.name, tc.arguments_json);
+            ++out_server_search_reqs;
+            observations.push_back(sr.tool_result_text);
+        }
+        append_dsv41_midturn_tool_observation_segments(prompt_segs, sp.assistant_segments(), observations, thinking_mode);
+    }
+
+    if (oreq.stream) {
+        if (on_before_final_sse_chunks) on_before_final_sse_chunks();
+
+        if (!any_streamed_client_tools && final_client_tool_calls.empty() &&
+            sync_content_accum.empty() && sync_reasoning_accum.empty()) {
+            JsonValue d = JsonValue::make_object();
+            d.set_key("content", " ");
+            (void)sse_send(make_chunk_envelope(std::move(d), nullptr));
+        }
+
+        const char* fin_reason = "stop";
+        if (any_streamed_client_tools) {
+            fin_reason = "tool_calls";
+        } else if (!final_client_tool_calls.empty()) {
+            fin_reason = "tool_calls";
+            JsonValue tc_arr = JsonValue::make_array();
+            for (size_t i = 0; i < final_client_tool_calls.size(); ++i) {
+                const auto& tc = final_client_tool_calls[i];
+                JsonValue fn = JsonValue::make_object();
+                fn.set_key("name", tc.name);
+                fn.set_key("arguments", tc.arguments_json);
+
+                JsonValue item = JsonValue::make_object();
+                item.set_key("index", int64_t(i));
+                item.set_key("id", tc.id);
+                item.set_key("type", "function");
+                item.set_key("function", std::move(fn));
+                tc_arr.push_back(std::move(item));
+            }
+            JsonValue d = JsonValue::make_object();
+            d.set_key("tool_calls", std::move(tc_arr));
+            if (!sse_send(make_chunk_envelope(std::move(d), nullptr))) return false;
+        } else if (hit_max_tokens) {
+            fin_reason = "length";
+        }
+
+        if (!sse_send(make_chunk_envelope(JsonValue::make_object(), fin_reason))) return false;
+
+        if (oreq.include_usage) {
+            JsonValue env = JsonValue::make_object();
+            env.set_key("id", cmpl_id);
+            env.set_key("object", "chat.completion.chunk");
+            env.set_key("created", created_ts);
+            env.set_key("model", oreq.model);
+            env.set_key("choices", JsonValue::make_array());
+            env.set_key("usage", make_openai_usage_json(
+                int64_t(out_agg_stats.prompt_tokens),
+                int64_t(out_agg_stats.completion_tokens),
+                int64_t(out_agg_stats.cached_prefix_tokens),
+                out_server_search_reqs));
+            if (!sse_send("data: " + env.dumps_compact() + "\n\n")) return false;
+        }
+        return sse_send("data: [DONE]\n\n");
+    }
+
+    JsonValue msg = JsonValue::make_object();
+    msg.set_key("role", "assistant");
+    if (sync_content_accum.empty() && !final_client_tool_calls.empty()) {
+        msg.set_key("content", JsonValue());
+    } else {
+        msg.set_key("content", sync_content_accum);
+    }
+    if (!sync_reasoning_accum.empty()) {
+        msg.set_key("reasoning_content", sync_reasoning_accum);
+    }
+    const char* fin_reason = "stop";
+    if (!final_client_tool_calls.empty()) {
+        fin_reason = "tool_calls";
+        JsonValue tc_arr = JsonValue::make_array();
+        for (const auto& tc : final_client_tool_calls) {
+            JsonValue fn = JsonValue::make_object();
+            fn.set_key("name", tc.name);
+            fn.set_key("arguments", tc.arguments_json);
+
+            JsonValue item = JsonValue::make_object();
+            item.set_key("id", tc.id);
+            item.set_key("type", "function");
+            item.set_key("function", std::move(fn));
+            tc_arr.push_back(std::move(item));
+        }
+        msg.set_key("tool_calls", std::move(tc_arr));
+    } else if (hit_max_tokens) {
+        fin_reason = "length";
+    }
+
+    JsonValue choice = JsonValue::make_object();
+    choice.set_key("index", int64_t(0));
+    choice.set_key("message", std::move(msg));
+    choice.set_key("finish_reason", std::string(fin_reason));
+
+    JsonValue choices = JsonValue::make_array();
+    choices.push_back(std::move(choice));
+
+    JsonValue root = JsonValue::make_object();
+    root.set_key("id", cmpl_id);
+    root.set_key("object", "chat.completion");
+    root.set_key("created", created_ts);
+    root.set_key("model", oreq.model);
+    root.set_key("choices", std::move(choices));
+    root.set_key("usage", make_openai_usage_json(
+        int64_t(out_agg_stats.prompt_tokens),
+        int64_t(out_agg_stats.completion_tokens),
+        int64_t(out_agg_stats.cached_prefix_tokens),
+        out_server_search_reqs));
     out_sync_json = root.dumps_compact();
     return true;
 }

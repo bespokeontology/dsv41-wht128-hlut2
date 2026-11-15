@@ -1,6 +1,7 @@
 #pragma once
-// Pure-C++17 Real-Time Native Telemetry Tracker (`x_flash_progress` v1) for DeepSeek-V4.1-Flash-1017 HTTP/SSE Server
-// Emits rolling token-rate histograms (`flashTokenTotals` / `x_flash_progress`) over OpenAI and Anthropic SSE streams.
+// Pure-C++17 Real-Time Native Telemetry Tracker (`x_flash_progress` v1) for DeepSeek-V4.1-Flash-1017
+// Mirrors Qwen 3.8 Flash Next (`FlashLiveProgress`) wire contract for `@earendil-works/pi-ai` (`openai-completions`),
+// `@deepseek-ai/dsh-session-stats` (`flashTokenTotals`), and `@deepseek-ai/dsh-client-ui-conversation` (`StatsLine`).
 // Counts all Input (cached + fresh prefill chunks) and Output (reasoning + text + buffered DSML tool calls) in real time.
 
 #include "dsv41_json.hpp"

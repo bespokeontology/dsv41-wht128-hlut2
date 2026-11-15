@@ -4287,7 +4287,7 @@ void k_hlut2_grouped_down8(
     }
 }
 
-// Expert-bucketed BM=32 WHT128-HLUT2 down_proj (192 threads = 3 wave64, ScratchSize == 0 on gfx906):
+// Rescued from Step 129 (verified ScratchSize == 0 on gfx906):
 // 48 KiB swizzled uint4 LDS + register-resident pd_reg[8], 32-row tile reuse.
 __global__ __launch_bounds__(192, 1)
 void k_hlut2_grouped_down32(
@@ -6407,7 +6407,7 @@ void k_dspark_prepare_tree_markov_emb(
     uint16_t*            __restrict__ out_markov_emb_bf16,
     uint64_t seq,
     uint32_t wait_stage_mask,
-    uint32_t src_slots_nibbles,
+    uint64_t src_slots_bytes,
     int num_rows)
 {
     const int tid = int(threadIdx.x);
@@ -6423,7 +6423,7 @@ void k_dspark_prepare_tree_markov_emb(
     __syncthreads();
 
     for (int r = 0; r < num_rows; ++r) {
-        const int slot = int((src_slots_nibbles >> (4 * r)) & 0xFu);
+        const int slot = int((src_slots_bytes >> (8 * r)) & 0xFFu);
         const int32_t tok = ctrl->tree_tokens[slot];
         out_markov_emb_bf16[size_t(r) * 256u + size_t(tid)] =
             mapped_markov_embed_bf16[size_t(tok) * 256u + size_t(tid)];
@@ -6439,7 +6439,7 @@ void k_dspark_tree_topk_tp3(
     int tree_stage,
     int out_slot,
     int B_out,
-    uint32_t anc_slots_nibbles,
+    uint64_t anc_slots_bytes,
     int anc_cnt,
     int rank,
     int vocab_offset,
@@ -6450,12 +6450,15 @@ void k_dspark_tree_topk_tp3(
         struct {
             float   val[256][kDsparkMaxTopkOut];
             int32_t id[256][kDsparkMaxTopkOut];
+            float   lse_max[256];
+            float   lse_sum[256];
         } top;
     };
     __shared__ SharedTreeTopk sh;
 
     const int tid = int(threadIdx.x);
     const float penalty = ctrl->rep_penalty;
+    const float inv_temp = 1.0f / fmaxf(ctrl->temperature, 0.60f);
     const bool do_rep = (markov_logits_f32 != nullptr && penalty > 1.0001f);
 
     if (do_rep) {
@@ -6477,7 +6480,7 @@ void k_dspark_tree_topk_tp3(
             if (tid == 0) {
                 t = ctrl->anchor_token;
             } else {
-                const int anc_slot = int((anc_slots_nibbles >> (4 * (tid - 1))) & 0xFu);
+                const int anc_slot = int((anc_slots_bytes >> (8 * (tid - 1))) & 0xFFu);
                 t = ctrl->tree_tokens[anc_slot];
             }
             if (t >= vocab_offset && t < vocab_offset + vocab_rows) {
@@ -6490,6 +6493,8 @@ void k_dspark_tree_topk_tp3(
 
     float b0 = -1.0e38f, b1 = -1.0e38f, b2 = -1.0e38f, b3 = -1.0e38f;
     int32_t i0 = 0x7FFFFFFF, i1 = 0x7FFFFFFF, i2 = 0x7FFFFFFF, i3 = 0x7FFFFFFF;
+    float m_loc = -1.0e38f;
+    float s_loc = 0.0f;
 
     for (int v = tid; v < vocab_rows; v += 256) {
         float lg = base_logits_f32[v];
@@ -6498,6 +6503,12 @@ void k_dspark_tree_topk_tp3(
             if (do_rep && ((sh.seen[v >> 5] >> (v & 31)) & 1u)) {
                 lg = (lg > 0.0f) ? (lg / penalty) : (lg * penalty);
             }
+        }
+        if (lg > m_loc) {
+            s_loc = s_loc * expf((m_loc - lg) * inv_temp) + 1.0f;
+            m_loc = lg;
+        } else {
+            s_loc += expf((lg - m_loc) * inv_temp);
         }
         const int32_t gid = vocab_offset + v;
         if (lg > b0 || (lg == b0 && gid < i0)) {
@@ -6522,6 +6533,8 @@ void k_dspark_tree_topk_tp3(
     sh.top.val[tid][1] = b1; sh.top.id[tid][1] = i1;
     sh.top.val[tid][2] = b2; sh.top.id[tid][2] = i2;
     sh.top.val[tid][3] = b3; sh.top.id[tid][3] = i3;
+    sh.top.lse_max[tid] = m_loc;
+    sh.top.lse_sum[tid] = s_loc;
     __syncthreads();
 
     for (int half = 128; half > 0; half >>= 1) {
@@ -6546,6 +6559,15 @@ void k_dspark_tree_topk_tp3(
                 sh.top.val[tid][k] = m_val[k];
                 sh.top.id[tid][k]  = m_id[k];
             }
+            const float ma = sh.top.lse_max[tid];
+            const float sa = sh.top.lse_sum[tid];
+            const float mb = sh.top.lse_max[tid + half];
+            const float sb = sh.top.lse_sum[tid + half];
+            const float mm = fmaxf(ma, mb);
+            sh.top.lse_max[tid] = mm;
+            sh.top.lse_sum[tid] = (mm > -1.0e37f)
+                ? (sa * expf((ma - mm) * inv_temp) + sb * expf((mb - mm) * inv_temp))
+                : 0.0f;
         }
         __syncthreads();
     }
@@ -6556,6 +6578,8 @@ void k_dspark_tree_topk_tp3(
             ctrl->tree_rank_val[tree_stage][rank][k] = sh.top.val[0][k];
             ctrl->tree_rank_id[tree_stage][rank][k]  = sh.top.id[0][k];
         }
+        ctrl->tree_rank_lse_max[tree_stage][rank] = sh.top.lse_max[0];
+        ctrl->tree_rank_lse_sum[tree_stage][rank] = sh.top.lse_sum[0];
         __threadfence_system();
         __hip_atomic_store(&ctrl->ready_tree_rank_seq[tree_stage][rank], seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 
@@ -6565,6 +6589,18 @@ void k_dspark_tree_topk_tp3(
                    __hip_atomic_load(&ctrl->ready_tree_rank_seq[tree_stage][2], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq) {
                 __builtin_amdgcn_s_sleep(1);
             }
+            const float m0 = ctrl->tree_rank_lse_max[tree_stage][0];
+            const float m1 = ctrl->tree_rank_lse_max[tree_stage][1];
+            const float m2 = ctrl->tree_rank_lse_max[tree_stage][2];
+            const float gm = fmaxf(m0, fmaxf(m1, m2));
+            float gsum = 0.0f;
+            if (gm > -1.0e37f) {
+                gsum = ctrl->tree_rank_lse_sum[tree_stage][0] * expf((m0 - gm) * inv_temp) +
+                       ctrl->tree_rank_lse_sum[tree_stage][1] * expf((m1 - gm) * inv_temp) +
+                       ctrl->tree_rank_lse_sum[tree_stage][2] * expf((m2 - gm) * inv_temp);
+            }
+            const float inv_gsum = (gsum > 0.0f) ? (1.0f / gsum) : 0.0f;
+
             int cur0 = 0, cur1 = 0, cur2 = 0;
             for (int k = 0; k < B_out; ++k) {
                 int best_r = 0;
@@ -6589,6 +6625,9 @@ void k_dspark_tree_topk_tp3(
                 else if (best_r == 1) ++cur1;
                 else ++cur2;
                 ctrl->tree_tokens[out_slot + k] = (best_i < 0x7FFFFFFF) ? best_i : 0;
+                ctrl->tree_probs[out_slot + k]  = (best_i < 0x7FFFFFFF && inv_gsum > 0.0f)
+                    ? (expf((best_v - gm) * inv_temp) * inv_gsum)
+                    : 0.0f;
             }
             __threadfence_system();
             __hip_atomic_store(&ctrl->ready_tree_stage_seq[tree_stage], seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
@@ -6626,24 +6665,306 @@ void launch_dspark_pack_conf_in(
 void launch_dspark_prepare_tree_markov_emb(
     DsparkGpuSampleSlot* d_ctrl, const uint16_t* d_mapped_markov_embed_bf16,
     uint16_t* d_out_markov_emb_bf16, uint64_t seq,
-    uint32_t wait_stage_mask, uint32_t src_slots_nibbles, int num_rows, hipStream_t stream)
+    uint32_t wait_stage_mask, uint64_t src_slots_bytes, int num_rows, hipStream_t stream)
 {
     if (num_rows <= 0) return;
     hipLaunchKernelGGL(k_dspark_prepare_tree_markov_emb, dim3(1), dim3(256), 0, stream,
                        d_ctrl, d_mapped_markov_embed_bf16, d_out_markov_emb_bf16,
-                       seq, wait_stage_mask, src_slots_nibbles, num_rows);
+                       seq, wait_stage_mask, src_slots_bytes, num_rows);
 }
 
 void launch_dspark_tree_topk_tp3(
     DsparkGpuSampleSlot* d_ctrl, const float* d_base_logits_row_f32, const float* d_markov_logits_row_f32,
     uint64_t seq, int tree_stage, int out_slot, int B_out,
-    uint32_t anc_slots_nibbles, int anc_cnt,
+    uint64_t anc_slots_bytes, int anc_cnt,
     int rank, int vocab_offset, int vocab_rows, hipStream_t stream)
 {
     hipLaunchKernelGGL(k_dspark_tree_topk_tp3, dim3(1), dim3(256), 0, stream,
                        d_ctrl, d_base_logits_row_f32, d_markov_logits_row_f32,
-                       seq, tree_stage, out_slot, B_out, anc_slots_nibbles, anc_cnt,
+                       seq, tree_stage, out_slot, B_out, anc_slots_bytes, anc_cnt,
                        rank, vocab_offset, vocab_rows);
+}
+
+// =============================================================================
+// 8. Native DeepSeek-ViT + Aligner Zero-Scratch gfx906 Kernels (Stage 3)
+// =============================================================================
+
+__global__ __launch_bounds__(256)
+void k_vit_linear_epilogue_bf16(
+    const float* __restrict__ in_f32,
+    const uint16_t* __restrict__ bias_bf16,
+    const uint16_t* __restrict__ res_bf16,
+    uint16_t* __restrict__ out_bf16,
+    int M, int N,
+    bool apply_exact_gelu)
+{
+    const size_t total = static_cast<size_t>(M) * static_cast<size_t>(N);
+    const size_t idx = static_cast<size_t>(blockIdx.x) * 256u + static_cast<size_t>(threadIdx.x);
+    if (idx >= total) return;
+
+    const int col = static_cast<int>(idx % static_cast<size_t>(N));
+    float v = in_f32[idx];
+    if (bias_bf16 != nullptr) {
+        v += d_bf16_to_f32(bias_bf16[col]);
+    }
+    // Match PyTorch nn.Linear BF16 output rounding prior to GELU / residual add
+    uint16_t q = d_f32_to_bf16_rne(v);
+    if (apply_exact_gelu) {
+        const float gv = d_bf16_to_f32(q);
+        const float gelu = 0.5f * gv * (1.0f + erff(gv * 0.7071067811865475244f));
+        q = d_f32_to_bf16_rne(gelu);
+    }
+    if (res_bf16 != nullptr) {
+        const float sum = d_bf16_to_f32(res_bf16[idx]) + d_bf16_to_f32(q);
+        q = d_f32_to_bf16_rne(sum);
+    }
+    out_bf16[idx] = q;
+}
+
+// Half-split 2D-RoPE matching hf_meta/inference/vision.py:18-21 & 56-58:
+//   wqkv -> chunk(3) -> [N, 16, 64] BF16, then x1=x[...,0:32], x2=x[...,32:64],
+//   out = cat([x1*cos - x2*sin, x2*cos + x1*sin], dim=-1).to(bf16)
+__global__ __launch_bounds__(256)
+void k_vit_split_qkv_2drope_bf16(
+    const float* __restrict__ qkv_f32,
+    const uint16_t* __restrict__ wqkv_bias,
+    const float* __restrict__ cos_f32,
+    const float* __restrict__ sin_f32,
+    uint16_t* __restrict__ q_bf16,
+    uint16_t* __restrict__ k_bf16,
+    uint16_t* __restrict__ v_bf16)
+{
+    const int n = static_cast<int>(blockIdx.x);
+    const int tid = static_cast<int>(threadIdx.x); // 0..255 -> 2 (head, d_pair) items for 16*32 = 512 pairs
+    const float* row_qkv = qkv_f32 + static_cast<size_t>(n) * 3072u;
+    const float* row_cos = cos_f32 + static_cast<size_t>(n) * 32u;
+    const float* row_sin = sin_f32 + static_cast<size_t>(n) * 32u;
+
+    #pragma unroll
+    for (int it = 0; it < 2; ++it) {
+        const int pair_idx = tid + it * 256; // 0..511
+        const int h = pair_idx >> 5;         // 0..15
+        const int d = pair_idx & 31;         // 0..31
+        const int off1 = h * 64 + d;
+        const int off2 = h * 64 + 32 + d;
+
+        const float c = row_cos[d];
+        const float s = row_sin[d];
+
+        // Q (0..1023): Linear BF16 round -> half-split 2D-RoPE -> BF16 round
+        const float q1 = d_bf16_to_f32(d_f32_to_bf16_rne(row_qkv[off1] + d_bf16_to_f32(wqkv_bias[off1])));
+        const float q2 = d_bf16_to_f32(d_f32_to_bf16_rne(row_qkv[off2] + d_bf16_to_f32(wqkv_bias[off2])));
+        q_bf16[static_cast<size_t>(n) * 1024u + static_cast<size_t>(off1)] = d_f32_to_bf16_rne(q1 * c - q2 * s);
+        q_bf16[static_cast<size_t>(n) * 1024u + static_cast<size_t>(off2)] = d_f32_to_bf16_rne(q2 * c + q1 * s);
+
+        // K (1024..2047): Linear BF16 round -> half-split 2D-RoPE -> BF16 round
+        const int koff1 = 1024 + off1;
+        const int koff2 = 1024 + off2;
+        const float k1 = d_bf16_to_f32(d_f32_to_bf16_rne(row_qkv[koff1] + d_bf16_to_f32(wqkv_bias[koff1])));
+        const float k2 = d_bf16_to_f32(d_f32_to_bf16_rne(row_qkv[koff2] + d_bf16_to_f32(wqkv_bias[koff2])));
+        k_bf16[static_cast<size_t>(n) * 1024u + static_cast<size_t>(off1)] = d_f32_to_bf16_rne(k1 * c - k2 * s);
+        k_bf16[static_cast<size_t>(n) * 1024u + static_cast<size_t>(off2)] = d_f32_to_bf16_rne(k2 * c + k1 * s);
+
+        // V (2048..3071): Linear BF16 round directly
+        const int voff1 = 2048 + off1;
+        const int voff2 = 2048 + off2;
+        v_bf16[static_cast<size_t>(n) * 1024u + static_cast<size_t>(off1)] =
+            d_f32_to_bf16_rne(row_qkv[voff1] + d_bf16_to_f32(wqkv_bias[voff1]));
+        v_bf16[static_cast<size_t>(n) * 1024u + static_cast<size_t>(off2)] =
+            d_f32_to_bf16_rne(row_qkv[voff2] + d_bf16_to_f32(wqkv_bias[voff2]));
+    }
+}
+
+// Zero-scratch Bidirectional FlashAttention-2 for DeepSeek-ViT (16 heads, head_dim=64, scale=0.125f):
+//   blockDim.x = 256 = 16 query rows (qr=0..15) x 16 lanes/query (dl=0..15, 4 dims/lane).
+//   16 aligned lanes lie strictly inside a quarter-wavefront on gfx906 (waveSize=64), so
+//   __shfl_xor(..., 8/4/2/1, 64) reduces 64-dim Q.K^T in 4 instructions with 0 scratch & 8.25 KiB LDS!
+__global__ __launch_bounds__(256, 4)
+void k_vit_bidir_flash_attn_bf16(
+    const uint16_t* __restrict__ q_bf16,
+    const uint16_t* __restrict__ k_bf16,
+    const uint16_t* __restrict__ v_bf16,
+    uint16_t* __restrict__ out_bf16,
+    int N_patches)
+{
+    __shared__ float s_k[16][65];
+    __shared__ float s_v[16][65];
+
+    const int q_base = static_cast<int>(blockIdx.x) * 16;
+    const int h      = static_cast<int>(blockIdx.y); // 0..15
+    const int tid    = static_cast<int>(threadIdx.x);
+    const int qr     = tid >> 4;                     // 0..15
+    const int dl     = tid & 15;                     // 0..15
+    const int d0     = dl * 4;
+    const int gq     = q_base + qr;
+
+    float q0 = 0.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
+    if (gq < N_patches) {
+        const size_t q_off = (static_cast<size_t>(gq) * 16u + static_cast<size_t>(h)) * 64u + static_cast<size_t>(d0);
+        q0 = d_bf16_to_f32(q_bf16[q_off + 0]) * 0.125f;
+        q1 = d_bf16_to_f32(q_bf16[q_off + 1]) * 0.125f;
+        q2 = d_bf16_to_f32(q_bf16[q_off + 2]) * 0.125f;
+        q3 = d_bf16_to_f32(q_bf16[q_off + 3]) * 0.125f;
+    }
+
+    float m_i = -1.0e30f;
+    float l_i = 0.0f;
+    float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+
+    for (int kb = 0; kb < N_patches; kb += 16) {
+        const int gk = kb + qr;
+        if (gk < N_patches) {
+            const size_t kv_off = (static_cast<size_t>(gk) * 16u + static_cast<size_t>(h)) * 64u + static_cast<size_t>(d0);
+            s_k[qr][d0 + 0] = d_bf16_to_f32(k_bf16[kv_off + 0]);
+            s_k[qr][d0 + 1] = d_bf16_to_f32(k_bf16[kv_off + 1]);
+            s_k[qr][d0 + 2] = d_bf16_to_f32(k_bf16[kv_off + 2]);
+            s_k[qr][d0 + 3] = d_bf16_to_f32(k_bf16[kv_off + 3]);
+            s_v[qr][d0 + 0] = d_bf16_to_f32(v_bf16[kv_off + 0]);
+            s_v[qr][d0 + 1] = d_bf16_to_f32(v_bf16[kv_off + 1]);
+            s_v[qr][d0 + 2] = d_bf16_to_f32(v_bf16[kv_off + 2]);
+            s_v[qr][d0 + 3] = d_bf16_to_f32(v_bf16[kv_off + 3]);
+        }
+        __syncthreads();
+
+        const int valid_k = (N_patches - kb < 16) ? (N_patches - kb) : 16;
+        for (int j = 0; j < valid_k; ++j) {
+            float dot = q0 * s_k[j][d0 + 0] + q1 * s_k[j][d0 + 1] +
+                        q2 * s_k[j][d0 + 2] + q3 * s_k[j][d0 + 3];
+            dot += __shfl_xor(dot, 8, 64);
+            dot += __shfl_xor(dot, 4, 64);
+            dot += __shfl_xor(dot, 2, 64);
+            dot += __shfl_xor(dot, 1, 64);
+
+            const float m_new = fmaxf(m_i, dot);
+            const float alpha = __expf(m_i - m_new);
+            const float p     = __expf(dot - m_new);
+            l_i = l_i * alpha + p;
+            o0  = o0 * alpha + p * s_v[j][d0 + 0];
+            o1  = o1 * alpha + p * s_v[j][d0 + 1];
+            o2  = o2 * alpha + p * s_v[j][d0 + 2];
+            o3  = o3 * alpha + p * s_v[j][d0 + 3];
+            m_i = m_new;
+        }
+        __syncthreads();
+    }
+
+    if (gq < N_patches) {
+        const float inv_l = 1.0f / fmaxf(l_i, 1.0e-30f);
+        const size_t out_off = (static_cast<size_t>(gq) * 16u + static_cast<size_t>(h)) * 64u + static_cast<size_t>(d0);
+        out_bf16[out_off + 0] = d_f32_to_bf16_rne(o0 * inv_l);
+        out_bf16[out_off + 1] = d_f32_to_bf16_rne(o1 * inv_l);
+        out_bf16[out_off + 2] = d_f32_to_bf16_rne(o2 * inv_l);
+        out_bf16[out_off + 3] = d_f32_to_bf16_rne(o3 * inv_l);
+    }
+}
+
+// Unclamped SwiGLU on concatenated [gate (inter_dim), up (inter_dim)] matching vision.py:69-71
+__global__ __launch_bounds__(256)
+void k_vit_swiglu_split_bf16(
+    const uint16_t* __restrict__ gateup_bf16,
+    uint16_t* __restrict__ out_bf16,
+    int N_patches,
+    int inter_dim)
+{
+    const size_t total = static_cast<size_t>(N_patches) * static_cast<size_t>(inter_dim);
+    const size_t idx = static_cast<size_t>(blockIdx.x) * 256u + static_cast<size_t>(threadIdx.x);
+    if (idx >= total) return;
+
+    const size_t row = idx / static_cast<size_t>(inter_dim);
+    const size_t col = idx % static_cast<size_t>(inter_dim);
+    const size_t src_base = row * static_cast<size_t>(2 * inter_dim);
+    const float g = d_bf16_to_f32(gateup_bf16[src_base + col]);
+    const float u = d_bf16_to_f32(gateup_bf16[src_base + static_cast<size_t>(inter_dim) + col]);
+    const float silu_g = g / (1.0f + __expf(-g));
+    out_bf16[idx] = d_f32_to_bf16_rne(silu_g * u);
+}
+
+// Exact Aligner 3x3 pixel-unshuffle matching vision.py:114-118:
+//   x.view(n_h, n_w, C).permute(2, 0, 1) -> F.pad((0, -n_w%3, 0, -n_h%3)) -> F.unfold(3, stride=3).T
+//   Output column order is channel-outer: col = c * 9 + dy * 3 + dx!
+__global__ __launch_bounds__(256)
+void k_vit_unshuffle3x3_bf16(
+    const uint16_t* __restrict__ in_bf16,
+    uint16_t* __restrict__ out_bf16,
+    int n_h,
+    int n_w,
+    int C)
+{
+    const int n_llm_h = (n_h + 2) / 3;
+    const int n_llm_w = (n_w + 2) / 3;
+    const int L = n_llm_h * n_llm_w;
+    const int out_dim = C * 9;
+    const size_t total = static_cast<size_t>(L) * static_cast<size_t>(out_dim);
+    const size_t idx = static_cast<size_t>(blockIdx.x) * 256u + static_cast<size_t>(threadIdx.x);
+    if (idx >= total) return;
+
+    const int tok = static_cast<int>(idx / static_cast<size_t>(out_dim));
+    const int col = static_cast<int>(idx % static_cast<size_t>(out_dim));
+    const int rh  = tok / n_llm_w;
+    const int rw  = tok % n_llm_w;
+    const int c   = col / 9;
+    const int rem = col % 9;
+    const int dy  = rem / 3;
+    const int dx  = rem % 3;
+
+    const int sh = rh * 3 + dy;
+    const int sw = rw * 3 + dx;
+    uint16_t val = 0u;
+    if (sh < n_h && sw < n_w) {
+        val = in_bf16[(static_cast<size_t>(sh * n_w + sw) * static_cast<size_t>(C)) + static_cast<size_t>(c)];
+    }
+    out_bf16[idx] = val;
+}
+
+void launch_vit_linear_epilogue_bf16(
+    const float* d_in_f32, const uint16_t* d_bias_bf16, const uint16_t* d_res_bf16,
+    uint16_t* d_out_bf16, int M, int N, bool apply_exact_gelu, hipStream_t stream)
+{
+    if (M <= 0 || N <= 0) return;
+    const size_t total = static_cast<size_t>(M) * static_cast<size_t>(N);
+    hipLaunchKernelGGL(k_vit_linear_epilogue_bf16, dim3((total + 255u) / 256u), dim3(256), 0, stream,
+                       d_in_f32, d_bias_bf16, d_res_bf16, d_out_bf16, M, N, apply_exact_gelu);
+}
+
+void launch_vit_split_qkv_2drope_bf16(
+    const float* d_qkv_f32, const uint16_t* d_wqkv_bias,
+    const float* d_cos_f32, const float* d_sin_f32,
+    uint16_t* d_q_bf16, uint16_t* d_k_bf16, uint16_t* d_v_bf16,
+    int N_patches, hipStream_t stream)
+{
+    if (N_patches <= 0) return;
+    hipLaunchKernelGGL(k_vit_split_qkv_2drope_bf16, dim3(N_patches), dim3(256), 0, stream,
+                       d_qkv_f32, d_wqkv_bias, d_cos_f32, d_sin_f32, d_q_bf16, d_k_bf16, d_v_bf16);
+}
+
+void launch_vit_bidir_flash_attn_bf16(
+    const uint16_t* d_q_bf16, const uint16_t* d_k_bf16, const uint16_t* d_v_bf16,
+    uint16_t* d_out_bf16, int N_patches, hipStream_t stream)
+{
+    if (N_patches <= 0) return;
+    hipLaunchKernelGGL(k_vit_bidir_flash_attn_bf16, dim3((N_patches + 15) / 16, 16), dim3(256), 0, stream,
+                       d_q_bf16, d_k_bf16, d_v_bf16, d_out_bf16, N_patches);
+}
+
+void launch_vit_swiglu_split_bf16(
+    const uint16_t* d_gateup_bf16, uint16_t* d_out_bf16,
+    int N_patches, int inter_dim, hipStream_t stream)
+{
+    if (N_patches <= 0 || inter_dim <= 0) return;
+    const size_t total = static_cast<size_t>(N_patches) * static_cast<size_t>(inter_dim);
+    hipLaunchKernelGGL(k_vit_swiglu_split_bf16, dim3((total + 255u) / 256u), dim3(256), 0, stream,
+                       d_gateup_bf16, d_out_bf16, N_patches, inter_dim);
+}
+
+void launch_vit_unshuffle3x3_bf16(
+    const uint16_t* d_in_bf16, uint16_t* d_out_bf16,
+    int n_h, int n_w, int C, hipStream_t stream)
+{
+    if (n_h <= 0 || n_w <= 0 || C <= 0) return;
+    const size_t L = static_cast<size_t>((n_h + 2) / 3) * static_cast<size_t>((n_w + 2) / 3);
+    const size_t total = L * static_cast<size_t>(C * 9);
+    hipLaunchKernelGGL(k_vit_unshuffle3x3_bf16, dim3((total + 255u) / 256u), dim3(256), 0, stream,
+                       d_in_bf16, d_out_bf16, n_h, n_w, C);
 }
 
 }  // namespace dsv41

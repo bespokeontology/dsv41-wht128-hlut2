@@ -69,6 +69,13 @@ public:
         int count,
         int start_pos);
 
+    // Compute single anchor token's 48 row IDs (24 L1 + 24 L14) at `pos` without mutating `seq_cache_`
+    void compute_anchor_row0_hashes(
+        int32_t anchor_tok,
+        int pos,
+        bool is_image,
+        int64_t out_hashes48[48]) const;
+
     void gather_dequant_tp3(
         int engram_idx,
         const int64_t* all_hashes,
@@ -76,7 +83,8 @@ public:
         const uint8_t* image_mask,
         uint16_t* out_tp0_bf16,
         uint16_t* out_tp1_bf16,
-        uint16_t* out_tp2_bf16) const;
+        uint16_t* out_tp2_bf16,
+        int s_start = 0) const;
 
     void ensure_seq_cache_capacity(int min_len) {
         if (min_len > int(seq_cache_.size())) {

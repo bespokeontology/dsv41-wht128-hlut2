@@ -406,7 +406,7 @@ void Dsv41EngramEngine::prefault_all_tables() {
     }
     if (total_bytes == 0) return;
 
-    std::printf("[DSV41_ENGRAM] Pre-faulting %.2f GiB Engram tables into 384 GiB DDR4 concurrently across Dual-NVMe (NVMe0 + NVMe1)...\n",
+    std::printf("[DSV41_ENGRAM] Pre-faulting %.2f GiB Engram tables into 384 GiB DDR4 concurrently across Dual-NVMe controllers...\n",
                 double(total_bytes) / (1024.0 * 1024.0 * 1024.0));
     std::fflush(stdout);
 
@@ -445,15 +445,16 @@ void Dsv41EngramEngine::compute_hashes(
     std::vector<int64_t>& out_hashes)
 {
     static constexpr int32_t kDead = -1;
+    static constexpr int32_t kImageTokenId = 129264;
     if (start_pos + seqlen > int(seq_cache_.size())) {
         seq_cache_.resize(size_t(start_pos + seqlen + 4096), pad_compressed_id_);
     }
 
     for (int s = 0; s < seqlen; ++s) {
-        if (image_mask && image_mask[s]) {
+        const int32_t tid = token_ids[s];
+        if ((image_mask && image_mask[s]) || tid == kImageTokenId) {
             seq_cache_[size_t(start_pos + s)] = kDead;
         } else {
-            const int32_t tid = token_ids[s];
             const int32_t cid = (tid >= 0 && size_t(tid) < token_map_.size()) ? token_map_[size_t(tid)] : pad_compressed_id_;
             seq_cache_[size_t(start_pos + s)] = cid;
         }
@@ -518,7 +519,11 @@ void Dsv41EngramEngine::compute_hashes_tree(
     int32_t node_cid[32];
     for (int s = 0; s < M; ++s) {
         const int32_t tid = token_ids[s];
-        node_cid[s] = (tid >= 0 && size_t(tid) < token_map_.size()) ? token_map_[size_t(tid)] : pad_compressed_id_;
+        if (tid == 129264) {
+            node_cid[s] = kDead;
+        } else {
+            node_cid[s] = (tid >= 0 && size_t(tid) < token_map_.size()) ? token_map_[size_t(tid)] : pad_compressed_id_;
+        }
     }
 
     out_hashes.resize(size_t(M) * 2ULL * 24ULL);
@@ -590,8 +595,70 @@ void Dsv41EngramEngine::commit_accepted_tokens(
     }
     for (int i = 0; i < count; ++i) {
         const int32_t tid = accepted_tokens[i];
-        const int32_t cid = (tid >= 0 && size_t(tid) < token_map_.size()) ? token_map_[size_t(tid)] : pad_compressed_id_;
-        seq_cache_[size_t(start_pos + i)] = cid;
+        if (tid == 129264) {
+            seq_cache_[size_t(start_pos + i)] = -1;
+        } else {
+            const int32_t cid = (tid >= 0 && size_t(tid) < token_map_.size()) ? token_map_[size_t(tid)] : pad_compressed_id_;
+            seq_cache_[size_t(start_pos + i)] = cid;
+        }
+    }
+}
+
+void Dsv41EngramEngine::compute_anchor_row0_hashes(
+    int32_t anchor_tok,
+    int pos,
+    bool is_image,
+    int64_t out_hashes48[48]) const
+{
+    static constexpr int32_t kDead = -1;
+    static constexpr int32_t kImageTokenId = 129264;
+    const int32_t cid0 = (is_image || anchor_tok == kImageTokenId)
+        ? kDead
+        : ((anchor_tok >= 0 && size_t(anchor_tok) < token_map_.size())
+               ? token_map_[size_t(anchor_tok)]
+               : pad_compressed_id_);
+
+    int64_t toks[4];
+    bool blocked = false;
+    for (int shift = 0; shift < 4; ++shift) {
+        const int idx = pos - shift;
+        if (idx < 0) {
+            blocked = true;
+            toks[shift] = int64_t(pad_compressed_id_);
+        } else {
+            const int32_t src = (shift == 0)
+                ? cid0
+                : ((size_t(idx) < seq_cache_.size()) ? seq_cache_[size_t(idx)] : pad_compressed_id_);
+            if (src == kDead) blocked = true;
+            toks[shift] = blocked ? int64_t(pad_compressed_id_) : int64_t(src);
+        }
+    }
+
+    for (int l = 0; l < 2; ++l) {
+        int64_t* dst = out_hashes48 + size_t(l) * 24ULL;
+        int64_t rolling = toks[0] * multipliers_[l][0];
+        for (int i = 1; i < 4; ++i) {
+            rolling ^= (toks[i] * multipliers_[l][i]);
+            const int base_col = (i - 1) * 8;
+            const uint64_t ux = uint64_t(rolling);
+            const __m256d vx0 = _mm256_set1_pd(double(ux & 0x1FFFFFULL));
+            const __m256d vx1 = _mm256_set1_pd(double((ux >> 21) & 0x1FFFFFULL));
+            const __m256d vx2 = _mm256_set1_pd(double((ux >> 42) & 0x1FFFFFULL));
+            const __m256d vb63 = _mm256_set1_pd(double(ux >> 63));
+            for (int g = 0; g < 2; ++g) {
+                const int c0 = base_col + g * 4;
+                const __m256d vp = _mm256_load_pd(&barrett_p_[l][c0]);
+                const __m256d vinv = _mm256_load_pd(&barrett_inv_p_[l][c0]);
+                __m256d vS = _mm256_fmadd_pd(vx1, _mm256_load_pd(&barrett_r21_[l][c0]), vx0);
+                vS = _mm256_fmadd_pd(vx2, _mm256_load_pd(&barrett_r42_[l][c0]), vS);
+                vS = _mm256_fmadd_pd(vb63, _mm256_load_pd(&barrett_r63_neg_[l][c0]), vS);
+                const __m256d vq = _mm256_floor_pd(_mm256_mul_pd(vS, vinv));
+                __m256d vrem = _mm256_fnmadd_pd(vq, vp, vS);
+                vrem = _mm256_sub_pd(vrem, _mm256_and_pd(_mm256_cmp_pd(vrem, vp, _CMP_GE_OQ), vp));
+                const __m128i vi32 = _mm256_cvttpd_epi32(_mm256_add_pd(vrem, _mm256_load_pd(&barrett_off_[l][c0])));
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + c0), _mm256_cvtepi32_epi64(vi32));
+            }
+        }
     }
 }
 
@@ -602,13 +669,18 @@ void Dsv41EngramEngine::gather_dequant_tp3(
     const uint8_t* image_mask,
     uint16_t* out_tp0_bf16,
     uint16_t* out_tp1_bf16,
-    uint16_t* out_tp2_bf16) const
+    uint16_t* out_tp2_bf16,
+    int s_start) const
 {
+    const int s0 = std::max(0, std::min(s_start, seqlen));
+    const int n_rows = seqlen - s0;
+    if (n_rows <= 0) return;
+
     uint16_t* outs[3] = {out_tp0_bf16, out_tp1_bf16, out_tp2_bf16};
     const auto& tbl = tables_.at(engram_idx);
     if (!tbl.weight_fp8 || !tbl.scale_ue8m0) {
         for (int tp = 0; tp < 3; ++tp) {
-            std::memset(outs[tp], 0, size_t(seqlen) * 2048ULL * sizeof(uint16_t));
+            std::memset(outs[tp] + size_t(s0) * 2048ULL, 0, size_t(n_rows) * 2048ULL * sizeof(uint16_t));
         }
         return;
     }
@@ -616,12 +688,12 @@ void Dsv41EngramEngine::gather_dequant_tp3(
     const auto& luts = dequant_luts();
     const uint8_t* __restrict__ w_base = tbl.weight_fp8;
     const uint8_t* __restrict__ s_base = tbl.scale_ue8m0;
-    const int total_jobs = seqlen * 24;
+    const int total_jobs = n_rows * 24;
 
-    // Small-M OpenMP Gate + Hardware MSHR Prefetch Burst (seqlen=1: 0 OpenMP barrier; seqlen<=16: 4..6 threads)
-    if (seqlen <= 16) {
+    // Small-M OpenMP Gate + Hardware MSHR Prefetch Burst (n_rows=1: 0 OpenMP barrier; n_rows<=16: 4..6 threads)
+    if (n_rows <= 16) {
         for (int job = 0; job < total_jobs; ++job) {
-            const int s = job / 24;
+            const int s = s0 + job / 24;
             if (image_mask && image_mask[s]) continue;
             const int col = job % 24;
             const int64_t row_id = all_hashes[(size_t(s) * 2ULL + size_t(engram_idx)) * 24ULL + size_t(col)];
@@ -633,25 +705,25 @@ void Dsv41EngramEngine::gather_dequant_tp3(
             _mm_prefetch(reinterpret_cast<const char*>(s_base + size_t(row_id) * 8ULL), _MM_HINT_T0);
         }
 
-        if (seqlen == 1) {
+        if (n_rows == 1) {
             for (int col = 0; col < 24; ++col) {
                 const int tp = col >> 3;
                 const int local_col = col & 7;
-                uint16_t* __restrict__ dst = outs[tp] + size_t(local_col) * 256ULL;
-                if (image_mask && image_mask[0]) {
+                uint16_t* __restrict__ dst = outs[tp] + (size_t(s0) * 8ULL + size_t(local_col)) * 256ULL;
+                if (image_mask && image_mask[s0]) {
                     std::memset(dst, 0, 256 * sizeof(uint16_t));
                     continue;
                 }
-                const int64_t row_id = all_hashes[size_t(engram_idx) * 24ULL + size_t(col)];
+                const int64_t row_id = all_hashes[(size_t(s0) * 2ULL + size_t(engram_idx)) * 24ULL + size_t(col)];
                 dequant_engram_row_avx2(w_base + size_t(row_id) * 256ULL, s_base + size_t(row_id) * 8ULL, luts, dst);
             }
             return;
         }
 
-        const int nth = (seqlen <= 8) ? 4 : 6;
+        const int nth = (n_rows <= 8) ? 4 : 6;
         #pragma omp parallel for num_threads(nth) schedule(static)
         for (int job = 0; job < total_jobs; ++job) {
-            const int s = job / 24;
+            const int s = s0 + job / 24;
             const int col = job % 24;
             const int tp = col >> 3;
             const int local_col = col & 7;
@@ -666,22 +738,24 @@ void Dsv41EngramEngine::gather_dequant_tp3(
         return;
     }
 
-    // Large-M prefill path (M > 6): full-socket OpenMP + 16-token (384-job) DDR4 MSHR software prefetch lookahead
+    // Large-M prefill path (n_rows > 16): full-socket OpenMP + 16-token (384-job) DDR4 MSHR software prefetch lookahead
     #pragma omp parallel for schedule(static)
     for (int job = 0; job < total_jobs; ++job) {
         if (job + 384 < total_jobs) {
-            const int ps = (job + 384) / 24;
-            const int pcol = (job + 384) % 24;
-            const int64_t prow = all_hashes[(size_t(ps) * 2ULL + size_t(engram_idx)) * 24ULL + size_t(pcol)];
-            const uint8_t* pwr = w_base + size_t(prow) * 256ULL;
-            _mm_prefetch(reinterpret_cast<const char*>(pwr), _MM_HINT_T0);
-            _mm_prefetch(reinterpret_cast<const char*>(pwr + 64), _MM_HINT_T0);
-            _mm_prefetch(reinterpret_cast<const char*>(pwr + 128), _MM_HINT_T0);
-            _mm_prefetch(reinterpret_cast<const char*>(pwr + 192), _MM_HINT_T0);
-            _mm_prefetch(reinterpret_cast<const char*>(s_base + size_t(prow) * 8ULL), _MM_HINT_T0);
+            const int ps = s0 + (job + 384) / 24;
+            if (!image_mask || !image_mask[ps]) {
+                const int pcol = (job + 384) % 24;
+                const int64_t prow = all_hashes[(size_t(ps) * 2ULL + size_t(engram_idx)) * 24ULL + size_t(pcol)];
+                const uint8_t* pwr = w_base + size_t(prow) * 256ULL;
+                _mm_prefetch(reinterpret_cast<const char*>(pwr), _MM_HINT_T0);
+                _mm_prefetch(reinterpret_cast<const char*>(pwr + 64), _MM_HINT_T0);
+                _mm_prefetch(reinterpret_cast<const char*>(pwr + 128), _MM_HINT_T0);
+                _mm_prefetch(reinterpret_cast<const char*>(pwr + 192), _MM_HINT_T0);
+                _mm_prefetch(reinterpret_cast<const char*>(s_base + size_t(prow) * 8ULL), _MM_HINT_T0);
+            }
         }
 
-        const int s = job / 24;
+        const int s = s0 + job / 24;
         const int col = job % 24;
         const int tp = col >> 3;
         const int local_col = col & 7;

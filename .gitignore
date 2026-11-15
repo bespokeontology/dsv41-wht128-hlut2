@@ -19,7 +19,6 @@ bin/
 *.zip
 .env
 settings.yaml
-AGENTS.md
 logs/
 radix_cache_nvme0/
 radix_cache_nvme1/

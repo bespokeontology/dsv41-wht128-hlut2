@@ -582,9 +582,10 @@ void launch_keep_dpm_warm(
     hipStream_t stream);
 
 // 7. GPU-Resident 5-Step DSpark Markov + Sliding RepPenalty + Borel Full-Partition Top-p/Greedy Sampler (1 sync instead of 19!)
-static constexpr int kDsparkMaxCand    = 4096;
-static constexpr int kDsparkMaxStages  = 12;   // Up to 10 stages for M=16 balanced tree (4 stages for M=8)
-static constexpr int kDsparkMaxTopkOut = 4;    // Top-4 root branching for M=16 (Top-3 for M=8)
+static constexpr int kDsparkMaxCand      = 4096;
+static constexpr int kDsparkMaxStages    = 16;   // Up to 13 stages for Wave 8.2D DeepSelect 29-node pool (4 stages for M=8)
+static constexpr int kDsparkMaxTopkOut   = 4;    // Top-4 stage branching
+static constexpr int kDsparkPoolMaxNodes = 32;   // 29-node DeepSelect candidate pool (root 0 + 28 draft candidates)
 
 struct DsparkGpuSampleSlot {
     uint64_t call_seq;
@@ -614,12 +615,15 @@ struct DsparkGpuSampleSlot {
     float    out_conf_logits[5];
     float    out_root_top1_prob;
 
-    // Deterministic top-B M=8 / M=16 causal tree extraction (Dirac delta proposals)
+    // Deterministic top-B M=8 / Wave 8.2D DeepSelect M=16 causal tree extraction (Dirac delta proposals)
     alignas(64) uint64_t ready_tree_rank_seq[kDsparkMaxStages][3];
     alignas(64) uint64_t ready_tree_stage_seq[kDsparkMaxStages];
     float    tree_rank_val[kDsparkMaxStages][3][kDsparkMaxTopkOut];
     int32_t  tree_rank_id[kDsparkMaxStages][3][kDsparkMaxTopkOut];
-    int32_t  tree_tokens[16];
+    float    tree_rank_lse_max[kDsparkMaxStages][3];
+    float    tree_rank_lse_sum[kDsparkMaxStages][3];
+    int32_t  tree_tokens[kDsparkPoolMaxNodes];
+    float    tree_probs[kDsparkPoolMaxNodes];
 
     uint32_t kept_cnt[5];
     int32_t  kept_id[5][kDsparkMaxCand];
@@ -663,23 +667,67 @@ void launch_dspark_prepare_tree_markov_emb(
     uint16_t* d_out_markov_emb_bf16,            // [num_rows, 256] local HBM2
     uint64_t seq,
     uint32_t wait_stage_mask,                   // bitmask of ready_tree_stage_seq stages to wait on
-    uint32_t src_slots_nibbles,                 // 4-bit tree_tokens indices per output row (0..num_rows-1)
+    uint64_t src_slots_bytes,                   // 8-bit tree_tokens[] pool indices per output row (0..num_rows-1)
     int num_rows,
     hipStream_t stream);
 
 void launch_dspark_tree_topk_tp3(
     DsparkGpuSampleSlot* d_ctrl,
-    const float* d_base_logits_row_f32,         // [vocab_rows] (stage 0: rep-penalized step-0 logits; stages 1..9: saved raw base row)
+    const float* d_base_logits_row_f32,         // [vocab_rows] (stage 0: rep-penalized step-0 logits; stages >= 1: saved raw base row)
     const float* d_markov_logits_row_f32,       // nullptr for stage 0; [vocab_rows] for stages >= 1
     uint64_t seq,
-    int tree_stage,                             // 0..9
-    int out_slot,                               // destination start index in tree_tokens[]
+    int tree_stage,                             // 0..15
+    int out_slot,                               // destination start index in tree_tokens[] / tree_probs[]
     int B_out,                                  // 1..4
-    uint32_t anc_slots_nibbles,                 // 4-bit ancestor indices in tree_tokens[] (0..anc_cnt-1)
+    uint64_t anc_slots_bytes,                   // 8-bit ancestor pool indices in tree_tokens[] (0..anc_cnt-1)
     int anc_cnt,                                // 0..4
     int rank,
     int vocab_offset,
     int vocab_rows,
+    hipStream_t stream);
+
+// 8. Native DeepSeek-ViT (14x14 Patch, 2D-RoPE Bidirectional FlashAttention, SwiGLU, 3x3 Unshuffle, 2-Layer GELU Aligner)
+void launch_vit_linear_epilogue_bf16(
+    const float* d_in_f32,          // [M, N] FP32 GEMM output
+    const uint16_t* d_bias_bf16,    // [N] BF16 optional bias (nullptr = 0)
+    const uint16_t* d_res_bf16,     // [M, N] BF16 optional residual to add after BF16 linear rounding (nullptr = none)
+    uint16_t* d_out_bf16,           // [M, N] BF16 output (may alias d_res_bf16)
+    int M, int N,
+    bool apply_exact_gelu,          // true for Aligner w1: bf16(F.gelu(bf16(in + bias)))
+    hipStream_t stream);
+
+void launch_vit_split_qkv_2drope_bf16(
+    const float* d_qkv_f32,         // [N_patches, 3072] FP32
+    const uint16_t* d_wqkv_bias,    // [3072] BF16
+    const float* d_cos_f32,         // [N_patches, 32] FP32
+    const float* d_sin_f32,         // [N_patches, 32] FP32
+    uint16_t* d_q_bf16,             // [N_patches, 16, 64] BF16
+    uint16_t* d_k_bf16,             // [N_patches, 16, 64] BF16
+    uint16_t* d_v_bf16,             // [N_patches, 16, 64] BF16
+    int N_patches,
+    hipStream_t stream);
+
+void launch_vit_bidir_flash_attn_bf16(
+    const uint16_t* d_q_bf16,       // [N_patches, 16, 64] BF16
+    const uint16_t* d_k_bf16,       // [N_patches, 16, 64] BF16
+    const uint16_t* d_v_bf16,       // [N_patches, 16, 64] BF16
+    uint16_t* d_out_bf16,           // [N_patches, 1024] BF16
+    int N_patches,
+    hipStream_t stream);
+
+void launch_vit_swiglu_split_bf16(
+    const uint16_t* d_gateup_bf16,  // [N_patches, 2 * inter_dim] BF16 ([gate | up])
+    uint16_t* d_out_bf16,           // [N_patches, inter_dim] BF16
+    int N_patches,
+    int inter_dim,
+    hipStream_t stream);
+
+void launch_vit_unshuffle3x3_bf16(
+    const uint16_t* d_in_bf16,      // [n_h * n_w, C] BF16 (C = 1024)
+    uint16_t* d_out_bf16,           // [ceil(n_h/3) * ceil(n_w/3), C * 9] BF16 (channel-outer F.unfold order!)
+    int n_h,
+    int n_w,
+    int C,
     hipStream_t stream);
 
 }  // namespace dsv41

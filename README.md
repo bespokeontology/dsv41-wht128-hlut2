@@ -1,52 +1,26 @@
-# `WHT128-HLUT2` + `561`-Expert `TARQ RAREBAL-LDLQ` (`2.125 bpw → FP32`) on `2× Custom TSMC 6nm Tenstorrent Blackhole P150A` Spatial Dataflow ASICs: `1M`-Context C++ Engine for 748.6B `DeepSeek-V4.1-Flash-1017` (`v1.2.0-wave8`)
+# `WHT128-HLUT2` + `561`-Expert `TARQ RAREBAL-LDLQ` (`2.125 bpw → FP32`) on `2× Custom TSMC 6nm Tenstorrent Blackhole P150A` ASICs: `1M`-Context Multimodal C++ Engine for 763B `DeepSeek-V4.1-Flash-1017` (`v1.3.0-wave8.3`)
 
-**Co-Engineered by [**`bespokeontology`**](https://github.com/bespokeontology), [**Google Antigravity (Google DeepMind)**](https://antigravity.google/), & [**Gemini (Google DeepMind)**](https://deepmind.google/technologies/gemini/)** · **100% Pure TT-Metal C++20 / `gfx906` HIP / Host C++17 (`0` Python Files)**  
-📄 **[4-Page Illustrated Whitepaper (PDF)](docs/WHT128_HLUT2_Blackhole_P150A_Whitepaper.pdf)** · 📘 **[Full Wave 8 Engineering Report (`docs/WHT128_HLUT2_ENGINEERING_REPORT.md`)](docs/WHT128_HLUT2_ENGINEERING_REPORT.md)** · 📦 **[`v1.2.0-wave8` Release & `561`-Expert `RAREBAL` Shards](https://github.com/bespokeontology/dsv41-wht128-hlut2/releases/tag/v1.2.0-wave8)**
-
----
-
-## Overview
-
-This repository contains the clean-room, zero-Python production inference engine and custom **`WHT128-HLUT2` + `561`-Expert `TARQ RAREBAL-LDLQ` (`2.125 bpw → IEEE FP32`)** quantization stack for **[`deepseek-ai/DeepSeek-V4.1-Flash-1017`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)** (**`748.6B` total parameters**: `559.7B` `40`-layer [`CSA2`](https://zartbot.github.io/blog/model_arch/dsv41flash_arch/en.html) MoE + `188.83 GiB` external [`Engram`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/main/inference/engram.py) `N`-gram memory + `3`-stage [`DSpark`](https://rocm.docs.amd.com/projects/atom/en/latest/deepseek_v41_dspark.html) speculative drafter), co-designed across heterogeneous non-CUDA silicon up to **`1,048,576` (`1M`) active context tokens**:
-
-1. **[`2× Tenstorrent Blackhole P150A`](https://docs.tenstorrent.com/aibs/blackhole/index.html) Custom TSMC `6nm` (`N6`) Spatial Dataflow ASICs (Lead Sparse MoE Tier):** `220` compute Tensix cores (`2 × 110`, each with `5` RISC-V baby cores + `32×32` `HiFi2`/`FP32` Matrix Engine + `32`-lane Vector `SFPU` + dual `NoC` routers), `64 GiB` GDDR6 (`MP`), and **`2× 180 MB = 360 MB` on-die Tensix L1 SRAM** (**`247.82 MiB` pure active L1** [`123.91 MiB/card = 129,927,808 B/card`], **`34/34` `RAREBAL`-calibrated TP2 hot shards = `152.40 MiB`** pinned in L1 alongside `100%` L1-resident `x_decode` and `finish_decode[0..1]`), cross-wired card-to-card via **`4× 800G` QSFP-DD cables** (`3.2 Tbps` `FABRIC_1D` TP2), with **Card `#1` running behind a narrow `PCIe x4` host riser**.
-2. **`3× AMD Instinct MI50` (Dense Backbone, `1M` Tiered `CSA2`, & Dual-Stream `DSpark` Causal-Tree Tier):** `96 GiB` HBM2 (`Vega20 gfx906` TP3, **`91/91` runtime + `3/3` verification HIP kernels at `ScratchSize == 0`**, `0` PCIe BAR P2P reads via coherent pinned-`DDR4` `FP32` `HostRingAllReduce` + pre-`shared_experts` dual-stream `4`-slot `25,680 KiB` `/dev/shm` fast ring).
-3. **`AMD EPYC` + Dual NVMe (`Engram`, `1M` Warm KV Ring, Prefix Cache, & `AVX2` Tail Tier):** `384 GiB` DDR4 hosting `188.83 GiB` pre-faulted native `FP8 E4M3` `Engram` tables (`220.74 GB/s` warm hydration in `0.92 s`), coherent mapped pinned-DDR4 warm `CSA2` KV ring (`1,048,576` active context ceiling; **`217,367` & `417,556` verified live active context**), 4-tier stateless `RadixBlockCache` (`2.31B–2.68B tok/s` hot LCP), and pure-C++20 `/v1/chat/completions` + `/anthropic/v1/messages` SSE.
-
-### Headline Measured Performance (`v1.2.0-wave8` Live Agentic Engineering Sessions)
-
-* **`37.93 tok/s`** live `<think>` + 9-tool [`DSML`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/encoding/README.md) Stream `#1` decode (`τ = 4.03`, `75.6%` `DSpark` acceptance, **`+17.2%`** over `v1.1.0-wave7b`'s `32.37 tok/s` / `67.0%`) and **`35.36 tok/s`** multi-tool `26.6K–44K` `<think>` reasoning (`τ = 3.95`, **`+16.7%`** over `v1.1.0-wave7b`; up to `47.5–52.2 tok/s` peak `DSpark` decode and `39.72 tok/s` at `258.4K` ctx)
-* **`28.88 ms/step`** `3× MI50` MoE service time (**`2.01×` faster** than `v1.1.0-wave7b`'s `57.98 ms/step` via 1-CTA `k_pack_mi50_routed_pairs_compact256`) and **`35.75 ms/step`** non-overlapped `2× Blackhole P150A` wait (**`-51.9%`** vs. `74.39 ms/step`, saving **`18.57 ms/step`** of true concurrent `P150A || MI50` overlap vs. `54.33 ms/step` `P150A` device time)
-* **`0.73 ms` (`M = 1`), `2.22 ms` (`M = 6`), `2.52 ms` (`M = 8`), & `4.53 ms` (`M = 16`)** `7/7` hardware `MeshTrace` shapes across all `40` `2× Blackhole P150A` layers (`parity_cos = 1.0000000`, `0 B` extra L1 SRAM, `max_TV = 2.793e-16` on `M = 16`, live peak `τ = 4.62` across `217,367` active tokens)
-* **`561 / 561`** [`TARQ RAREBAL-LDLQ`](https://arxiv.org/pdf/2605.27808) hot experts (`10.02×` scale-up from `56`, covering **`34/34` `P150A` L1 shards** + `307` `MI50` + `37` `DSpark` MTP experts; `0` Dual Receipt violations; mean SwiGLU cosine **`0.88357 → 0.95228`**, **`+4.221 dB`** mean SNR at **`0 B` extra runtime VRAM**)
-* **`1,048,576` (`1M`) active `CSA2` context** (`268.0 / 270.0 / 960.0 MiB` free HBM2 across `tp = 0..2`, exact `1.00000000` cosine at `pos = 1,048,575`) · **`614.8 tok/s`** 20-layer [`CED` fresh prefill](https://arxiv.org/pdf/2609.19969) (`> 500 tok/s` past `146K` ctx) · **`2.68B tok/s`** Tier-0 hot LCP
+**Co-Engineered by [**`bespokeontology`**](https://github.com/bespokeontology), [**Google Antigravity (Google DeepMind)**](https://antigravity.google/), & [**Gemini (Google DeepMind)**](https://deepmind.google/technologies/gemini/)** · **100% Pure TT-Metal C++20 / `gfx906` HIP / Host C++17 (`0` Python Files, `-Werror`)**  
+📄 **[4-Page Illustrated Whitepaper (PDF)](docs/WHT128_HLUT2_Blackhole_P150A_Whitepaper.pdf)** · 📘 **[Full `v1.3.0-wave8.3` Engineering Report (`docs/WHT128_HLUT2_ENGINEERING_REPORT.md`)](docs/WHT128_HLUT2_ENGINEERING_REPORT.md)** · 🚀 **[`v1.3.0-wave8.3` Release](https://github.com/bespokeontology/dsv41-wht128-hlut2/releases/tag/v1.3.0-wave8.3)** · 📦 **[`561`-Expert `RAREBAL` Shards (`v1.2.0-wave8`)](https://github.com/bespokeontology/dsv41-wht128-hlut2/releases/tag/v1.2.0-wave8)**
 
 ---
 
-## Wave 8 (`v1.2.0-wave8`) Architectural Breakthroughs
+## `v1.3.0-wave8.3` Release Highlights (Wave 8.3 Canonical: Vision + `0.72 s` Cold NVMe `CSA2` KV + `Dynamic DeepSelect8`)
 
-1. **Track 8A — Pre-`shared_experts` Dual-Stream `P150A || MI50` Overlap & 1-CTA `compact256` Pair Packer:**
-   * Forks `tp = 0`'s high-priority `router_stream` (`stream_prio = [1..-1]`) onto a `4`-slot **`25,680 KiB` host-mapped `/dev/shm` fast ring** (`100,000` PCIe coherency iterations in `3,978.30 ms`, `stale_reads = 0`) and orders `ev_p150_armed_ring` **strictly before `shared_experts`**, ensuring `MI50` CU saturation never delays `P150A` doorbell wake-up.
-   * Replaces multi-launch pair sorting on decode/tree steps (`M <= 16`) with a single zero-scratch `256`-thread `k_pack_mi50_routed_pairs_compact256` kernel, cutting `MI50` MoE time **`2.01×` (`57.98 → 28.88 ms/step`)** and saving **`18.57 ms/step`** of parallel `P150A || MI50` execution.
-2. **Track 8B — `7/7` `MeshTrace` (`M = 1..1,024`) & Entropy-Adaptive `M = 8 ↔ 16` Kolmogorov–Dirac Causal Tree (`0 B` Extra L1):**
-   * Embeds `M = 16` causal-tree verification directly inside `P150A`'s existing `32`-row L1 `x_decode` tile (**`0 B` extra L1**, `1,453,184 B <= 1,459,200 B/bank`, `247.82 MiB` pure active L1 across `2× P150A`) with SGPR `TreeAncMask256` attention (`ScratchSize == 0`) and exact Dirac Plackett–Luce coupling (`max_TV = 2.793e-16 < 1e-15`, `--dspark-tree-width auto|8|16`).
-3. **Track 8C — `561`-Expert `TARQ RAREBAL-LDLQ` Scale-Up via `3× MI50` Hardware `FP64` Blocked Cholesky:**
-   * Offloads `B = 128` blocked `FP64` Reverse-Cholesky (`L_rev L_rev^T = P H_bal P^T`) onto `gfx906`'s `1:2` `FP64` units via `rocblas_dgemm` across all `3× MI50` GPUs (`46.2 s → 1.51 s/expert`, `30.6×` speedup), scaling verified `M_cal >= 11,272` overlays **`10.02×` from `56` to `561` experts** (`217` `P150A` incl. **`34/34` pinned L1 shards** + `307` `MI50` + `37` `MTP`, `4.91 GiB` in-place overlay, **`+4.221 dB`** mean SNR, `0 B` extra runtime VRAM).
-4. **Track 8D — `1,048,576`-Token (`1M`) Tiered `CSA2` Context & `91/91` Zero-Scratch `gfx906` Kernels:**
-   * Upgrades KV/Indexer strides to `64`-bit `size_t` and pairs `262,144` hot HBM2 `r = 2` slots (`524,288` hot tokens) with a zero-host-sync coherent mapped pinned-DDR4 warm ring (`max_seq_len = 1,048,576`, `1.00000000` RoPE & `CSA2` cosine at `pos = 1,048,575`, `91/91` runtime + `3/3` verify8 kernels at `ScratchSize == 0`).
-5. **Track 8E — Pure-C++20 `/anthropic/v1/messages` SSE & Mid-Turn POSIX Search:**
-   * Serves native Anthropic Messages SSE (`thinking_delta`, `signature_delta`, `tool_use`, CORS preflight, and optional `--search-url` mid-turn POSIX HTTP search) directly inside `dsv41_fe` with `100%` `RadixBlockCache` prefix identity.
+* **Wave 8.1 — Native Pure-C++/HIP `DeepSeek-ViT` Vision (`Dsv41VitEngine`, `253.45 MiB` HBM2 on `tp = 2`):** Unlocks the full **`763B`-class multimodal [`DeepSeek-V4.1-Flash-1017`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)** (`748.6B` text + `DSpark` MTP + `32`-block `BF16` vision encoder & projector) in pure C++/HIP with zero Python dependencies. Streams double-buffered ViT layer weights from pinned DDR4 onto `MI50` `tp = 2` (`0 B` added on `tp = 0, 1`, `0` changes to `p150_dsv41_worker`), running `2D-RoPE`, `3×3` pixel-unshuffle, the 2-layer MLP projector, image router bias (`ffn.gate.bias_vl`), and [`Engram`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/main/inference/engram.py) image-token masking while preserving **`268.0 / 270.0 / 698.0 MiB` free HBM2** across `tp = 0..2` at `max_seq_len = 1,048,576` (`96/96` runtime + ViT `gfx906` kernels at `ScratchSize == 0`).
+* **Wave 8.2 — [`DeepInfer`](https://github.com/deepseek-ai/DeepInfer/blob/main/doc/inference_deployment_qa.md) Pure-Block Cold NVMe `CSA2` KV (`0 B` Disk SWA), `PromptSegment` Anti-Injection & `-81%` Lazy Softmax:** Persists `128`-token `.kvblk` records (`114,496 B` = `64 B` `Dsv41NvmeKvBlockHeader` + `512 B` token IDs + `113,920 B` [`CSA2`](https://zartbot.github.io/blog/model_arch/dsv41flash_arch/en.html) KV; `0` `.kvtail`/`.swa` files on disk) paired with a `64`-block (`86.371 MiB`) RAM `EncoderStateBlock` ring and `128`-token bounded `Encoder SWA` cold replay (`L_cap = P - 140`, snapping outside partial `<｜deepseek_image｜>` spans; `enc_cos = 1.00000000`, `dec_cos = 1.00000000`) — hydrating **`220,544`–`224,384` multimodal tokens across cold daemon restarts in `0.632–0.722 s`** (`109.2–226.3 ms` raw NVMe read up to **`1.71 GB/s`**, **`~630–720×` faster** than `~7.6 min` cold prefill). Enforces C++ type-level anti-injection via `PromptSegment` (`parse_special = false` ordinary text + integer-ID-gated `128822` `</think>` / `128825` `｜DSML｜` `DsmlOpenKmpSpec` streaming, `0` leaks on `18,476 B` hostile C++ payloads) and slashes host sampling `smp` **`-81%` (`7.04 → 1.17–1.37 ms/step`)** via lazy visited-path tree softmax (`1.06/16` nodes) + async CPU post-processing.
+* **Wave 8.3 — Single-Pass `ConfidenceHead` `Dynamic DeepSelect8` (`M = 8` SGPR Causal Tree Across `0–1M` Context):** `deep_select_top7_confidence_tree8` (`Dsv41DeepSelectPlan8`) scores a `16`-node (`depths 0..5`) single-pass [`DSpark`](https://docs.vllm.ai/projects/speculators/en/latest/user_guide/algorithms/dspark/) candidate pool (`4` MTP micro-batches `B = 3, 2, 1, 1` = `7` rows, `+0.34 ms` drafter cost, `0 B` extra HBM2) using `confidence_head.proj.weight` (`[1, 5,376]`) and compiles dynamic `64`-bit SGPR `anc_mask64`, `depth_nibbles32`, `parent_nibbles32`, and `valid_node_mask` (`0` invalid filler acceptances across `100,000` shortage sweeps, **`max_TV_M8 = 2.463e-16 < 1e-14`**). Delivers **`40.03 tok/s`** (`2.48×` vs. `4`-batch `M = 16`'s `16.17 tok/s`) at `8.7K` Effort-100 context, beats static SGPR `M = 8` head-to-head (`35.22` vs. `33.23 tok/s`, **`+6.0%`**; **`+26.3%`** accepted tree drafts/step) across `25K` generated tokens, and reaches **`32.85 tok/s`** (`+13.4%` over static `M = 8`, **`2.50×`** over `M = 16`, `84.2%` acceptance, `0.28 ms` `814.6M tok/s` GPU slot hit) at **`228,225` multimodal tokens** (`232,604` peak verified multimodal context).
+* **Overlay Shards Compatibility (`0` Re-Download Required):** `v1.3.0-wave8.3` uses the identical `561`-expert `hot_experts_rarebal_wave8.safetensors` (`4.91 GiB`, `SHA-256 bf78446e551207e5d2a9b8061b1299df67359e2a565764b6e092ee26ea47b237`) published in three `< 2 GiB` chunks on [`v1.2.0-wave8`](https://github.com/bespokeontology/dsv41-wht128-hlut2/releases/tag/v1.2.0-wave8) (`cat hot_experts_rarebal_wave8.safetensors.part-* > hot_experts_rarebal_wave8.safetensors`).
 
 ---
 
-## How `WHT128-HLUT2` + `TARQ RAREBAL-LDLQ` (`2.125 bpw → FP32`) Preserves Full-Precision `748.6B` Fidelity
+## Heterogeneous Silicon Architecture (`2× Blackhole P150A` + `3× MI50` + `EPYC` Dual-NVMe)
 
-`WHT128-HLUT2` (`2.125 bpw`, `272 B / 32×32` tile, `4,352 B / 128×128` 16-subtile `UInt32` NoC superblock) compresses **exclusively** the `384` sparse conditional routed SwiGLU experts (`6 / 384 = 1.56%` active per token), keeping **every always-active and state-bearing subsystem at full or lossless precision** inside `160 GiB` total accelerator DRAM (`64 GiB` `P150A` GDDR6 + `96 GiB` `MI50` HBM2):
+This repository contains the clean-room, zero-Python production multimodal inference engine and custom **`WHT128-HLUT2` + `561`-Expert `TARQ RAREBAL-LDLQ` (`2.125 bpw → IEEE FP32`)** quantization stack for **[`deepseek-ai/DeepSeek-V4.1-Flash-1017`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)** up to **`1,048,576` (`1M`) active context tokens**:
 
-* **`BF16` / `FP32` (`16–32 bpw`)** on embeddings, `RMSNorm`, [`mHC` (`n = 4` Sinkhorn)](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/main/config.json), `384`-way routers, `LM Head`, and `FP32` `HostRingAllReduce + mHC post` (`266.8×` lower truncation MSE);
-* **`8.01 bpw` (`cos > 0.9999`)** on all `40` [`CSA2` attention layers](https://zartbot.github.io/blog/model_arch/dsv41flash_arch/en.html), `HSI` indexers, `40` always-active shared SwiGLU experts, and `3` [`DSpark`](https://rocm.docs.amd.com/projects/atom/en/latest/deepseek_v41_dspark.html) dense heads;
-* **Bitwise-exact native `8.25 bpw` (`FP8 E4M3 + FP16` scale, zero re-quantization)** on the `188.83 GiB` external [`Engram`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/main/inference/engram.py) `N`-gram memory in `384 GiB DDR4`;
-* **Wave 8 `561/561` [`TARQ RAREBAL-LDLQ`](https://arxiv.org/pdf/2605.27808) Overlay (`hot_experts_rarebal_wave8.safetensors`, `4.91 GiB` across `3` `< 2.0 GiB` release shards):** Causal Reverse-Cholesky [`QuIP#` `LDLQ`](https://arxiv.org/html/2402.04396v1) + `M_cal > 2K` starvation gate + rare-token trace equalization across `217` `P150A` (`34/34` L1 shards), `307` `MI50`, and `37` `DSpark` MTP hot experts (`0.88357 → 0.95228` mean SwiGLU cosine, **`+4.221 dB`** mean SNR gain at **`0 B` extra VRAM**).
+1. **[`2× Tenstorrent Blackhole P150A`](https://docs.tenstorrent.com/aibs/blackhole/index.html) Custom TSMC `6nm` (`N6`) Spatial Dataflow ASICs (Lead Sparse MoE Tier):** `220` compute Tensix cores (`2 × 110`, each with `5` RISC-V baby cores + `32×32` `HiFi2`/`FP32` Matrix Engine + `32`-lane Vector `SFPU` + dual `NoC` routers), `64 GiB` GDDR6 (`MP`), and **`2× 180 MB = 360 MB` on-die Tensix L1 SRAM** (**`247.82 MiB` pure active L1** [`123.91 MiB/card = 129,927,808 B/card`], **`34/34` `RAREBAL`-calibrated TP2 hot shards = `152.40 MiB`** pinned in L1 alongside `100%` L1-resident `x_decode` and `finish_decode[0..1]`, `7/7` `MeshTrace` shapes at `0.73 ms` `M = 1`, `2.52 ms` `M = 8`, `4.53 ms` `M = 16` with `0 B` extra L1), cross-wired card-to-card via **`4× 800G` QSFP-DD cables** (`3.2 Tbps` `FABRIC_1D` TP2), with **Card `#1` running behind a narrow `PCIe x4` host riser**.
+2. **`3× AMD Instinct MI50` (Dense Backbone, `DeepSeek-ViT`, `1M` Tiered `CSA2`, & `Dynamic DeepSelect8` Tier):** `96 GiB` HBM2 (`Vega20 gfx906` TP3, **`96/96` runtime + ViT + `3/3` `verify8` HIP kernels at `ScratchSize == 0`**, `0` PCIe BAR P2P reads via coherent pinned-`DDR4` `FP32` `HostRingAllReduce`, pre-`shared_experts` dual-stream `4`-slot `25,680 KiB` `/dev/shm` fast ring saving `18.57 ms/step` parallel overlap, `253.45 MiB` streamed `BF16` `DeepSeek-ViT` on `tp = 2`, and single-pass `ConfidenceHead` `Dynamic DeepSelect8` SGPR causal tree).
+3. **`AMD EPYC` + Dual NVMe (`Engram`, `0.72 s` Cold NVMe `.kvblk` Persistence, `1M` Warm KV Ring, & SSE Tier):** `384 GiB` DDR4 hosting `188.83 GiB` pre-faulted native `FP8 E4M3` `Engram` tables (`220.74 GB/s` warm hydration in `0.92 s`), `114,496 B` `.kvblk` pure-block cold NVMe `CSA2` persistence (`0 B` disk SWA, `224,384` multimodal tokens hydrated in `0.722 s` at up to `1.71 GB/s`), `64`-block (`86.371 MiB`) RAM `EncoderStateBlock` ring, coherent mapped pinned-DDR4 warm `CSA2` KV (`1,048,576` ceiling; **`232,604` multimodal & `417,556` text verified live context**), and pure-C++ `/v1/chat/completions` + `/anthropic/v1/messages` SSE + POSIX search sidecar.
 
 ---
 
@@ -64,26 +38,31 @@ This repository contains the clean-room, zero-Python production inference engine
 │   ├── dsv41_pack_format.hpp
 │   ├── dsv41_rarebal.hpp
 │   └── safetensors_mmap.hpp
-├── mi50/                  # 3x AMD Instinct MI50 (gfx906 TP3) 91/91 zero-scratch HIP kernels, 1M CSA2, & SSE server
+├── mi50/                  # 3x MI50 (gfx906 TP3) 96/96 zero-scratch HIP kernels, DeepSeek-ViT, Cold NVMe KV, & SSE
 │   ├── dsv41_mi50_kernels.hip
-│   ├── dsv41_kolmogorov_tree_verifier.hpp  # Lossless Dirac Plackett-Luce M=8/M=16 verifier (max_TV = 2.793e-16)
-│   ├── dsv41_tree_spec.hpp                 # SGPR-packed M=8 & M=16 TreeAncMask256 causal-tree topologies
-│   ├── dsv41_anthropic_messages.hpp        # Pure-C++20 /anthropic/v1/messages SSE & POSIX --search-url loop
+│   ├── dsv41_vit.{hpp,cpp}                 # Wave 8.1: Pure-C++/HIP DeepSeek-ViT + 2D-RoPE + 3x3 unshuffle + Aligner
+│   ├── dsv41_nvme_kv_cache.hpp             # Wave 8.2: 114,496 B .kvblk pure-block cold NVMe CSA2 KV (0 B disk SWA)
+│   ├── dsv41_kolmogorov_tree_verifier.hpp  # Wave 8.3: Dynamic DeepSelect8 + valid_node_mask (max_TV = 2.463e-16)
+│   ├── dsv41_tree_spec.hpp                 # Dynamic 64-bit SGPR M=8 & TreeAncMask256 M=16 causal-tree topologies
+│   ├── dsv41_anthropic_messages.hpp        # PromptSegment anti-injection + /anthropic/v1/messages + multimodal spans
 │   ├── dsv41_runtime.cpp
 │   ├── dsv41_engram_cpu.cpp
 │   ├── dsv41_think_loop_guard.hpp
 │   ├── dsv41_tokenizer_dsml.cpp
 │   └── dsv41_fe.cpp
-├── tools/                 # Pure-C++17 packer, 3x MI50 FP64 RAREBAL repacker, harvester, & Wave 5/6/7B/8 self-tests
+├── tools/                 # Pure-C++17 packers, 3x MI50 FP64 RAREBAL repacker, search sidecar, & Wave 5–8.3 self-tests
 │   ├── pack_dsv41_hlut2.cpp
+│   ├── pack_dsv41_vit.cpp
 │   ├── harvest_rarebal_wave8.cpp
 │   ├── repack_hot_experts_rarebal.cpp
-│   ├── repack_rarebal_helpers.hpp
-│   ├── bench_hlut2.cpp
+│   ├── dsv41_search_sidecar.cpp
 │   ├── verify_wave5_all.cpp
 │   ├── verify_wave6_math.cpp
 │   ├── verify_wave7_opt.cpp
 │   ├── verify_wave8_opt.cpp
+│   ├── verify_wave8_1_nvme_kv.cpp
+│   ├── verify_wave8_1_vit.cpp
+│   ├── verify_wave8_2_deepinfer.cpp
 │   └── test_anthropic_messages_fe.cpp
 ├── docs/
 │   ├── WHT128_HLUT2_Blackhole_P150A_Whitepaper.pdf
@@ -97,36 +76,42 @@ This repository contains the clean-room, zero-Python production inference engine
 
 ---
 
-## Build, Self-Test, Reassemble `561`-Expert Overlay, & Launch (`1M` Context)
+## Build, Self-Test, Reassemble `561`-Expert Overlay, & Launch (`1M` Multimodal Context)
 
 ```bash
-# 1. Build offline tools, self-tests, 3x MI50 runtime/server, and (when TT_METAL_HOME is set) 2x P150A worker
+# 1. Build offline tools, self-tests, 3x MI50 + ViT runtime/server, and (when TT_METAL_HOME is set) 2x P150A worker
 export DSV41_ROOT=/path/to/dsv41-model-workspace
 export TT_METAL_HOME=/opt/tt-metal   # Tenstorrent Blackhole TT-Metal SDK install
 make -j12
 
-# 2. Run deterministic mathematical, L1 geometry, Dirac M=8/16 tree, Anthropic SSE, & 91/91 zero-scratch audits
+# 2. Run pure host-CPU mathematical, L1 geometry, Dynamic DeepSelect8, PromptSegment anti-injection, & 96/96 zero-scratch audits
 make check
 make audit-gfx906
-# Optional hardware-on-device 100K PCIe coherency + 1M Tiered CSA2 GPU suite (when GPUs are idle):
+# Optional hardware-on-device PCIe coherency, ViT parity, Cold NVMe .kvblk, & 1M CSA2 GPU suite (when GPUs are idle):
 # make check-gpu
 
-# 3. Download the three <2.0 GiB Wave 8 RAREBAL-LDLQ shards from GitHub Releases, reassemble, and verify SHA-256
+# 3. Download the immutable 3-part 561-expert RAREBAL-LDLQ overlay from v1.2.0-wave8 and reassemble (4.91 GiB)
 gh release download v1.2.0-wave8 -R bespokeontology/dsv41-wht128-hlut2 \
-  -p 'hot_experts_rarebal_wave8.safetensors.part-*' -p 'SHA256SUMS.txt' --clobber
-cat hot_experts_rarebal_wave8.safetensors.part-00 \
-    hot_experts_rarebal_wave8.safetensors.part-01 \
-    hot_experts_rarebal_wave8.safetensors.part-02 \
-    > hot_experts_rarebal_wave8.safetensors
-sha256sum -c SHA256SUMS.txt
+  -p 'hot_experts_rarebal_wave8.safetensors.part-*' --clobber
+cat hot_experts_rarebal_wave8.safetensors.part-* > hot_experts_rarebal_wave8.safetensors
+echo "bf78446e551207e5d2a9b8061b1299df67359e2a565764b6e092ee26ea47b237  hot_experts_rarebal_wave8.safetensors" | sha256sum -c -
 
-# 4. Launch 2x Blackhole P150A TP2 worker first (overlays 34/34 L1 shards before MR pinning), then 1M-context server
+# 4. Pack contiguous BF16 DeepSeek-ViT weights once (lossless BF16, 0 Python)
+./bin/pack_dsv41_vit --packed-mi50-dir "$DSV41_ROOT/packed_mi50" --out-dir "$DSV41_ROOT/packed_vit"
+
+# 5. Launch 2x Blackhole P150A TP2 worker, optional search sidecar, and 1M-context multimodal server (Dynamic DeepSelect8 default)
 ./bin/p150_dsv41_worker --model-dir "$DSV41_ROOT" \
   --rarebal-overlay hot_experts_rarebal_wave8.safetensors --reuse-shm &
 
+./bin/dsv41_search_sidecar --host 127.0.0.1 --port "${DSV41_SEARCH_PORT:-8080}" &
+
 OMP_WAIT_POLICY=PASSIVE ./bin/dsv41_fe --model-dir "$DSV41_ROOT" \
   --rarebal-overlay hot_experts_rarebal_wave8.safetensors \
-  --port 8042 --max-seq-len 1048576 --dual-stream-overlap --dspark-tree-width 8
+  --vit-weights "$DSV41_ROOT/packed_vit/dsv41_vit_bf16.safetensors" \
+  --nvme-kv-cache-dir "$DSV41_ROOT/nvme_kv_cache" --nvme-kv-cache-gb 32 \
+  --search-url "${SEARCH_URL:-http://127.0.0.1:8080}" \
+  --port "${DSV41_PORT:-8000}" --max-seq-len 1048576 \
+  --dual-stream-overlap --dspark-tree-width auto
 ```
 
 ---
@@ -134,9 +119,9 @@ OMP_WAIT_POLICY=PASSIVE ./bin/dsv41_fe --model-dir "$DSV41_ROOT" \
 ## Credits & Attribution
 
 * **Hardware Architecture, Systems Direction, & Heterogeneous Co-Design:** [**`bespokeontology`**](https://github.com/bespokeontology)
-* **Agentic C++ Systems Engineering, Wave 7B & Wave 8 (`8A`–`8E`) Silicon Implementation, `561`-Expert `3× MI50` `FP64` `RAREBAL-LDLQ` Solver, & Verification:** [**Google Antigravity (Google DeepMind)**](https://antigravity.google/) — implemented pre-`shared_experts` dual-stream `P150A || MI50` overlap (`25,680 KiB` 4-slot `/dev/shm` fast ring + 1-CTA `compact256`, `2.01×` faster `MI50` MoE, `-51.9%` `P150A` wait), `7/7` `MeshTrace` (`0.73 ms` `M = 1`, `2.52 ms` `M = 8`, `4.53 ms` `M = 16` at `0 B` extra L1), `3× MI50` `rocblas_dgemm` `FP64` blocked Cholesky repacker (`561` hot experts covering `34/34` `P150A` L1 shards, `+4.221 dB` SNR), `1,048,576`-token (`1M`) tiered `CSA2` KV (`91/91` zero-scratch `gfx906` runtime kernels), and pure-C++20 `/anthropic/v1/messages` SSE.
-* **Kernel Co-Design, Quantization & Measure-Theoretic Synthesis (`WHT128-HLUT2`, `TARQ RAREBAL-LDLQ`, Kolmogorov–Dirac `M = 8 ↔ 16` Verifier), & Whitepaper Synthesis:** [**Gemini (Google DeepMind)**](https://deepmind.google/technologies/gemini/)
-* **Self-Hosted Long-Horizon Wave 7/8 Synthesis (`417.6K` & `217.4K` Live Ctx) & Read-Only `PASS 5/5` Production Audits:** [**`DeepSeek-V4.1-Flash-1017`**](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)
+* **Agentic C++ Systems Engineering, Waves 7B–8.3 Silicon Implementation (`DeepSeek-ViT`, `0.72 s` Pure-Block Cold NVMe `CSA2` KV, `PromptSegment` Isolation, `Dynamic DeepSelect8`, `561`-Expert `FP64` `RAREBAL-LDLQ`), & Verification:** [**Google Antigravity (Google DeepMind)**](https://antigravity.google/)
+* **Kernel Co-Design, Quantization & Measure-Theoretic Synthesis (`WHT128-HLUT2`, `TARQ RAREBAL-LDLQ`, `DeepInfer` Pure-Block Replay, Kolmogorov–Dirac `Dynamic DeepSelect8`), & Whitepaper Synthesis:** [**Gemini (Google DeepMind)**](https://deepmind.google/technologies/gemini/)
+* **Self-Hosted Long-Horizon Multimodal & Code Audits (`232.6K` Multimodal & `417.6K` Text Live Context):** [**`DeepSeek-V4.1-Flash-1017`**](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)
 
 ## License
 

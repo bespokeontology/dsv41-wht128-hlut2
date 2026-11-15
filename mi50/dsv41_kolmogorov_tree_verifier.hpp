@@ -1,9 +1,15 @@
 // ============================================================================
 // dsv41_kolmogorov_tree_verifier.hpp
 //
-// Minimal Pure-C++17 Reference & Audit Suite for Wave 7 Track 7C:
-// Exact Kolmogorov-Borel Multi-Branch Speculative Tree Verifier (M <= 8)
-// for DeepSeek-V4.1-Flash-1017 (2x Blackhole P150A + 3x MI50 + DSpark).
+// Pure-C++17 Exact Kolmogorov-Borel Multi-Branch Speculative Tree Verifier
+// & Single-Pass ConfidenceHead Dynamic M = 8 (`DeepSelect8`) / M = 16 (`DeepSelect16`)
+// SGPR Tree Planner for DeepSeek-V4.1-Flash-1017 (2x Blackhole P150A + 3x MI50 + DSpark):
+//   - Wave 7 Track 7C: Exact Dirac-aware M <= 8 tree verifier + 64-bit SGPR mask
+//   - Wave 8B / 8.2D:  M <= 16 SGPR TreeAncMask256 + lazy visited-path verification
+//   - Wave 8.3A..C:    Full-range (0..1,048,576) Dynamic M = 8 / M = 6 fast path
+//                      (`kAutoTree16MaxContext = 0`), single-pass 16 -> 8 `ConfidenceHead`
+//                      `deep_select_top7_confidence_tree8`, and `valid_node_mask`
+//                      inert dead-filler quarantine across both M = 8 and M = 16 verifiers.
 //
 // Mathematical Foundation (Kolmogorov 1936 Partition Identity):
 // Let (Omega, F, p) be the target next-token probability space at tree node u
@@ -62,8 +68,9 @@ inline constexpr std::size_t kMaxSpecTreeNodes = 8;
 struct Dsv41SpecTree8 {
   std::uint32_t num_nodes = 0;  // 1 <= num_nodes <= 8 (node 0 is root)
   std::uint32_t base_pos = 0;   // Sequence cursor of root node 0
+  std::uint8_t valid_node_mask = 0xFFu;                        // Bit 0 = 1; bit i = 1 iff slot i is an active valid candidate
   std::array<std::int32_t, kMaxSpecTreeNodes> parent{};        // parent[0] = -1, 0 <= parent[i] < i
-  std::array<std::uint32_t, kMaxSpecTreeNodes> depth{};        // depth[0] = 0, depth[i] = depth[parent[i]] + 1
+  std::array<std::uint32_t, kMaxSpecTreeNodes> depth{};        // depth[0] = 0, depth[i] = depth[parent[i]] + 1 (0..6)
   std::array<std::uint32_t, kMaxSpecTreeNodes> rope_pos{};     // base_pos + depth[i] (sibling-invariant!)
   std::array<std::uint8_t, kMaxSpecTreeNodes> ancestor_mask{}; // Bit j set iff node j is ancestor of node i
   std::array<std::uint8_t, kMaxSpecTreeNodes> child_mask{};    // Deduplicated active draft children of node i
@@ -79,14 +86,16 @@ struct Dsv41TreeVerifyResult {
 };
 
 // Builds and validates an M <= 8 rooted speculative tree topology.
-// Automatically masks out duplicate sibling token proposals under the same parent
-// so deterministic top-B trees never double-count target probability mass.
+// Automatically masks out quarantined dead filler slots (`((valid_node_mask >> i) & 1u) == 0`)
+// and duplicate sibling token proposals under the same parent so deterministic top-B trees
+// never double-count or corrupt target probability mass.
 inline bool build_spec_tree_topology(
     std::uint32_t num_nodes,
     std::uint32_t base_pos,
     const std::int32_t* parent_in,
     const std::int32_t* token_id_in,
-    Dsv41SpecTree8* out) noexcept {
+    Dsv41SpecTree8* out,
+    std::uint8_t valid_node_mask = 0xFFu) noexcept {
   if (!out || !parent_in || !token_id_in || num_nodes == 0 ||
       num_nodes > kMaxSpecTreeNodes) {
     return false;
@@ -98,6 +107,10 @@ inline bool build_spec_tree_topology(
   *out = Dsv41SpecTree8{};
   out->num_nodes = num_nodes;
   out->base_pos = base_pos;
+  const std::uint8_t width_mask = (num_nodes >= 8u)
+      ? 0xFFu
+      : static_cast<std::uint8_t>((1u << num_nodes) - 1u);
+  out->valid_node_mask = static_cast<std::uint8_t>((valid_node_mask | 0x01u) & width_mask);
   out->parent[0] = -1;
   out->depth[0] = 0;
   out->rope_pos[0] = base_pos;
@@ -117,6 +130,13 @@ inline bool build_spec_tree_topology(
         static_cast<std::uint8_t>(out->ancestor_mask[pu] | (1u << i));
     out->token_id[i] = token_id_in[i];
 
+    // Quarantine dead filler slots (or children of quarantined slots) before attachment
+    if (((out->valid_node_mask >> i) & 1u) == 0u ||
+        ((out->valid_node_mask >> pu) & 1u) == 0u) {
+      out->valid_node_mask = static_cast<std::uint8_t>(out->valid_node_mask & ~(1u << i));
+      continue;
+    }
+
     // Sibling deduplication: only attach child i if no earlier sibling under pu
     // already proposed the exact same token_id.
     bool duplicate_sibling = false;
@@ -132,6 +152,8 @@ inline bool build_spec_tree_topology(
     if (!duplicate_sibling && token_id_in[i] >= 0) {
       out->child_mask[pu] =
           static_cast<std::uint8_t>(out->child_mask[pu] | (1u << i));
+    } else {
+      out->valid_node_mask = static_cast<std::uint8_t>(out->valid_node_mask & ~(1u << i));
     }
   }
   return true;
@@ -258,31 +280,33 @@ inline constexpr std::uint32_t count_completed_r2_pairs(
 //   - target_probs: Row-major [M, vocab_size] filtered target probabilities
 //   - u_per_depth:  Array of M independent Uniform[0, 1) variates (one per depth)
 // ============================================================================
-inline Dsv41TreeVerifyResult verify_deterministic_tree_u01(
+template <typename RowProbFn>
+inline Dsv41TreeVerifyResult verify_deterministic_tree_u01_lazy(
     const Dsv41SpecTree8& tree,
-    const double* target_probs,
     std::size_t vocab_size,
-    const double* u_per_depth) noexcept {
+    const double* u_per_depth,
+    RowProbFn&& get_row_probs) {
   Dsv41TreeVerifyResult res{};
   std::uint32_t cur = 0;
   std::uint32_t step_d = 0;
 
   while (true) {
     res.accepted_nodes[step_d] = cur;
-    const double* p_row = target_probs + static_cast<std::size_t>(cur) * vocab_size;
+    const double* p_row = get_row_probs(cur);
     const double u = std::clamp(u_per_depth[step_d], 0.0, 0.9999999999999999);
 
-    std::uint8_t mask = tree.child_mask[cur];
+    std::uint8_t mask = static_cast<std::uint8_t>(tree.child_mask[cur] & tree.valid_node_mask);
     double branch_cdf = 0.0;
     std::int32_t chosen_child = -1;
 
-    // Partition [0, sum_j p(x_j)) across distinct deterministic children c_j:
+    // Partition [0, sum_j p(x_j)) across distinct valid deterministic children c_j:
     // Child c_j owns interval [branch_cdf_prev, branch_cdf_prev + p(x_j)), which
     // has exact Lebesgue measure p(x_j) (identical to sequential alpha_j =
     // p(x_j) / (1 - sum_{i<j} p(x_i)) under q_j = delta_{x_j}).
     while (mask != 0u) {
       const std::uint32_t c = static_cast<std::uint32_t>(__builtin_ctz(mask));
       mask &= static_cast<std::uint8_t>(mask - 1u);
+      if (((tree.valid_node_mask >> c) & 1u) == 0u) continue;
       const std::int32_t tok = tree.token_id[c];
       if (tok >= 0 && static_cast<std::size_t>(tok) < vocab_size) {
         const double pm = p_row[tok];
@@ -309,14 +333,17 @@ inline Dsv41TreeVerifyResult verify_deterministic_tree_u01(
     const double rem_mass = std::max(0.0, 1.0 - branch_cdf);
     const double target_u = (rem_mass > 1e-15) ? std::max(0.0, u - branch_cdf) : 0.0;
 
-    // Build small local exclusion list (at most 7 sibling tokens)
+    // Build small local exclusion list (only valid active children; filler slots excluded!)
     std::array<std::int32_t, kMaxSpecTreeNodes> excl{};
     std::uint32_t n_excl = 0;
-    std::uint8_t m2 = tree.child_mask[cur];
+    std::uint8_t m2 = static_cast<std::uint8_t>(tree.child_mask[cur] & tree.valid_node_mask);
     while (m2 != 0u) {
       const std::uint32_t c = static_cast<std::uint32_t>(__builtin_ctz(m2));
       m2 &= static_cast<std::uint8_t>(m2 - 1u);
-      excl[n_excl++] = tree.token_id[c];
+      if (((tree.valid_node_mask >> c) & 1u) == 0u) continue;
+      if (tree.token_id[c] >= 0) {
+        excl[n_excl++] = tree.token_id[c];
+      }
     }
 
     double comp_cdf = 0.0;
@@ -361,6 +388,18 @@ inline Dsv41TreeVerifyResult verify_deterministic_tree_u01(
   return res;
 }
 
+inline Dsv41TreeVerifyResult verify_deterministic_tree_u01(
+    const Dsv41SpecTree8& tree,
+    const double* target_probs,
+    std::size_t vocab_size,
+    const double* u_per_depth) noexcept {
+  return verify_deterministic_tree_u01_lazy(
+      tree, vocab_size, u_per_depth,
+      [&](std::uint32_t cur) noexcept -> const double* {
+        return target_probs + static_cast<std::size_t>(cur) * vocab_size;
+      });
+}
+
 // ============================================================================
 // WAVE 8B: Exact Kolmogorov-Dirac Verifier & Balanced Topology for M <= 16
 // Fits inside the SAME single 32-row P150A L1 decode tile (0 B extra L1/VRAM)!
@@ -370,6 +409,7 @@ inline constexpr std::size_t kMaxSpecTree16Nodes = 16;
 struct Dsv41SpecTree16 {
   std::uint32_t num_nodes = 0;  // 1 <= num_nodes <= 16 (node 0 is root)
   std::uint32_t base_pos = 0;   // Sequence cursor of root node 0
+  std::uint16_t valid_node_mask = 0xFFFFu;                        // Bit 0 = 1; bit i = 1 iff slot i is an active valid candidate
   std::array<std::int32_t, kMaxSpecTree16Nodes> parent{};         // parent[0] = -1, 0 <= parent[i] < i
   std::array<std::uint32_t, kMaxSpecTree16Nodes> depth{};         // depth[0] = 0, depth[i] = depth[parent[i]] + 1 (<= 5)
   std::array<std::uint32_t, kMaxSpecTree16Nodes> rope_pos{};      // base_pos + depth[i] (sibling-invariant!)
@@ -482,7 +522,8 @@ inline bool build_spec_tree16_topology(
     std::uint32_t base_pos,
     const std::int32_t* parent_in,
     const std::int32_t* token_id_in,
-    Dsv41SpecTree16* out) noexcept {
+    Dsv41SpecTree16* out,
+    std::uint16_t valid_node_mask = 0xFFFFu) noexcept {
   if (!out || !parent_in || !token_id_in || num_nodes == 0 ||
       num_nodes > kMaxSpecTree16Nodes) {
     return false;
@@ -494,6 +535,10 @@ inline bool build_spec_tree16_topology(
   *out = Dsv41SpecTree16{};
   out->num_nodes = num_nodes;
   out->base_pos = base_pos;
+  const std::uint16_t width_mask = (num_nodes >= 16u)
+      ? 0xFFFFu
+      : static_cast<std::uint16_t>((1u << num_nodes) - 1u);
+  out->valid_node_mask = static_cast<std::uint16_t>((valid_node_mask | 0x0001u) & width_mask);
   out->parent[0] = -1;
   out->depth[0] = 0;
   out->rope_pos[0] = base_pos;
@@ -513,6 +558,12 @@ inline bool build_spec_tree16_topology(
         static_cast<std::uint16_t>(out->ancestor_mask[pu] | (1u << i));
     out->token_id[i] = token_id_in[i];
 
+    if (((out->valid_node_mask >> i) & 1u) == 0u ||
+        ((out->valid_node_mask >> pu) & 1u) == 0u) {
+      out->valid_node_mask = static_cast<std::uint16_t>(out->valid_node_mask & ~(1u << i));
+      continue;
+    }
+
     bool duplicate_sibling = false;
     std::uint16_t sib_bits = out->child_mask[pu];
     while (sib_bits != 0u) {
@@ -526,32 +577,36 @@ inline bool build_spec_tree16_topology(
     if (!duplicate_sibling && token_id_in[i] >= 0) {
       out->child_mask[pu] =
           static_cast<std::uint16_t>(out->child_mask[pu] | (1u << i));
+    } else {
+      out->valid_node_mask = static_cast<std::uint16_t>(out->valid_node_mask & ~(1u << i));
     }
   }
   return true;
 }
 
-inline Dsv41Tree16VerifyResult verify_deterministic_tree16_u01(
+template <typename RowProbFn>
+inline Dsv41Tree16VerifyResult verify_deterministic_tree16_u01_lazy(
     const Dsv41SpecTree16& tree,
-    const double* target_probs,
     std::size_t vocab_size,
-    const double* u_per_depth) noexcept {
+    const double* u_per_depth,
+    RowProbFn&& get_row_probs) {
   Dsv41Tree16VerifyResult res{};
   std::uint32_t cur = 0;
   std::uint32_t step_d = 0;
 
   while (true) {
     res.accepted_nodes[step_d] = cur;
-    const double* p_row = target_probs + static_cast<std::size_t>(cur) * vocab_size;
+    const double* p_row = get_row_probs(cur);
     const double u = std::clamp(u_per_depth[step_d], 0.0, 0.9999999999999999);
 
-    std::uint16_t mask = tree.child_mask[cur];
+    std::uint16_t mask = static_cast<std::uint16_t>(tree.child_mask[cur] & tree.valid_node_mask);
     double branch_cdf = 0.0;
     std::int32_t chosen_child = -1;
 
     while (mask != 0u) {
       const std::uint32_t c = static_cast<std::uint32_t>(__builtin_ctz(mask));
       mask &= static_cast<std::uint16_t>(mask - 1u);
+      if (((tree.valid_node_mask >> c) & 1u) == 0u) continue;
       const std::int32_t tok = tree.token_id[c];
       if (tok >= 0 && static_cast<std::size_t>(tok) < vocab_size) {
         const double pm = p_row[tok];
@@ -577,11 +632,14 @@ inline Dsv41Tree16VerifyResult verify_deterministic_tree16_u01(
 
     std::array<std::int32_t, kMaxSpecTree16Nodes> excl{};
     std::uint32_t n_excl = 0;
-    std::uint16_t m2 = tree.child_mask[cur];
+    std::uint16_t m2 = static_cast<std::uint16_t>(tree.child_mask[cur] & tree.valid_node_mask);
     while (m2 != 0u) {
       const std::uint32_t c = static_cast<std::uint32_t>(__builtin_ctz(m2));
       m2 &= static_cast<std::uint16_t>(m2 - 1u);
-      excl[n_excl++] = tree.token_id[c];
+      if (((tree.valid_node_mask >> c) & 1u) == 0u) continue;
+      if (tree.token_id[c] >= 0) {
+        excl[n_excl++] = tree.token_id[c];
+      }
     }
 
     double comp_cdf = 0.0;
@@ -625,12 +683,480 @@ inline Dsv41Tree16VerifyResult verify_deterministic_tree16_u01(
   return res;
 }
 
-// Entropy-Adaptive M = 8 <-> M = 16 DSpark Controller (--dspark-tree-width auto|8|16):
+inline Dsv41Tree16VerifyResult verify_deterministic_tree16_u01(
+    const Dsv41SpecTree16& tree,
+    const double* target_probs,
+    std::size_t vocab_size,
+    const double* u_per_depth) noexcept {
+  return verify_deterministic_tree16_u01_lazy(
+      tree, vocab_size, u_per_depth,
+      [&](std::uint32_t cur) noexcept -> const double* {
+        return target_probs + static_cast<std::size_t>(cur) * vocab_size;
+      });
+}
+
+// ============================================================================
+// WAVE 8.2D (`DeepSelect`): Dynamic Confidence-Head Top-15 Prefix-Closed M=16
+// Tree Selection inside the SAME 32-row P150A L1 decode tile (0 B extra L1!).
+//
+// Pool Topology (`kDeepSelectPoolNodes = 29`: Root 0 + 28 Draft Candidates):
+//   - Depth 1 (Stage 0 under 0):    1..4    (top-4)
+//   - Depth 2 (Stage 1 under 1):    5..8    (top-4)
+//   - Depth 2 (Stage 2 under 2):    9..11   (top-3)
+//   - Depth 2 (Stage 3 under 3):    12..13  (top-2)
+//   - Depth 2 (Stage 4 under 4):    14..15  (top-2)
+//   - Depth 3 (Stage 5 under 5):    16..18  (top-3)
+//   - Depth 3 (Stage 6 under 6):    19..20  (top-2)
+//   - Depth 3 (Stage 7 under 9):    21..22  (top-2)
+//   - Depth 3 (Stage 8 under 10):   23      (top-1)
+//   - Depth 3 (Stage 9 under 12):   24      (top-1)
+//   - Depth 4 (Stage 10 under 16):  25..26  (top-2)
+//   - Depth 4 (Stage 11 under 21):  27      (top-1)
+//   - Depth 5 (Stage 12 under 25):  28      (top-1)
+// ============================================================================
+inline constexpr int kDeepSelectPoolNodes = 29;
+inline constexpr int kDeepSelectMaxPoolCap = 64;
+
+inline constexpr std::array<std::int32_t, kDeepSelectPoolNodes> kDeepSelectPoolParents = {
+    -1,
+     0,  0,  0,  0,
+     1,  1,  1,  1,
+     2,  2,  2,
+     3,  3,
+     4,  4,
+     5,  5,  5,
+     6,  6,
+     9,  9,
+    10,
+    12,
+    16, 16,
+    21,
+    25
+};
+
+inline constexpr std::array<std::uint32_t, kDeepSelectPoolNodes> kDeepSelectPoolDepths = {
+    0u,
+    1u, 1u, 1u, 1u,
+    2u, 2u, 2u, 2u,
+    2u, 2u, 2u,
+    2u, 2u,
+    2u, 2u,
+    3u, 3u, 3u,
+    3u, 3u,
+    3u, 3u,
+    3u,
+    3u,
+    4u, 4u,
+    4u,
+    5u
+};
+
+struct Dsv41DeepSelectPlan16 {
+  std::array<std::int32_t, kTree16NumNodes>  parents{};
+  std::array<std::uint32_t, kTree16NumNodes> depths{};
+  std::array<std::int32_t, kTree16NumNodes>  tokens{};
+  std::array<std::uint32_t, kTree16NumNodes> pool_indices{};
+  std::array<double, kTree16NumNodes>        cum_alpha{};
+  TreeAncMask256 anc_mask256{};
+  std::uint64_t  depth_nibbles64  = 0ULL;
+  std::uint64_t  parent_nibbles64 = 0ULL;
+  std::uint16_t  valid_node_mask  = 0xFFFFu;
+  int            max_depth        = 0;
+  double         expected_accepted_drafts = 0.0;
+};
+
+// Greedily selects up to 15 VALID prefix-closed nodes maximizing sum_{v=1}^{15} prod_{u in anc(v)} c_u,
+// topologically sorts (parent[i] < i), quarantines any remaining candidate-shortage slots inertly under
+// root 0 (`valid_node_mask` bit i = 0, `anc_mask = (1u << 0) | (1u << i)`, `tokens[i] = -1`), and packs
+// SGPR TreeAncMask256 + depth/parent nibbles.
+inline bool deep_select_top15_confidence_tree(
+    int pool_size,
+    const std::int32_t* pool_parents,
+    const std::int32_t* pool_tokens,
+    const double* pool_node_conf,
+    std::int32_t eos_token_id,
+    Dsv41DeepSelectPlan16* out_plan) noexcept {
+  if (!out_plan || !pool_parents || !pool_tokens || !pool_node_conf ||
+      pool_size < kTree16NumNodes || pool_size > kDeepSelectMaxPoolCap) {
+    return false;
+  }
+  if (pool_parents[0] != -1) {
+    return false;
+  }
+
+  std::array<std::uint32_t, kDeepSelectMaxPoolCap> p_depth{};
+  std::array<double, kDeepSelectMaxPoolCap> alpha{};
+  std::array<bool, kDeepSelectMaxPoolCap> valid_node{};
+  std::array<bool, kDeepSelectMaxPoolCap> selected{};
+
+  p_depth[0] = 0u;
+  alpha[0] = 1.0;
+  valid_node[0] = true;
+  selected[0] = true;
+
+  for (int u = 1; u < pool_size; ++u) {
+    const int p = pool_parents[u];
+    if (p < 0 || p >= u) {
+      return false;
+    }
+    p_depth[static_cast<std::size_t>(u)] = p_depth[static_cast<std::size_t>(p)] + 1u;
+    if (!valid_node[static_cast<std::size_t>(p)] ||
+        p_depth[static_cast<std::size_t>(u)] > 5u ||
+        pool_tokens[u] < 0 ||
+        (eos_token_id >= 0 && pool_tokens[p] == eos_token_id)) {
+      valid_node[static_cast<std::size_t>(u)] = false;
+      alpha[static_cast<std::size_t>(u)] = 0.0;
+      continue;
+    }
+
+    // Deduplicate identical sibling proposals under the same parent in the pool
+    bool dup_sib = false;
+    for (int s = 1; s < u; ++s) {
+      if (pool_parents[s] == p && valid_node[static_cast<std::size_t>(s)] &&
+          pool_tokens[s] == pool_tokens[u]) {
+        dup_sib = true;
+        break;
+      }
+    }
+    if (dup_sib) {
+      valid_node[static_cast<std::size_t>(u)] = false;
+      alpha[static_cast<std::size_t>(u)] = 0.0;
+      continue;
+    }
+
+    valid_node[static_cast<std::size_t>(u)] = true;
+    const double cu = std::isfinite(pool_node_conf[u])
+        ? std::clamp(pool_node_conf[u], 0.0, 1.0)
+        : 0.0;
+    alpha[static_cast<std::size_t>(u)] = alpha[static_cast<std::size_t>(p)] * cu;
+  }
+
+  // Greedy prefix-closed selection of up to 15 VALID draft nodes ONLY (never selects invalid/duplicate/post-EOS filler!)
+  for (int pick = 1; pick < kTree16NumNodes; ++pick) {
+    int best_u = -1;
+    double best_a = -1.0;
+    for (int u = 1; u < pool_size; ++u) {
+      if (selected[static_cast<std::size_t>(u)]) continue;
+      if (!valid_node[static_cast<std::size_t>(u)]) continue;
+      const int p = pool_parents[u];
+      if (!selected[static_cast<std::size_t>(p)]) continue;
+      if (p_depth[static_cast<std::size_t>(u)] > 5u) continue;
+      const double score = alpha[static_cast<std::size_t>(u)];
+      if (best_u < 0 || score > best_a) {
+        best_u = u;
+        best_a = score;
+      }
+    }
+    if (best_u < 0) {
+      break;
+    }
+    selected[static_cast<std::size_t>(best_u)] = true;
+  }
+
+  *out_plan = Dsv41DeepSelectPlan16{};
+  out_plan->valid_node_mask = 0x0001u;
+  std::array<int, kDeepSelectMaxPoolCap> old_to_new{};
+  old_to_new.fill(-1);
+
+  int out_idx = 0;
+  for (int u = 0; u < pool_size && out_idx < kTree16NumNodes; ++u) {
+    if (!selected[static_cast<std::size_t>(u)]) continue;
+    old_to_new[static_cast<std::size_t>(u)] = out_idx;
+    out_plan->pool_indices[static_cast<std::size_t>(out_idx)] = static_cast<std::uint32_t>(u);
+    out_plan->tokens[static_cast<std::size_t>(out_idx)] = pool_tokens[u];
+    out_plan->cum_alpha[static_cast<std::size_t>(out_idx)] = alpha[static_cast<std::size_t>(u)];
+    out_plan->valid_node_mask =
+        static_cast<std::uint16_t>(out_plan->valid_node_mask | (1u << out_idx));
+    if (out_idx == 0) {
+      out_plan->parents[0] = -1;
+      out_plan->depths[0] = 0u;
+    } else {
+      const int mapped_p = old_to_new[static_cast<std::size_t>(pool_parents[u])];
+      if (mapped_p < 0 || mapped_p >= out_idx) {
+        return false;
+      }
+      out_plan->parents[static_cast<std::size_t>(out_idx)] = mapped_p;
+      const std::uint32_t d = out_plan->depths[static_cast<std::size_t>(mapped_p)] + 1u;
+      out_plan->depths[static_cast<std::size_t>(out_idx)] = d;
+      if (static_cast<int>(d) > out_plan->max_depth) {
+        out_plan->max_depth = static_cast<int>(d);
+      }
+      out_plan->expected_accepted_drafts += alpha[static_cast<std::size_t>(u)];
+    }
+    ++out_idx;
+  }
+  if (out_idx == 0) {
+    return false;
+  }
+
+  // Quarantine any unfilled candidate-shortage slots inertly under root 0:
+  // `valid_node_mask` bit i = 0, `anc_mask = (1u << 0) | (1u << i)`, `tokens[i] = -1`, `cum_alpha[i] = 0.0`.
+  for (; out_idx < kTree16NumNodes; ++out_idx) {
+    out_plan->parents[static_cast<std::size_t>(out_idx)] = 0;
+    out_plan->depths[static_cast<std::size_t>(out_idx)] = 1u;
+    out_plan->tokens[static_cast<std::size_t>(out_idx)] = -1;
+    out_plan->pool_indices[static_cast<std::size_t>(out_idx)] = 0u;
+    out_plan->cum_alpha[static_cast<std::size_t>(out_idx)] = 0.0;
+  }
+  if (out_plan->max_depth == 0) {
+    out_plan->max_depth = 1;
+  }
+
+  out_plan->anc_mask256 =
+      make_tree_anc_mask256_from_parents(out_plan->parents.data(), kTree16NumNodes);
+  out_plan->depth_nibbles64 =
+      pack_tree16_depth_nibbles(out_plan->depths.data(), kTree16NumNodes);
+  out_plan->parent_nibbles64 =
+      pack_tree16_parent_nibbles(out_plan->parents.data(), kTree16NumNodes);
+  return true;
+}
+
+// ============================================================================
+// WAVE 8.3B (`DeepSelect8`): Single-Pass ConfidenceHead Dynamic Top-7 M = 8
+// SGPR Tree Selection (16 -> 8 Pool, 0 B Extra HBM2/L1, 64-Bit SGPR Mask!).
+//
+// Pool Topology (`kDeepSelect8PoolNodes = 16`: Root 0 + 15 Draft Candidates
+// across 4 MTP micro-batches `B = 3, 2, 1, 1` = 7 total Markov rows):
+//   - Stage 0 (root 0, top-4):  1..4   (depth 1)
+//   - Stage 1 (u = 1,  top-3):  5..7   (depth 2, Batch 1 row 0)
+//   - Stage 2 (u = 2,  top-2):  8..9   (depth 2, Batch 1 row 1)
+//   - Stage 3 (u = 3,  top-1):  10     (depth 2, Batch 1 row 2)
+//   - Stage 4 (u = 5,  top-2):  11..12 (depth 3, Batch 2 row 0)
+//   - Stage 5 (u = 8,  top-1):  13     (depth 3, Batch 2 row 1)
+//   - Stage 6 (u = 11, top-1):  14     (depth 4, Batch 3 row 0)
+//   - Stage 7 (u = 14, top-1):  15     (depth 5, Batch 4 row 0 -> up to 6 emitted tokens/burst!)
+// ============================================================================
+inline constexpr int kTree8DynamicNumNodes = 8;
+inline constexpr int kDeepSelect8PoolNodes = 16;
+
+inline constexpr std::array<std::int32_t, kDeepSelect8PoolNodes> kDeepSelect8PoolParents = {
+    -1,
+     0,  0,  0,  0,
+     1,  1,  1,
+     2,  2,
+     3,
+     5,  5,
+     8,
+    11,
+    14
+};
+
+inline constexpr std::array<std::uint32_t, kDeepSelect8PoolNodes> kDeepSelect8PoolDepths = {
+    0u,
+    1u, 1u, 1u, 1u,
+    2u, 2u, 2u,
+    2u, 2u,
+    2u,
+    3u, 3u,
+    3u,
+    4u,
+    5u
+};
+
+inline constexpr std::uint64_t pack_tree8_anc_mask64(
+    const std::int32_t* parents, int num_nodes) noexcept {
+  std::uint8_t rows[8]{};
+  for (int i = 0; i < num_nodes && i < 8; ++i) {
+    if (i == 0) {
+      rows[0] = 0x01u;
+    } else {
+      const int p = parents[i];
+      rows[i] = static_cast<std::uint8_t>((p >= 0 ? rows[p] : 0u) | (1u << i));
+    }
+  }
+  std::uint64_t out = 0ULL;
+  for (int i = 0; i < 8; ++i) {
+    out |= (static_cast<std::uint64_t>(rows[i]) << (8 * i));
+  }
+  return out;
+}
+
+inline constexpr std::uint32_t pack_tree8_depth_nibbles32(
+    const std::uint32_t* depths, int num_nodes) noexcept {
+  std::uint32_t out = 0u;
+  for (int i = 0; i < num_nodes && i < 8; ++i) {
+    out |= ((depths[i] & 0xFu) << (4 * i));
+  }
+  return out;
+}
+
+inline constexpr std::uint32_t pack_tree8_parent_nibbles32(
+    const std::int32_t* parents, int num_nodes) noexcept {
+  std::uint32_t out = 0u;
+  for (int i = 0; i < num_nodes && i < 8; ++i) {
+    const std::uint32_t nib = static_cast<std::uint32_t>(parents[i]) & 0xFu;
+    out |= (nib << (4 * i));
+  }
+  return out;
+}
+
+struct Dsv41DeepSelectPlan8 {
+  std::array<std::int32_t, kTree8DynamicNumNodes>  parents{};
+  std::array<std::uint32_t, kTree8DynamicNumNodes> depths{};
+  std::array<std::int32_t, kTree8DynamicNumNodes>  tokens{};
+  std::array<std::uint32_t, kTree8DynamicNumNodes> pool_indices{};
+  std::array<double, kTree8DynamicNumNodes>        cum_alpha{};
+  std::uint64_t anc_mask64       = 0ULL;
+  std::uint32_t depth_nibbles32  = 0u;
+  std::uint32_t parent_nibbles32 = 0u;
+  std::uint8_t  valid_node_mask  = 0xFFu;
+  int           max_depth        = 0;
+  double        expected_accepted_drafts = 0.0;
+};
+
+// Greedily selects up to 7 VALID non-root prefix-closed nodes maximizing sum_{v=1}^{7} prod_{u in anc(v)} c_u,
+// topologically sorts (parent[i] < i), quarantines any remaining candidate-shortage slots inertly under
+// root 0 (`valid_node_mask` bit i = 0, `anc_mask = (1u << 0) | (1u << i)`, `tokens[i] = -1`), and emits
+// direct 64-bit SGPR bitpacks (`anc_mask64`, `depth_nibbles32`, `parent_nibbles32`).
+inline bool deep_select_top7_confidence_tree8(
+    int pool_size,
+    const std::int32_t* pool_parents,
+    const std::int32_t* pool_tokens,
+    const double* pool_node_conf,
+    std::int32_t eos_token_id,
+    Dsv41DeepSelectPlan8* out_plan,
+    std::uint32_t max_allowed_depth = 6u) noexcept {
+  if (!out_plan || !pool_parents || !pool_tokens || !pool_node_conf ||
+      pool_size < kTree8DynamicNumNodes || pool_size > kDeepSelectMaxPoolCap ||
+      max_allowed_depth < 1u || max_allowed_depth > 6u) {
+    return false;
+  }
+  if (pool_parents[0] != -1) {
+    return false;
+  }
+
+  std::array<std::uint32_t, kDeepSelectMaxPoolCap> p_depth{};
+  std::array<double, kDeepSelectMaxPoolCap> alpha{};
+  std::array<bool, kDeepSelectMaxPoolCap> valid_node{};
+  std::array<bool, kDeepSelectMaxPoolCap> selected{};
+
+  p_depth[0] = 0u;
+  alpha[0] = 1.0;
+  valid_node[0] = true;
+  selected[0] = true;
+
+  for (int u = 1; u < pool_size; ++u) {
+    const int p = pool_parents[u];
+    if (p < 0 || p >= u) {
+      return false;
+    }
+    p_depth[static_cast<std::size_t>(u)] = p_depth[static_cast<std::size_t>(p)] + 1u;
+    if (!valid_node[static_cast<std::size_t>(p)] ||
+        p_depth[static_cast<std::size_t>(u)] > max_allowed_depth ||
+        pool_tokens[u] < 0 ||
+        (eos_token_id >= 0 && pool_tokens[p] == eos_token_id)) {
+      valid_node[static_cast<std::size_t>(u)] = false;
+      alpha[static_cast<std::size_t>(u)] = 0.0;
+      continue;
+    }
+
+    bool dup_sib = false;
+    for (int s = 1; s < u; ++s) {
+      if (pool_parents[s] == p && valid_node[static_cast<std::size_t>(s)] &&
+          pool_tokens[s] == pool_tokens[u]) {
+        dup_sib = true;
+        break;
+      }
+    }
+    if (dup_sib) {
+      valid_node[static_cast<std::size_t>(u)] = false;
+      alpha[static_cast<std::size_t>(u)] = 0.0;
+      continue;
+    }
+
+    valid_node[static_cast<std::size_t>(u)] = true;
+    const double cu = std::isfinite(pool_node_conf[u])
+        ? std::clamp(pool_node_conf[u], 0.0, 1.0)
+        : 0.0;
+    alpha[static_cast<std::size_t>(u)] = alpha[static_cast<std::size_t>(p)] * cu;
+  }
+
+  for (int pick = 1; pick < kTree8DynamicNumNodes; ++pick) {
+    int best_u = -1;
+    double best_a = -1.0;
+    for (int u = 1; u < pool_size; ++u) {
+      if (selected[static_cast<std::size_t>(u)]) continue;
+      if (!valid_node[static_cast<std::size_t>(u)]) continue;
+      const int p = pool_parents[u];
+      if (!selected[static_cast<std::size_t>(p)]) continue;
+      if (p_depth[static_cast<std::size_t>(u)] > max_allowed_depth) continue;
+      const double score = alpha[static_cast<std::size_t>(u)];
+      if (best_u < 0 || score > best_a) {
+        best_u = u;
+        best_a = score;
+      }
+    }
+    if (best_u < 0) {
+      break;
+    }
+    selected[static_cast<std::size_t>(best_u)] = true;
+  }
+
+  *out_plan = Dsv41DeepSelectPlan8{};
+  out_plan->valid_node_mask = 0x01u;
+  std::array<int, kDeepSelectMaxPoolCap> old_to_new{};
+  old_to_new.fill(-1);
+
+  int out_idx = 0;
+  for (int u = 0; u < pool_size && out_idx < kTree8DynamicNumNodes; ++u) {
+    if (!selected[static_cast<std::size_t>(u)]) continue;
+    old_to_new[static_cast<std::size_t>(u)] = out_idx;
+    out_plan->pool_indices[static_cast<std::size_t>(out_idx)] = static_cast<std::uint32_t>(u);
+    out_plan->tokens[static_cast<std::size_t>(out_idx)] = pool_tokens[u];
+    out_plan->cum_alpha[static_cast<std::size_t>(out_idx)] = alpha[static_cast<std::size_t>(u)];
+    out_plan->valid_node_mask =
+        static_cast<std::uint8_t>(out_plan->valid_node_mask | (1u << out_idx));
+    if (out_idx == 0) {
+      out_plan->parents[0] = -1;
+      out_plan->depths[0] = 0u;
+    } else {
+      const int mapped_p = old_to_new[static_cast<std::size_t>(pool_parents[u])];
+      if (mapped_p < 0 || mapped_p >= out_idx) {
+        return false;
+      }
+      out_plan->parents[static_cast<std::size_t>(out_idx)] = mapped_p;
+      const std::uint32_t d = out_plan->depths[static_cast<std::size_t>(mapped_p)] + 1u;
+      out_plan->depths[static_cast<std::size_t>(out_idx)] = d;
+      if (static_cast<int>(d) > out_plan->max_depth) {
+        out_plan->max_depth = static_cast<int>(d);
+      }
+      out_plan->expected_accepted_drafts += alpha[static_cast<std::size_t>(u)];
+    }
+    ++out_idx;
+  }
+  if (out_idx == 0) {
+    return false;
+  }
+
+  // Quarantine any unfilled candidate-shortage slots inertly under root 0:
+  // `valid_node_mask` bit i = 0, `anc_mask = (1u << 0) | (1u << i)`, `tokens[i] = -1`, `cum_alpha[i] = 0.0`.
+  for (; out_idx < kTree8DynamicNumNodes; ++out_idx) {
+    out_plan->parents[static_cast<std::size_t>(out_idx)] = 0;
+    out_plan->depths[static_cast<std::size_t>(out_idx)] = 1u;
+    out_plan->tokens[static_cast<std::size_t>(out_idx)] = -1;
+    out_plan->pool_indices[static_cast<std::size_t>(out_idx)] = 0u;
+    out_plan->cum_alpha[static_cast<std::size_t>(out_idx)] = 0.0;
+  }
+  if (out_plan->max_depth == 0) {
+    out_plan->max_depth = 1;
+  }
+
+  out_plan->anc_mask64 =
+      pack_tree8_anc_mask64(out_plan->parents.data(), kTree8DynamicNumNodes);
+  out_plan->depth_nibbles32 =
+      pack_tree8_depth_nibbles32(out_plan->depths.data(), kTree8DynamicNumNodes);
+  out_plan->parent_nibbles32 =
+      pack_tree8_parent_nibbles32(out_plan->parents.data(), kTree8DynamicNumNodes);
+  return true;
+}
+
+// Wave 8.3A Full-Range (0..1,048,576) DSpark Width Controller (--dspark-tree-width auto|8|16):
+//   - Auto (default `kAutoTree16MaxContext = 0`): disables under-48K 4-batch M = 16 drag across
+//     0..1,048,576 so `p_root_top1 >= 0.72` runs M = 6 linear DSpark and `p_root_top1 < 0.72`
+//     runs single-pass ConfidenceHead Dynamic M = 8 (`DeepSelect8`; or static M = 8 under
+//     `--dspark-static-m8`). Optional `--dspark-tree16-max-ctx <int>` overrides `auto_tree16_max_context`.
 //   - Fixed8:  always uses M = 8 when tree confidence gate fires
-//   - Fixed16: always uses M = 16 when tree confidence gate fires
-//   - Auto:    runs M = 8 when rolling 16-step EMA tau >= 4.2 (or outside <think>),
-//              switches to M = 16 when rolling tau < 3.9 inside <think>,
-//              and switches back to M = 8 once tau >= 4.2 or </think> closes.
+//   - Fixed16: opt-in standalone M = 16 DeepSelect benchmarking
 enum class Dsv41TreeWidthMode : std::uint8_t {
   Auto    = 0,
   Fixed8  = 8,
@@ -638,17 +1164,21 @@ enum class Dsv41TreeWidthMode : std::uint8_t {
 };
 
 struct Dsv41AdaptiveTreeWidthController {
+  static constexpr int kAutoTree16MaxContext = 0;  // Wave 8.3A: Full-range Dynamic M = 8 + M = 6 fast path across 0..1,048,576!
   Dsv41TreeWidthMode mode = Dsv41TreeWidthMode::Auto;
+  int auto_tree16_max_context = kAutoTree16MaxContext;
   double ema_tau = 4.25;
   int current_width = 8;
 
   explicit constexpr Dsv41AdaptiveTreeWidthController(
-      Dsv41TreeWidthMode m = Dsv41TreeWidthMode::Auto) noexcept
+      Dsv41TreeWidthMode m = Dsv41TreeWidthMode::Auto,
+      int tree16_max_ctx = kAutoTree16MaxContext) noexcept
       : mode(m),
+        auto_tree16_max_context(tree16_max_ctx),
         ema_tau(4.25),
         current_width(m == Dsv41TreeWidthMode::Fixed16 ? 16 : 8) {}
 
-  int select_width(bool in_think) noexcept {
+  int select_width(bool in_think, int cur_pos = 0) noexcept {
     if (mode == Dsv41TreeWidthMode::Fixed8) {
       current_width = 8;
       return 8;
@@ -657,7 +1187,7 @@ struct Dsv41AdaptiveTreeWidthController {
       current_width = 16;
       return 16;
     }
-    if (!in_think) {
+    if (!in_think || cur_pos >= auto_tree16_max_context) {
       current_width = 8;
       return 8;
     }
@@ -675,8 +1205,13 @@ struct Dsv41AdaptiveTreeWidthController {
     if (!in_think && mode == Dsv41TreeWidthMode::Auto) {
       current_width = 8;
     } else if (mode == Dsv41TreeWidthMode::Auto) {
-      if (ema_tau < 3.9) current_width = 16;
-      else if (ema_tau >= 4.2) current_width = 8;
+      if (auto_tree16_max_context <= 0) {
+        current_width = 8;
+      } else if (ema_tau < 3.9) {
+        current_width = 16;
+      } else if (ema_tau >= 4.2) {
+        current_width = 8;
+      }
     }
   }
 };
@@ -714,12 +1249,14 @@ inline Dsv41TreeVerifyResult verify_stochastic_specinfer_tree(
     const double* p_src = target_probs + static_cast<std::size_t>(cur) * vocab_size;
     std::copy(p_src, p_src + vocab_size, p_res_buf);
 
-    std::uint8_t mask = raw_child_mask ? raw_child_mask[cur] : tree.child_mask[cur];
+    std::uint8_t mask = static_cast<std::uint8_t>(
+        (raw_child_mask ? raw_child_mask[cur] : tree.child_mask[cur]) & tree.valid_node_mask);
     std::int32_t accepted_child = -1;
 
     while (mask != 0u) {
       const std::uint32_t c = static_cast<std::uint32_t>(__builtin_ctz(mask));
       mask &= static_cast<std::uint8_t>(mask - 1u);
+      if (((tree.valid_node_mask >> c) & 1u) == 0u) continue;
 
       const std::int32_t x_c = tree.token_id[c];
       const double* q_c = draft_probs + static_cast<std::size_t>(c) * vocab_size;

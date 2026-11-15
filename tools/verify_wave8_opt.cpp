@@ -283,11 +283,19 @@ bool test_2_tree16_kolmogorov_and_adaptive_controller() {
         }
     }
 
-    // 2B. Verify Dsv41AdaptiveTreeWidthController hysteresis:
-    //     - Starts at M=8 (ema_tau=4.25)
-    //     - Drops to M=16 inside <think> once rolling tau < 3.9
-    //     - Stays at M=16 inside deadband [3.9, 4.2), returns to M=8 once tau >= 4.2 or outside <think>
-    Dsv41AdaptiveTreeWidthController ctrl(Dsv41TreeWidthMode::Auto);
+    // 2B. Verify Dsv41AdaptiveTreeWidthController default (Wave 8.3A kAutoTree16MaxContext = 0 -> M=8 across 0..1M)
+    //     plus explicit `--dspark-tree16-max-ctx 49152` hysteresis:
+    {
+        Dsv41AdaptiveTreeWidthController def_ctrl(Dsv41TreeWidthMode::Auto);
+        for (int i = 0; i < 12; ++i) def_ctrl.observe_step(2, true);
+        if (def_ctrl.select_width(true, 0) != 8 ||
+            def_ctrl.select_width(true, 9029) != 8 ||
+            def_ctrl.select_width(true, 1048575) != 8) {
+            std::fprintf(stderr, "[TEST 2] Default Auto controller failed to keep M=8 across 0..1M\n");
+            return false;
+        }
+    }
+    Dsv41AdaptiveTreeWidthController ctrl(Dsv41TreeWidthMode::Auto, 49152);
     if (ctrl.select_width(true) != 8) return false;
     for (int i = 0; i < 12; ++i) ctrl.observe_step(2, true);  // High-entropy <think> drops EMA < 3.9
     if (ctrl.ema_tau >= 3.9 || ctrl.select_width(true) != 16) {

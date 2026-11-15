@@ -9,6 +9,7 @@
 #include "dsv41_engram_cpu.hpp"
 #include "dsv41_mi50_kernels.hpp"
 #include "dsv41_tokenizer_dsml.hpp"
+#include "dsv41_vit.hpp"
 #include "../p150/dsv41_p150_shm.hpp"
 
 #include <cstdint>
@@ -34,9 +35,13 @@ struct Dsv41GenStats {
     int prompt_tokens = 0;
     int cached_prefix_tokens = 0;
     int radix_hit_tokens = 0;
+    int nvme_hit_tokens = 0;
     int swa_replay_tokens = 0;
     int prefilled_tokens = 0;
     int completion_tokens = 0;
+    int images_encoded = 0;
+    double vit_encode_ms = 0.0;
+    double nvme_hydrate_ms = 0.0;
     double prefix_reuse_ms = 0.0;
     double fresh_prefill_ms = 0.0;
     double prefill_ms = 0.0;
@@ -57,6 +62,8 @@ struct Dsv41GenStats {
     uint64_t dspark_accepted = 0;
     uint64_t dspark_tree_steps = 0;
     uint64_t dspark_tree_accepted = 0;
+    uint64_t dspark_tree_dyn8_steps = 0;
+    uint64_t dspark_tree_dyn8_accepted = 0;
     uint64_t dspark_tree16_steps = 0;
     uint64_t dspark_tree16_accepted = 0;
     bool think_guard_triggered = false;
@@ -98,16 +105,24 @@ public:
         const std::string& p150_shm_name = "/dsv41_p150_ipc",
         int max_seq_len = 524288,
         const std::string& rarebal_overlay_path = "",
-        const std::string& capture_rarebal_dir = "");
+        const std::string& capture_rarebal_dir = "",
+        const std::string& vit_weights_path = "");
 
     bool ready() const noexcept { return ready_; }
+    bool vision_ready() const noexcept;
     const Dsv41Tokenizer& tokenizer() const { return tokenizer_; }
 
     void reset_session_cache();
     void set_sync_timers(bool enable);
     void set_dual_stream_overlap(bool enable);
     void set_dspark_tree_width(int width_mode);  // 0 = auto, 8 = fixed M=8, 16 = fixed M=16
+    void set_dspark_tree16_max_context(int max_ctx);
+    void set_dspark_static_m8(bool enable);
+    void set_dspark_dyn8_max_depth(int max_depth);
+    void set_nvme_kv_cache(const std::string& cache_dir, double max_gb = 32.0);
+    void flush_nvme_kv_cache();
     void clear_all_caches();
+    std::vector<float> last_logits_row0() const;
     bool capture_rarebal_corpus(const std::vector<int32_t>& corpus_ids);
 
     // Thread-safe generation with multi-tier KV prefix reuse, strict CED prefill, and 3-stage DSpark (M=6)
@@ -116,7 +131,8 @@ public:
         const Dsv41GenParams& params,
         TokenStreamCallback on_token,
         Dsv41GenStats& out_stats,
-        ProgressCallback on_progress = nullptr);
+        ProgressCallback on_progress = nullptr,
+        const std::vector<Dsv41ImageSource>* images = nullptr);
 
 private:
     struct Impl;

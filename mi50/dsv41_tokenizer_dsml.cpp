@@ -10,14 +10,19 @@
 #include <unicode/unistr.h>
 
 #include "dsv41_tokenizer_dsml.hpp"
+#include "dsv41_vit.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <stdexcept>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace dsv41 {
 
@@ -408,6 +413,31 @@ void Dsv41Tokenizer::load(const std::string& tokenizer_json_path) {
                 Impl::make_pair_key(m.arr_val[0].as_str(), m.arr_val[1].as_str()), r);
         }
     }
+
+    // 5. Precompute raw byte-level payloads per token ID for O(1) zero-alloc UTF-8 streaming
+    const auto& bt = byte_tables();
+    id_to_raw_bytes_.assign(id_to_token_.size(), std::string{});
+    for (size_t tid = 0; tid < id_to_token_.size(); ++tid) {
+        const std::string& tok = id_to_token_[tid];
+        if (impl_->is_added_id[tid]) {
+            id_to_raw_bytes_[tid] = tok;
+            continue;
+        }
+        std::string rb;
+        rb.reserve(tok.size());
+        size_t i = 0;
+        while (i < tok.size()) {
+            const size_t prev = i;
+            const uint32_t cp = next_utf8_lossy(tok, i);
+            auto it = bt.cp_to_byte.find(cp);
+            if (it != bt.cp_to_byte.end()) {
+                rb.push_back(char(it->second));
+            } else {
+                rb.append(tok.data() + prev, i - prev);
+            }
+        }
+        id_to_raw_bytes_[tid] = std::move(rb);
+    }
 }
 
 const std::string& Dsv41Tokenizer::id_to_token(int32_t id) const {
@@ -483,36 +513,121 @@ std::vector<int32_t> Dsv41Tokenizer::encode(const std::string& text, bool parse_
     return out;
 }
 
-std::string Dsv41Tokenizer::decode(const std::vector<int32_t>& ids, bool skip_special_tokens) const {
-    const auto& bt = byte_tables();
-    std::string raw_bytes;
-    raw_bytes.reserve(ids.size() * 4);
+std::vector<int32_t> Dsv41Tokenizer::encode_segments(const std::vector<PromptSegment>& segments) const {
+    if (segments.empty()) return {};
 
-    for (int32_t id : ids) {
-        if (id < 0 || size_t(id) >= id_to_token_.size()) continue;
-        if (skip_special_tokens && id_is_special_[size_t(id)]) continue;
-        const std::string& tok = id_to_token_[size_t(id)];
-        if (impl_->is_added_id[size_t(id)]) {
-            raw_bytes.append(tok);
-            continue;
+    size_t total_ordinary_bytes = 0;
+    for (const auto& seg : segments) {
+        if (seg.kind == PromptSegment::Kind::OrdinaryText) {
+            total_ordinary_bytes += seg.text.size();
         }
-        size_t i = 0;
-        while (i < tok.size()) {
-            const size_t prev = i;
-            const uint32_t cp = next_utf8_lossy(tok, i);
-            auto it = bt.cp_to_byte.find(cp);
-            if (it != bt.cp_to_byte.end()) {
-                raw_bytes.push_back(char(it->second));
-            } else {
-                raw_bytes.append(tok.data() + prev, i - prev);
+    }
+
+    if (total_ordinary_bytes < 8192u) {
+        std::vector<int32_t> out;
+        out.reserve(segments.size() + total_ordinary_bytes / 3u);
+        for (const auto& seg : segments) {
+            if (seg.kind == PromptSegment::Kind::TokenId) {
+                if (seg.token_id >= 0 && seg.repeat > 0) {
+                    out.insert(out.end(), size_t(seg.repeat), seg.token_id);
+                }
+            } else if (!seg.text.empty()) {
+                std::vector<int32_t> sub = encode(seg.text, /*parse_special=*/false);
+                out.insert(out.end(), sub.begin(), sub.end());
             }
         }
+        return out;
+    }
+
+    struct WorkSlice {
+        bool is_tok = false;
+        int32_t token_id = -1;
+        int32_t repeat = 0;
+        std::string_view sv;
+    };
+
+    std::vector<WorkSlice> slices;
+    slices.reserve(segments.size() + total_ordinary_bytes / 2048u + 8u);
+    static constexpr size_t kTargetSliceBytes = 2048u;
+
+    for (const auto& seg : segments) {
+        if (seg.kind == PromptSegment::Kind::TokenId) {
+            if (seg.token_id >= 0 && seg.repeat > 0) {
+                slices.push_back(WorkSlice{true, seg.token_id, seg.repeat, {}});
+            }
+            continue;
+        }
+        const std::string& s = seg.text;
+        if (s.empty()) continue;
+        if (s.size() <= kTargetSliceBytes * 2u) {
+            slices.push_back(WorkSlice{false, -1, 0, std::string_view(s)});
+            continue;
+        }
+        size_t start = 0;
+        while (start < s.size()) {
+            if (s.size() - start <= kTargetSliceBytes) {
+                slices.push_back(WorkSlice{false, -1, 0, std::string_view(s.data() + start, s.size() - start)});
+                break;
+            }
+            size_t p = start + kTargetSliceBytes;
+            while (p < s.size()) {
+                const unsigned char cur = static_cast<unsigned char>(s[p]);
+                if (s[p - 1] == '\n' && cur > 0x20u && (cur & 0xC0u) != 0x80u) {
+                    break;
+                }
+                ++p;
+            }
+            slices.push_back(WorkSlice{false, -1, 0, std::string_view(s.data() + start, p - start)});
+            start = p;
+        }
+    }
+
+    std::vector<std::vector<int32_t>> encoded_slices(slices.size());
+    const int n_slices = static_cast<int>(slices.size());
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int i = 0; i < n_slices; ++i) {
+        if (!slices[size_t(i)].is_tok && !slices[size_t(i)].sv.empty()) {
+            encoded_slices[size_t(i)] = encode(std::string(slices[size_t(i)].sv), /*parse_special=*/false);
+        }
+    }
+
+    size_t total_ids = 0;
+    for (size_t i = 0; i < slices.size(); ++i) {
+        total_ids += slices[i].is_tok ? size_t(slices[i].repeat) : encoded_slices[i].size();
+    }
+    std::vector<int32_t> out;
+    out.reserve(total_ids);
+    for (size_t i = 0; i < slices.size(); ++i) {
+        if (slices[i].is_tok) {
+            out.insert(out.end(), size_t(slices[i].repeat), slices[i].token_id);
+        } else {
+            const auto& v = encoded_slices[i];
+            out.insert(out.end(), v.begin(), v.end());
+        }
+    }
+    return out;
+}
+
+std::string_view Dsv41Tokenizer::raw_bytes_single(int32_t id, bool skip_special_tokens) const {
+    if (id < 0 || size_t(id) >= id_to_raw_bytes_.size()) return {};
+    if (skip_special_tokens && id_is_special_[size_t(id)]) return {};
+    return id_to_raw_bytes_[size_t(id)];
+}
+
+std::string Dsv41Tokenizer::decode(const std::vector<int32_t>& ids, bool skip_special_tokens) const {
+    std::string raw_bytes;
+    raw_bytes.reserve(ids.size() * 4);
+    for (int32_t id : ids) {
+        const std::string_view rb = raw_bytes_single(id, skip_special_tokens);
+        if (!rb.empty()) raw_bytes.append(rb.data(), rb.size());
     }
     return bytes_to_utf8_lossy(raw_bytes);
 }
 
 std::string Dsv41Tokenizer::decode_single(int32_t id, bool skip_special_tokens) const {
-    return decode(std::vector<int32_t>{id}, skip_special_tokens);
+    const std::string_view rb = raw_bytes_single(id, skip_special_tokens);
+    if (rb.empty()) return {};
+    return bytes_to_utf8_lossy(std::string(rb));
 }
 
 void Dsv41Tokenizer::build_engram_compressed_map(
@@ -653,15 +768,80 @@ void Dsv41Tokenizer::build_engram_compressed_map(
 
 namespace {
 
-static const char* kBosTok       = "<\xEF\xBD\x9C" "begin\xE2\x96\x81of\xE2\x96\x81sentence\xEF\xBD\x9C>";
 static const char* kEosTok       = "<\xEF\xBD\x9C" "end\xE2\x96\x81of\xE2\x96\x81sentence\xEF\xBD\x9C>";
-static const char* kSystemTok    = "<\xEF\xBD\x9C" "System\xEF\xBD\x9C>";
-static const char* kUserTok      = "<\xEF\xBD\x9C" "User\xEF\xBD\x9C>";
-static const char* kAssistantTok = "<\xEF\xBD\x9C" "Assistant\xEF\xBD\x9C>";
-static const char* kReminderTok  = "<\xEF\xBD\x9C" "latest_reminder\xEF\xBD\x9C>";
-static const char* kThinkStart   = "<think>";
 static const char* kThinkEnd     = "</think>";
 static const char* kDsmlTok      = "\xEF\xBD\x9C" "DSML\xEF\xBD\x9C";
+
+bool is_image_json_block(const JsonValue& b) {
+    if (!b.is_object()) return false;
+    const std::string& bt = b.get("type").as_str();
+    return bt == "image" || bt == "image_url" || bt == "input_image";
+}
+
+Dsv41ImageSource extract_image_source_from_json_block(const JsonValue& b) {
+    const std::string& bt = b.get("type").as_str();
+    if (bt == "image_url") {
+        const JsonValue& iu = b.get("image_url");
+        const std::string url = iu.is_string() ? iu.s_val : iu.get("url").as_str();
+        if (url.empty()) {
+            throw std::runtime_error("image_url block missing url");
+        }
+        return load_image_source_from_spec(url);
+    }
+    if (bt == "input_image") {
+        if (b.has("image_url")) {
+            const JsonValue& iu = b.get("image_url");
+            const std::string url = iu.is_string() ? iu.s_val : iu.get("url").as_str();
+            if (!url.empty()) return load_image_source_from_spec(url);
+        }
+        if (b.has("url") && b.get("url").is_string() && !b.get("url").s_val.empty()) {
+            return load_image_source_from_spec(b.get("url").s_val);
+        }
+        if (b.has("image_data") && b.get("image_data").is_string() && !b.get("image_data").s_val.empty()) {
+            return make_image_source_from_base64(b.get("image_data").s_val, b.get("media_type").as_str());
+        }
+        throw std::runtime_error("input_image block does not contain a valid source");
+    }
+    if (b.has("source") && b.get("source").is_object()) {
+        const JsonValue& src = b.get("source");
+        const std::string st = src.get("type").as_str();
+        if (st == "base64" || (!src.get("data").as_str().empty() && st != "url")) {
+            return make_image_source_from_base64(src.get("data").as_str(), src.get("media_type").as_str());
+        }
+        if (st == "url" || !src.get("url").as_str().empty()) {
+            return load_image_source_from_spec(src.get("url").as_str());
+        }
+    }
+    if (b.has("data") && b.get("data").is_string() && !b.get("data").s_val.empty()) {
+        return make_image_source_from_base64(b.get("data").s_val, b.get("media_type").as_str());
+    }
+    if (b.has("url") && b.get("url").is_string() && !b.get("url").s_val.empty()) {
+        return load_image_source_from_spec(b.get("url").s_val);
+    }
+    throw std::runtime_error("Image block does not contain a valid source");
+}
+
+struct PromptSegmentBuilder {
+    std::vector<PromptSegment> segs;
+
+    void push_tok(int32_t id, int32_t count = 1) {
+        if (id < 0 || count <= 0) return;
+        if (!segs.empty() && segs.back().kind == PromptSegment::Kind::TokenId && segs.back().token_id == id) {
+            segs.back().repeat += count;
+        } else {
+            segs.push_back(PromptSegment::tok(id, count));
+        }
+    }
+
+    void push_txt(std::string_view s) {
+        if (s.empty()) return;
+        if (!segs.empty() && segs.back().kind == PromptSegment::Kind::OrdinaryText) {
+            segs.back().text.append(s.data(), s.size());
+        } else {
+            segs.push_back(PromptSegment::txt(std::string(s)));
+        }
+    }
+};
 
 std::pair<std::string, std::string> split_tool_name(const std::string& raw_name, const std::string& explicit_ns = "") {
     const size_t pos = raw_name.find("::");
@@ -703,44 +883,49 @@ std::vector<JsonValue> tools_from_openai_format(const JsonValue& tools) {
     return out;
 }
 
-std::string render_tools_block(const std::vector<JsonValue>& fns) {
+void append_tools_block_segments(PromptSegmentBuilder& bld, const std::vector<JsonValue>& fns) {
     std::string schemas;
     for (size_t i = 0; i < fns.size(); ++i) {
         if (i) schemas.push_back('\n');
         schemas += fns[i].dumps_py();
     }
-    std::string s;
-    s.reserve(schemas.size() + 1024);
-    s += "## Tools\n\n";
-    s += "You have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<";
-    s += kDsmlTok;
-    s += " calls>\" block like the following:\n\n<";
-    s += kDsmlTok;
-    s += " calls>\n<";
-    s += kDsmlTok;
-    s += " invoke name=\"$TOOL_NAME\">\n<";
-    s += kDsmlTok;
-    s += " parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</";
-    s += kDsmlTok;
-    s += " parameter>\n...\n</";
-    s += kDsmlTok;
-    s += " invoke>\n<";
-    s += kDsmlTok;
-    s += " invoke name=\"$TOOL_NAME2\">\n...\n</";
-    s += kDsmlTok;
-    s += " invoke>\n</";
-    s += kDsmlTok;
-    s += " calls>\n\n";
-    s += "String parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\n";
-    s += "If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\n";
-    s += "Otherwise, output directly after </think> with tool calls or final response.\n\n";
-    s += "### Available Tool Schemas\n\n";
-    s += schemas;
-    s += "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n";
-    return s;
+    bld.push_txt("## Tools\n\n");
+    bld.push_txt("You have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<");
+    bld.push_tok(Dsv41SpecialTokens::kDsml);
+    bld.push_txt(" calls>\" block like the following:\n\n<");
+    bld.push_tok(Dsv41SpecialTokens::kDsml);
+    bld.push_txt(" calls>\n<");
+    bld.push_tok(Dsv41SpecialTokens::kDsml);
+    bld.push_txt(" invoke name=\"$TOOL_NAME\">\n<");
+    bld.push_tok(Dsv41SpecialTokens::kDsml);
+    bld.push_txt(" parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</");
+    bld.push_tok(Dsv41SpecialTokens::kDsml);
+    bld.push_txt(" parameter>\n...\n</");
+    bld.push_tok(Dsv41SpecialTokens::kDsml);
+    bld.push_txt(" invoke>\n<");
+    bld.push_tok(Dsv41SpecialTokens::kDsml);
+    bld.push_txt(" invoke name=\"$TOOL_NAME2\">\n...\n</");
+    bld.push_tok(Dsv41SpecialTokens::kDsml);
+    bld.push_txt(" invoke>\n</");
+    bld.push_tok(Dsv41SpecialTokens::kDsml);
+    bld.push_txt(" calls>\n\n");
+    bld.push_txt("String parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\n");
+    bld.push_txt("If thinking_mode is enabled (triggered by ");
+    bld.push_tok(Dsv41SpecialTokens::kThinkOpen);
+    bld.push_txt("), you MUST output your complete reasoning inside ");
+    bld.push_tok(Dsv41SpecialTokens::kThinkOpen);
+    bld.push_txt("...");
+    bld.push_tok(Dsv41SpecialTokens::kThinkEnd);
+    bld.push_txt(" BEFORE any tool calls or final response.\n\n");
+    bld.push_txt("Otherwise, output directly after ");
+    bld.push_tok(Dsv41SpecialTokens::kThinkEnd);
+    bld.push_txt(" with tool calls or final response.\n\n");
+    bld.push_txt("### Available Tool Schemas\n\n");
+    bld.push_txt(schemas);
+    bld.push_txt("\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n");
 }
 
-std::string encode_arguments_to_dsml(const JsonValue& raw_args) {
+void append_arguments_to_dsml_segments(PromptSegmentBuilder& bld, const JsonValue& raw_args) {
     JsonValue args = raw_args;
     for (int iter = 0; iter < 2; ++iter) {
         if (args.is_string()) {
@@ -760,32 +945,41 @@ std::string encode_arguments_to_dsml(const JsonValue& raw_args) {
         args = std::move(wrap);
     }
 
-    std::string out;
     for (size_t i = 0; i < args.obj_val.size(); ++i) {
-        if (i) out.push_back('\n');
+        if (i) bld.push_txt("\n");
         const std::string& k = args.obj_val[i].first;
         const JsonValue& v = args.obj_val[i].second;
         const bool is_str = v.is_string();
-        out += "<";
-        out += kDsmlTok;
-        out += " parameter name=\"";
-        out += k;
-        out += "\" string=\"";
-        out += (is_str ? "true" : "false");
-        out += "\">";
-        out += (is_str ? v.s_val : v.dumps_py());
-        out += "</";
-        out += kDsmlTok;
-        out += " parameter>";
+        bld.push_txt("<");
+        bld.push_tok(Dsv41SpecialTokens::kDsml);
+        bld.push_txt(" parameter name=\"");
+        bld.push_txt(k);
+        bld.push_txt("\" string=\"");
+        bld.push_txt(is_str ? "true" : "false");
+        bld.push_txt("\">");
+        if (is_str) {
+            bld.push_txt(v.s_val);
+        } else {
+            bld.push_txt(v.dumps_py());
+        }
+        bld.push_txt("</");
+        bld.push_tok(Dsv41SpecialTokens::kDsml);
+        bld.push_txt(" parameter>");
     }
-    return out;
 }
 
 int resolve_reasoning_budget(const JsonValue* effort_val, std::string& io_thinking_mode) {
-    // Interactive default budget = 55 per Speed Wave 3 directive (supports "low"=50, "medium"=55, "high"=75, "max"=100, or int 1..100; 0/"none" -> chat mode)
-    if (!effort_val || effort_val->is_null()) return 55;
+    // Official DeepSeek-V4.1 Max recipe default = 100 ("low"=50, "medium"=65, "high"=75, "xhigh"=90, "max"=100, or int 1..100; 0/"none" -> chat mode)
+    if (!effort_val || effort_val->is_null()) return (io_thinking_mode == "chat") ? 0 : 100;
+    if (effort_val->is_bool()) {
+        if (!effort_val->b_val) {
+            io_thinking_mode = "chat";
+            return 0;
+        }
+        return 100;
+    }
     if (effort_val->is_int() || effort_val->is_number()) {
-        const int v = int(effort_val->as_int(55));
+        const int v = int(effort_val->as_int(100));
         if (v <= 0) {
             io_thinking_mode = "chat";
             return 0;
@@ -794,17 +988,23 @@ int resolve_reasoning_budget(const JsonValue* effort_val, std::string& io_thinki
     }
     if (effort_val->is_string()) {
         std::string s = effort_val->s_val;
+        size_t a = 0;
+        while (a < s.size() && std::isspace(static_cast<unsigned char>(s[a]))) ++a;
+        size_t b = s.size();
+        while (b > a && std::isspace(static_cast<unsigned char>(s[b - 1]))) --b;
+        s = s.substr(a, b - a);
         for (char& c : s) c = char(std::tolower(static_cast<unsigned char>(c)));
-        if (s.empty()) return 55;
-        if (s == "none" || s == "off" || s == "disabled" || s == "chat" || s == "0") {
+        if (s.empty()) return (io_thinking_mode == "chat") ? 0 : 100;
+        if (s == "none" || s == "off" || s == "disabled" || s == "false" || s == "chat" || s == "0") {
             io_thinking_mode = "chat";
             return 0;
         }
         if (s == "minimal") return 35;
         if (s == "low") return 50;
-        if (s == "medium") return 55;
+        if (s == "medium" || s == "med") return 65;
         if (s == "high") return 75;
-        if (s == "max" || s == "xhigh") return 100;
+        if (s == "xhigh" || s == "x-high" || s == "very_high") return 90;
+        if (s == "max" || s == "ultrathink") return 100;
         char* endp = nullptr;
         const long iv = std::strtol(s.c_str(), &endp, 10);
         if (endp && *endp == '\0') {
@@ -815,7 +1015,7 @@ int resolve_reasoning_budget(const JsonValue* effort_val, std::string& io_thinki
             return int(std::max(1L, std::min(100L, iv)));
         }
     }
-    return 55;
+    return (io_thinking_mode == "chat") ? 0 : 100;
 }
 
 int find_last_user_index(const std::vector<JsonValue>& msgs) {
@@ -827,7 +1027,7 @@ int find_last_user_index(const std::vector<JsonValue>& msgs) {
                 bool has_user_block = false;
                 for (const auto& b : cb->arr_val) {
                     const std::string& bt = b.get("type").as_str();
-                    if (bt == "text" || bt == "image" || bt == "image_url") {
+                    if (bt == "text" || bt == "image" || bt == "image_url" || bt == "input_image") {
                         has_user_block = true;
                         break;
                     }
@@ -860,14 +1060,17 @@ std::string extract_text_content(const JsonValue& c) {
 
 }  // namespace
 
-std::string render_dsv41_chat_prompt(
+std::vector<PromptSegment> render_dsv41_chat_segments(
     const JsonValue& raw_messages,
     const JsonValue* tools,
     const JsonValue* response_format,
     const JsonValue* reasoning_effort_val,
     std::string& out_thinking_mode,
-    int& out_budget)
+    int& out_budget,
+    std::vector<Dsv41ImageSource>* out_images)
 {
+    if (out_images) out_images->clear();
+
     if (out_thinking_mode != "chat" && out_thinking_mode != "thinking") {
         out_thinking_mode = "thinking";
     }
@@ -990,12 +1193,15 @@ std::string render_dsv41_chat_prompt(
         for (int idx = 0; idx < int(merged.size()); ++idx) {
             if (idx < last_user_idx && merged[size_t(idx)].get("role").as_str() == "assistant") {
                 merged[size_t(idx)].erase("reasoning_content");
+                merged[size_t(idx)].erase("thinking");
             }
         }
     }
 
-    // 5. Render full prompt starting with BOS (encoding.py:783, 585-742)
-    std::string prompt = kBosTok;
+    // 5. Render full prompt as anti-injection PromptSegments starting with BOS (deepseek-recipe + encoding.py)
+    PromptSegmentBuilder bld;
+    bld.push_tok(Dsv41SpecialTokens::kBos);
+
     for (int index = 0; index < int(merged.size()); ++index) {
         const JsonValue& msg = merged[size_t(index)];
         const std::string role = msg.get("role").as_str();
@@ -1006,83 +1212,108 @@ std::string render_dsv41_chat_prompt(
                             " (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
         }
         if (index == 0 && (!effort_prefix.empty() || role == "system")) {
-            prompt += kSystemTok;
+            bld.push_tok(Dsv41SpecialTokens::kSystem);
         }
-        prompt += effort_prefix;
+        bld.push_txt(effort_prefix);
 
         if (role == "system") {
-            if (index > 0) prompt += kSystemTok;
-            prompt += extract_text_content(msg.get("content"));
+            if (index > 0) bld.push_tok(Dsv41SpecialTokens::kSystem);
+            bld.push_txt(extract_text_content(msg.get("content")));
             if (msg.get("tools").is_array() && !msg.get("tools").arr_val.empty()) {
-                prompt += "\n\n";
-                prompt += render_tools_block(tools_from_openai_format(msg.get("tools")));
+                bld.push_txt("\n\n");
+                append_tools_block_segments(bld, tools_from_openai_format(msg.get("tools")));
             }
             if (msg.get("response_format").is_object() && !msg.get("response_format").obj_val.empty()) {
-                prompt += "\n\n## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n";
-                prompt += msg.get("response_format").dumps_py();
+                bld.push_txt("\n\n## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n");
+                bld.push_txt(msg.get("response_format").dumps_py());
             }
         } else if (role == "user") {
-            prompt += kUserTok;
+            bld.push_tok(Dsv41SpecialTokens::kUser);
             if (msg.get("content_blocks").is_array()) {
                 const auto& blks = msg.get("content_blocks").arr_val;
                 for (size_t bi = 0; bi < blks.size(); ++bi) {
-                    if (bi) prompt += "\n\n";
+                    if (bi) bld.push_txt("\n\n");
                     const auto& b = blks[bi];
                     const std::string bt = b.get("type").as_str();
                     if (bt == "text") {
-                        prompt += b.get("text").as_str();
+                        bld.push_txt(b.get("text").as_str());
+                    } else if (is_image_json_block(b)) {
+                        if (out_images) out_images->push_back(extract_image_source_from_json_block(b));
+                        bld.push_tok(Dsv41SpecialTokens::kImage);
                     } else if (bt == "tool_result") {
-                        prompt += "<tool_result>";
-                        prompt += extract_text_content(b.get("content"));
-                        prompt += "</tool_result>";
+                        bld.push_txt("<tool_result>");
+                        const JsonValue& tc = b.get("content");
+                        if (tc.is_array()) {
+                            for (size_t si = 0; si < tc.arr_val.size(); ++si) {
+                                if (si) bld.push_txt("\n\n");
+                                const JsonValue& sub = tc.arr_val[si];
+                                if (sub.is_string()) {
+                                    bld.push_txt(sub.s_val);
+                                } else if (sub.is_object() && sub.get("type").as_str() == "text") {
+                                    bld.push_txt(sub.get("text").as_str());
+                                } else if (is_image_json_block(sub)) {
+                                    if (out_images) out_images->push_back(extract_image_source_from_json_block(sub));
+                                    bld.push_tok(Dsv41SpecialTokens::kImage);
+                                } else if (sub.is_object()) {
+                                    bld.push_txt("[Unsupported " + sub.get("type").as_str() + "]");
+                                }
+                            }
+                        } else {
+                            bld.push_txt(extract_text_content(tc));
+                        }
+                        bld.push_txt("</tool_result>");
+                    } else {
+                        bld.push_txt("[Unsupported " + bt + "]");
                     }
                 }
             } else {
-                prompt += extract_text_content(msg.get("content"));
+                bld.push_txt(extract_text_content(msg.get("content")));
             }
         } else if (role == "latest_reminder") {
-            prompt += kReminderTok;
-            prompt += extract_text_content(msg.get("content"));
+            bld.push_tok(Dsv41SpecialTokens::kLatestReminder);
+            bld.push_txt(extract_text_content(msg.get("content")));
         } else if (role == "assistant") {
-            std::string thinking_part;
             if (out_thinking_mode == "thinking") {
-                if (!drop_thinking || index > last_user_idx) {
-                    thinking_part = msg.get("reasoning_content").as_str() + kThinkEnd;
+                const bool prev_has_task = (index > 0 && merged[size_t(index - 1)].has("task") &&
+                                            !merged[size_t(index - 1)].get("task").is_null());
+                if (!prev_has_task && (!drop_thinking || index > last_user_idx)) {
+                    const std::string rc = msg.has("reasoning_content") && !msg.get("reasoning_content").is_null()
+                                               ? msg.get("reasoning_content").as_str()
+                                               : msg.get("thinking").as_str();
+                    bld.push_txt(rc);
+                    bld.push_tok(Dsv41SpecialTokens::kThinkEnd);
                 }
             }
-            std::string tc_content;
+            bld.push_txt(extract_text_content(msg.get("content")));
             if (msg.get("tool_calls").is_array() && !msg.get("tool_calls").arr_val.empty()) {
-                tc_content += "\n\n<";
-                tc_content += kDsmlTok;
-                tc_content += " calls>\n";
+                bld.push_txt("\n\n<");
+                bld.push_tok(Dsv41SpecialTokens::kDsml);
+                bld.push_txt(" calls>\n");
                 const auto& tcs = msg.get("tool_calls").arr_val;
                 for (size_t ti = 0; ti < tcs.size(); ++ti) {
-                    if (ti) tc_content.push_back('\n');
+                    if (ti) bld.push_txt("\n");
                     const JsonValue& tc = tcs[ti];
                     const JsonValue& fn = tc.has("function") ? tc.get("function") : tc;
                     std::string ns = tc.get("namespace").as_str();
                     if (ns.empty()) ns = fn.get("namespace").as_str();
                     auto [rns, bare] = split_tool_name(fn.get("name").as_str(), ns);
                     const std::string qname = rns.empty() ? bare : (rns + "::" + bare);
-                    tc_content += "<";
-                    tc_content += kDsmlTok;
-                    tc_content += " invoke name=\"";
-                    tc_content += qname;
-                    tc_content += "\">\n";
-                    tc_content += encode_arguments_to_dsml(fn.get("arguments"));
-                    tc_content += "\n</";
-                    tc_content += kDsmlTok;
-                    tc_content += " invoke>";
+                    bld.push_txt("<");
+                    bld.push_tok(Dsv41SpecialTokens::kDsml);
+                    bld.push_txt(" invoke name=\"");
+                    bld.push_txt(qname);
+                    bld.push_txt("\">\n");
+                    append_arguments_to_dsml_segments(bld, fn.get("arguments"));
+                    bld.push_txt("\n</");
+                    bld.push_tok(Dsv41SpecialTokens::kDsml);
+                    bld.push_txt(" invoke>");
                 }
-                tc_content += "\n</";
-                tc_content += kDsmlTok;
-                tc_content += " calls>";
+                bld.push_txt("\n</");
+                bld.push_tok(Dsv41SpecialTokens::kDsml);
+                bld.push_txt(" calls>");
             }
-            prompt += thinking_part;
-            prompt += extract_text_content(msg.get("content"));
-            prompt += tc_content;
             if (!msg.get("wo_eos").as_bool(false)) {
-                prompt += kEosTok;
+                bld.push_tok(Dsv41SpecialTokens::kEos);
             }
         }
 
@@ -1094,17 +1325,17 @@ std::string render_dsv41_chat_prompt(
         }
 
         if (role == "user" || (role == "system" && index > 0)) {
-            prompt += kAssistantTok;
+            bld.push_tok(Dsv41SpecialTokens::kAssistant);
             if ((!drop_thinking && out_thinking_mode == "thinking") ||
                 (drop_thinking && out_thinking_mode == "thinking" && index >= last_user_idx)) {
-                prompt += kThinkStart;
+                bld.push_tok(Dsv41SpecialTokens::kThinkOpen);
             } else {
-                prompt += kThinkEnd;
+                bld.push_tok(Dsv41SpecialTokens::kThinkEnd);
             }
         }
     }
 
-    return prompt;
+    return bld.segs;
 }
 
 namespace {
@@ -1397,9 +1628,671 @@ Dsv41ParsedCompletion parse_dsv41_completion(
     return out;
 }
 
+namespace {
+
+void append_json_escaped_inner(std::string& out, std::string_view sv) {
+    for (unsigned char c : sv) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c < 0x20u) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", unsigned(c));
+                    out += buf;
+                } else {
+                    out.push_back(char(c));
+                }
+                break;
+        }
+    }
+}
+
+std::string json_quote_str(std::string_view sv) {
+    std::string out;
+    out.reserve(sv.size() + 4);
+    out.push_back('"');
+    append_json_escaped_inner(out, sv);
+    out.push_back('"');
+    return out;
+}
+
+std::string pop_complete_utf8_bytes(std::string& pending_bytes) {
+    if (pending_bytes.empty()) return {};
+    const size_t n = pending_bytes.size();
+    size_t check = n;
+    for (size_t back = 1; back <= 3 && back <= n; ++back) {
+        const uint8_t b = static_cast<uint8_t>(pending_bytes[n - back]);
+        if ((b & 0x80u) == 0u) break;
+        if ((b & 0xC0u) == 0xC0u) {
+            size_t expected = 1;
+            if ((b & 0xE0u) == 0xC0u) expected = 2;
+            else if ((b & 0xF0u) == 0xE0u) expected = 3;
+            else if ((b & 0xF8u) == 0xF0u) expected = 4;
+            if (back < expected) check = n - back;
+            break;
+        }
+    }
+    if (check == 0) return {};
+    std::string complete_raw = pending_bytes.substr(0, check);
+    pending_bytes.erase(0, check);
+    return bytes_to_utf8_lossy(complete_raw);
+}
+
+void push_assistant_seg_tok(std::vector<PromptSegment>& segs, int32_t id) {
+    if (id < 0) return;
+    if (!segs.empty() && segs.back().kind == PromptSegment::Kind::TokenId && segs.back().token_id == id) {
+        segs.back().repeat += 1;
+    } else {
+        segs.push_back(PromptSegment::tok(id, 1));
+    }
+}
+
+void push_assistant_seg_txt(std::vector<PromptSegment>& segs, std::string_view sv) {
+    if (sv.empty()) return;
+    if (!segs.empty() && segs.back().kind == PromptSegment::Kind::OrdinaryText) {
+        segs.back().text.append(sv.data(), sv.size());
+    } else {
+        segs.push_back(PromptSegment::txt(std::string(sv)));
+    }
+}
+
+struct DsmlOpenKmpSpec {
+    static constexpr int kNumPats = 6;
+    const char* pats[kNumPats] = {
+        " calls>",
+        "calls>",
+        " function_calls>",
+        "function_calls>",
+        " invoke",
+        "invoke"
+    };
+    bool is_wrapper[kNumPats] = {true, true, true, true, false, false};
+    int lens[kNumPats] = {};
+    int pi[kNumPats][24] = {};
+
+    DsmlOpenKmpSpec() {
+        for (int p = 0; p < kNumPats; ++p) {
+            const int m = static_cast<int>(std::strlen(pats[p]));
+            lens[p] = m;
+            pi[p][0] = 0;
+            int k = 0;
+            for (int i = 1; i < m; ++i) {
+                while (k > 0 && pats[p][k] != pats[p][i]) {
+                    k = pi[p][k - 1];
+                }
+                if (pats[p][k] == pats[p][i]) ++k;
+                pi[p][i] = k;
+            }
+        }
+    }
+
+    int step(int p, int q, char ch) const {
+        while (q > 0 && (q >= lens[p] || pats[p][q] != ch)) {
+            q = pi[p][q - 1];
+        }
+        if (q < lens[p] && pats[p][q] == ch) ++q;
+        return q;
+    }
+};
+
+const DsmlOpenKmpSpec& dsml_open_kmp() {
+    static const DsmlOpenKmpSpec kSpec;
+    return kSpec;
+}
+
+std::string trim_leading_ascii_ws(std::string_view sv) {
+    size_t i = 0;
+    while (i < sv.size() && (sv[i] == ' ' || sv[i] == '\n' || sv[i] == '\r' || sv[i] == '\t')) ++i;
+    return std::string(sv.substr(i));
+}
+
+}  // namespace
+
 Dsv41StreamParser::Dsv41StreamParser(const std::string& thinking_mode)
     : thinking_mode_(thinking_mode),
       state_(thinking_mode == "thinking" ? State::InThinking : State::InContent) {}
+
+void Dsv41StreamParser::step_token_gated_dsml_bytes(
+    std::string_view utf8_chunk,
+    std::vector<Dsv41ToolStreamDelta>* out_tool_deltas,
+    uint64_t call_id_seed)
+{
+    static constexpr size_t kMaxSingleToolBytes = 196608ULL;  // 192 KiB runaway guard per invoke
+    if (utf8_chunk.empty() || tool_block_closed_ || tool_runaway_) return;
+
+    std::string work(utf8_chunk);
+    while (!work.empty() && !tool_block_closed_ && !tool_runaway_) {
+        if (dsml_sub_ == DsmlSub::BetweenInvokes) {
+            dsml_tag_buf_ += work;
+            work.clear();
+            const std::string trimmed = trim_leading_ascii_ws(dsml_tag_buf_);
+            if (trimmed.empty() || trimmed == "<" || trimmed == "</") {
+                return;
+            }
+            if (next_tool_idx_ > 0) {
+                tool_block_closed_ = true;
+            }
+            return;
+        }
+
+        if (dsml_sub_ == DsmlSub::ReadingInvokeHeader) {
+            dsml_tag_buf_ += work;
+            work.clear();
+            const size_t gt = dsml_tag_buf_.find('>');
+            if (gt == std::string::npos) {
+                if (dsml_tag_buf_.size() > 4096u) tool_runaway_ = true;
+                return;
+            }
+            const std::string hdr = dsml_tag_buf_.substr(0, gt);
+            work = dsml_tag_buf_.substr(gt + 1);
+            dsml_tag_buf_.clear();
+
+            const size_t nq0 = hdr.find("name=\"");
+            if (nq0 == std::string::npos) {
+                dsml_sub_ = DsmlSub::BetweenInvokes;
+                continue;
+            }
+            const size_t nq1 = hdr.find('"', nq0 + 6);
+            if (nq1 == std::string::npos) {
+                dsml_sub_ = DsmlSub::BetweenInvokes;
+                continue;
+            }
+            auto [ns, bare_name] = split_tool_name(hdr.substr(nq0 + 6, nq1 - (nq0 + 6)));
+            (void)ns;
+
+            char id_buf[64];
+            std::snprintf(id_buf, sizeof(id_buf), "call_dsv41_%llu_%llu",
+                          static_cast<unsigned long long>(call_id_seed),
+                          static_cast<unsigned long long>(next_tool_idx_));
+            cur_tool_id_ = id_buf;
+            cur_tool_name_ = bare_name;
+            cur_tool_json_acc_.clear();
+            cur_tool_param_count_ = 0;
+            open_invoke_started_ = true;
+            open_invoke_name_ = bare_name;
+            tool_bytes_ = 0;
+            dsml_sub_ = DsmlSub::BetweenParams;
+
+            if (out_tool_deltas) {
+                out_tool_deltas->push_back(Dsv41ToolStreamDelta{
+                    next_tool_idx_, cur_tool_id_, cur_tool_name_, "", /*is_start=*/true, /*is_end=*/false});
+            }
+            continue;
+        }
+
+        if (dsml_sub_ == DsmlSub::BetweenParams) {
+            dsml_tag_buf_ += work;
+            work.clear();
+            return;
+        }
+
+        if (dsml_sub_ == DsmlSub::ReadingParamHeader) {
+            dsml_tag_buf_ += work;
+            work.clear();
+            const size_t gt = dsml_tag_buf_.find('>');
+            if (gt == std::string::npos) {
+                if (dsml_tag_buf_.size() > 4096u) tool_runaway_ = true;
+                return;
+            }
+            const std::string hdr = dsml_tag_buf_.substr(0, gt);
+            work = dsml_tag_buf_.substr(gt + 1);
+            dsml_tag_buf_.clear();
+
+            cur_param_name_ = "value";
+            const size_t pk0 = hdr.find("name=\"");
+            if (pk0 != std::string::npos) {
+                const size_t pk1 = hdr.find('"', pk0 + 6);
+                if (pk1 != std::string::npos) {
+                    cur_param_name_ = hdr.substr(pk0 + 6, pk1 - (pk0 + 6));
+                }
+            }
+            cur_param_is_string_ = true;
+            const size_t ps0 = hdr.find("string=\"");
+            if (ps0 != std::string::npos) {
+                const size_t ps1 = hdr.find('"', ps0 + 8);
+                if (ps1 != std::string::npos) {
+                    cur_param_is_string_ = (hdr.substr(ps0 + 8, ps1 - (ps0 + 8)) != "false");
+                }
+            }
+            param_val_pending_.clear();
+
+            std::string prefix = (cur_tool_param_count_ == 0) ? "{" : ", ";
+            prefix += json_quote_str(cur_param_name_);
+            prefix += cur_param_is_string_ ? ": \"" : ": ";
+            cur_tool_json_acc_ += prefix;
+            if (out_tool_deltas) {
+                out_tool_deltas->push_back(Dsv41ToolStreamDelta{
+                    next_tool_idx_, cur_tool_id_, cur_tool_name_, std::move(prefix), false, false});
+            }
+            dsml_sub_ = cur_param_is_string_ ? DsmlSub::StreamingStringParamValue : DsmlSub::BufferingJsonParamValue;
+            continue;
+        }
+
+        if (dsml_sub_ == DsmlSub::StreamingStringParamValue) {
+            tool_bytes_ += work.size();
+            if (tool_bytes_ > kMaxSingleToolBytes) {
+                tool_runaway_ = true;
+                return;
+            }
+            param_val_pending_ += work;
+            work.clear();
+
+            size_t hold = 0;
+            if (param_val_pending_.size() >= 2 &&
+                param_val_pending_[param_val_pending_.size() - 2] == '<' &&
+                param_val_pending_[param_val_pending_.size() - 1] == '/') {
+                hold = 2;
+            } else if (!param_val_pending_.empty() && param_val_pending_.back() == '<') {
+                hold = 1;
+            }
+            const size_t emit_n = param_val_pending_.size() - hold;
+            if (emit_n > 0) {
+                std::string esc;
+                esc.reserve(emit_n + 8);
+                append_json_escaped_inner(esc, std::string_view(param_val_pending_.data(), emit_n));
+                param_val_pending_.erase(0, emit_n);
+                cur_tool_json_acc_ += esc;
+                if (out_tool_deltas && !esc.empty()) {
+                    out_tool_deltas->push_back(Dsv41ToolStreamDelta{
+                        next_tool_idx_, cur_tool_id_, cur_tool_name_, std::move(esc), false, false});
+                }
+            }
+            return;
+        }
+
+        if (dsml_sub_ == DsmlSub::BufferingJsonParamValue) {
+            tool_bytes_ += work.size();
+            if (tool_bytes_ > kMaxSingleToolBytes) {
+                tool_runaway_ = true;
+                return;
+            }
+            param_val_pending_ += work;
+            work.clear();
+            return;
+        }
+
+        if (dsml_sub_ == DsmlSub::ReadingCloseTag) {
+            dsml_tag_buf_ += work;
+            work.clear();
+            const size_t gt = dsml_tag_buf_.find('>');
+            if (gt == std::string::npos) {
+                if (dsml_tag_buf_.size() > 512u) tool_block_closed_ = true;
+                return;
+            }
+            work = dsml_tag_buf_.substr(gt + 1);
+            dsml_tag_buf_.clear();
+
+            if (close_is_wrapper_) {
+                tool_block_closed_ = true;
+                return;
+            }
+            if (close_is_invoke_) {
+                std::string close_json = (cur_tool_param_count_ == 0) ? "{}" : "}";
+                cur_tool_json_acc_ += close_json;
+                parsed_tools_.push_back(Dsv41ParsedToolCall{cur_tool_id_, cur_tool_name_, cur_tool_json_acc_});
+                if (out_tool_deltas) {
+                    out_tool_deltas->push_back(Dsv41ToolStreamDelta{
+                        next_tool_idx_, cur_tool_id_, cur_tool_name_, std::move(close_json), false, /*is_end=*/true});
+                }
+                open_invoke_started_ = false;
+                tool_bytes_ = 0;
+                ++next_tool_idx_;
+                dsml_sub_ = DsmlSub::BetweenInvokes;
+            } else {
+                dsml_sub_ = DsmlSub::BetweenParams;
+            }
+            continue;
+        }
+    }
+}
+
+void Dsv41StreamParser::on_token_gated_dsml_marker(
+    std::string& out_content_delta,
+    std::vector<Dsv41ToolStreamDelta>* out_tool_deltas,
+    uint64_t /*call_id_seed*/)
+{
+    if (state_ == State::InContent) {
+        if (!pending_.empty() && pending_.back() == '<') {
+            pending_.pop_back();
+            dsml_pre_ws_.clear();
+            if (pending_.size() >= 2 && pending_.compare(pending_.size() - 2, 2, "\n\n") == 0) {
+                dsml_pre_ws_ = "\n\n";
+                pending_.erase(pending_.size() - 2);
+            } else if (!pending_.empty() && pending_.back() == '\n') {
+                dsml_pre_ws_ = "\n";
+                pending_.pop_back();
+            }
+            if (!pending_.empty()) {
+                out_content_delta += pending_;
+                content_acc_ += pending_;
+                pending_.clear();
+            }
+            dsml_open_buf_.clear();
+            for (int& q : kmp_q_) q = 0;
+            state_ = State::ConfirmingDsmlOpen;
+        } else {
+            pending_ += kDsmlTok;
+            out_content_delta += pending_;
+            content_acc_ += pending_;
+            pending_.clear();
+        }
+        return;
+    }
+
+    if (state_ == State::ConfirmingDsmlOpen) {
+        // Unexpected back-to-back ｜DSML｜ inside unconfirmed header -> flush literal
+        std::string restored = dsml_pre_ws_ + "<" + kDsmlTok + dsml_open_buf_ + kDsmlTok;
+        dsml_pre_ws_.clear();
+        dsml_open_buf_.clear();
+        state_ = State::InContent;
+        out_content_delta += restored;
+        content_acc_ += restored;
+        return;
+    }
+
+    if (state_ != State::InToolCalls || tool_block_closed_ || tool_runaway_) return;
+
+    if (dsml_sub_ == DsmlSub::BetweenInvokes) {
+        const std::string trimmed = trim_leading_ascii_ws(dsml_tag_buf_);
+        dsml_tag_buf_.clear();
+        if (trimmed == "<") {
+            dsml_sub_ = DsmlSub::ReadingInvokeHeader;
+        } else if (trimmed == "</") {
+            dsml_sub_ = DsmlSub::ReadingCloseTag;
+            close_is_invoke_ = false;
+            close_is_wrapper_ = true;
+        } else {
+            tool_block_closed_ = true;
+        }
+        return;
+    }
+
+    if (dsml_sub_ == DsmlSub::BetweenParams) {
+        const std::string trimmed = trim_leading_ascii_ws(dsml_tag_buf_);
+        dsml_tag_buf_.clear();
+        if (trimmed == "<") {
+            dsml_sub_ = DsmlSub::ReadingParamHeader;
+        } else if (trimmed == "</") {
+            dsml_sub_ = DsmlSub::ReadingCloseTag;
+            close_is_invoke_ = true;
+            close_is_wrapper_ = false;
+        } else {
+            tool_block_closed_ = true;
+        }
+        return;
+    }
+
+    if (dsml_sub_ == DsmlSub::StreamingStringParamValue) {
+        if (param_val_pending_.size() >= 2 &&
+            param_val_pending_[param_val_pending_.size() - 2] == '<' &&
+            param_val_pending_[param_val_pending_.size() - 1] == '/') {
+            param_val_pending_.erase(param_val_pending_.size() - 2);
+            std::string delta;
+            if (!param_val_pending_.empty()) {
+                append_json_escaped_inner(delta, param_val_pending_);
+                param_val_pending_.clear();
+            }
+            delta.push_back('"');
+            cur_tool_json_acc_ += delta;
+            if (out_tool_deltas) {
+                out_tool_deltas->push_back(Dsv41ToolStreamDelta{
+                    next_tool_idx_, cur_tool_id_, cur_tool_name_, std::move(delta), false, false});
+            }
+            ++cur_tool_param_count_;
+            dsml_tag_buf_.clear();
+            dsml_sub_ = DsmlSub::ReadingCloseTag;
+            close_is_invoke_ = false;
+            close_is_wrapper_ = false;
+        } else {
+            param_val_pending_ += kDsmlTok;
+            std::string esc;
+            append_json_escaped_inner(esc, param_val_pending_);
+            param_val_pending_.clear();
+            cur_tool_json_acc_ += esc;
+            if (out_tool_deltas && !esc.empty()) {
+                out_tool_deltas->push_back(Dsv41ToolStreamDelta{
+                    next_tool_idx_, cur_tool_id_, cur_tool_name_, std::move(esc), false, false});
+            }
+        }
+        return;
+    }
+
+    if (dsml_sub_ == DsmlSub::BufferingJsonParamValue) {
+        if (param_val_pending_.size() >= 2 &&
+            param_val_pending_[param_val_pending_.size() - 2] == '<' &&
+            param_val_pending_[param_val_pending_.size() - 1] == '/') {
+            param_val_pending_.erase(param_val_pending_.size() - 2);
+            JsonValue tmp;
+            std::string val_json;
+            if (JsonParser::try_parse(param_val_pending_, tmp)) {
+                val_json = param_val_pending_;
+            } else {
+                val_json = json_quote_str(param_val_pending_);
+            }
+            param_val_pending_.clear();
+            cur_tool_json_acc_ += val_json;
+            if (out_tool_deltas) {
+                out_tool_deltas->push_back(Dsv41ToolStreamDelta{
+                    next_tool_idx_, cur_tool_id_, cur_tool_name_, std::move(val_json), false, false});
+            }
+            ++cur_tool_param_count_;
+            dsml_tag_buf_.clear();
+            dsml_sub_ = DsmlSub::ReadingCloseTag;
+            close_is_invoke_ = false;
+            close_is_wrapper_ = false;
+        } else {
+            param_val_pending_ += kDsmlTok;
+        }
+        return;
+    }
+}
+
+void Dsv41StreamParser::feed_token(
+    int32_t token_id,
+    std::string_view raw_piece,
+    std::string& out_reasoning_delta,
+    std::string& out_content_delta,
+    std::vector<Dsv41ToolStreamDelta>* out_tool_deltas,
+    uint64_t call_id_seed)
+{
+    out_reasoning_delta.clear();
+    out_content_delta.clear();
+    if (out_tool_deltas) out_tool_deltas->clear();
+    token_gated_mode_ = true;
+
+    if (token_id == Dsv41SpecialTokens::kEos) {
+        if (state_ == State::InToolCalls) {
+            tool_block_closed_ = true;
+        }
+        return;
+    }
+
+    // Flush any pending multi-byte UTF-8 tail before structural special tokens
+    auto flush_incomplete_utf8 = [&]() -> std::string {
+        if (utf8_tail_.empty()) return {};
+        std::string flushed = bytes_to_utf8_lossy(utf8_tail_);
+        utf8_tail_.clear();
+        push_assistant_seg_txt(assistant_segs_, flushed);
+        full_raw_ += flushed;
+        return flushed;
+    };
+
+    // 1. Strict Token-ID-gated `</think>` exit (ordinary BPE spelling "</think>" NEVER exits <think>!)
+    if (token_id == Dsv41SpecialTokens::kThinkEnd) {
+        const std::string tail = flush_incomplete_utf8();
+        push_assistant_seg_tok(assistant_segs_, Dsv41SpecialTokens::kThinkEnd);
+        if (state_ == State::InThinking) {
+            if (!tail.empty()) {
+                out_reasoning_delta += tail;
+                reasoning_acc_ += tail;
+            }
+            if (!pending_.empty()) {
+                out_reasoning_delta += pending_;
+                reasoning_acc_ += pending_;
+                pending_.clear();
+            }
+            has_real_think_end_ = true;
+            real_think_end_pos_ = full_raw_.size();
+            full_raw_ += kThinkEnd;
+            state_ = State::InContent;
+            return;
+        }
+        // After </think>, a literal 128822 token behaves as literal "</think>"
+        full_raw_ += kThinkEnd;
+        if (state_ == State::InToolCalls) {
+            step_token_gated_dsml_bytes(kThinkEnd, out_tool_deltas, call_id_seed);
+            return;
+        }
+        pending_ += tail;
+        pending_ += kThinkEnd;
+    } else if (token_id == Dsv41SpecialTokens::kDsml) {
+        // 2. Strict Token-ID-gated `｜DSML｜` marker (ordinary BPE spelling "｜DSML｜" NEVER triggers tool mode!)
+        const std::string tail = flush_incomplete_utf8();
+        push_assistant_seg_tok(assistant_segs_, Dsv41SpecialTokens::kDsml);
+        full_raw_ += kDsmlTok;
+        if (state_ == State::InThinking) {
+            if (!tail.empty()) {
+                out_reasoning_delta += tail;
+                reasoning_acc_ += tail;
+            }
+            out_reasoning_delta += kDsmlTok;
+            reasoning_acc_ += kDsmlTok;
+            return;
+        }
+        if (!tail.empty()) {
+            if (state_ == State::InToolCalls) {
+                step_token_gated_dsml_bytes(tail, out_tool_deltas, call_id_seed);
+            } else {
+                pending_ += tail;
+            }
+        }
+        on_token_gated_dsml_marker(out_content_delta, out_tool_deltas, call_id_seed);
+        return;
+    } else if (token_id == Dsv41SpecialTokens::kThinkOpen ||
+               token_id == Dsv41SpecialTokens::kSystem ||
+               token_id == Dsv41SpecialTokens::kUser ||
+               token_id == Dsv41SpecialTokens::kAssistant ||
+               token_id == Dsv41SpecialTokens::kLatestReminder ||
+               token_id == Dsv41SpecialTokens::kImage ||
+               token_id == Dsv41SpecialTokens::kBos) {
+        const std::string tail = flush_incomplete_utf8();
+        push_assistant_seg_tok(assistant_segs_, token_id);
+        full_raw_.append(raw_piece.data(), raw_piece.size());
+        if (state_ == State::InThinking) {
+            if (!tail.empty()) {
+                out_reasoning_delta += tail;
+                reasoning_acc_ += tail;
+            }
+            out_reasoning_delta.append(raw_piece.data(), raw_piece.size());
+            reasoning_acc_.append(raw_piece.data(), raw_piece.size());
+            return;
+        }
+        if (state_ == State::InToolCalls) {
+            if (!tail.empty()) step_token_gated_dsml_bytes(tail, out_tool_deltas, call_id_seed);
+            step_token_gated_dsml_bytes(raw_piece, out_tool_deltas, call_id_seed);
+            return;
+        }
+        pending_ += tail;
+        pending_.append(raw_piece.data(), raw_piece.size());
+    } else {
+        if (raw_piece.empty()) return;
+        utf8_tail_.append(raw_piece.data(), raw_piece.size());
+        const std::string utf8_chunk = pop_complete_utf8_bytes(utf8_tail_);
+        if (utf8_chunk.empty()) return;
+
+        push_assistant_seg_txt(assistant_segs_, utf8_chunk);
+        full_raw_ += utf8_chunk;
+
+        if (state_ == State::InThinking) {
+            out_reasoning_delta += utf8_chunk;
+            reasoning_acc_ += utf8_chunk;
+            return;
+        }
+
+        if (state_ == State::ConfirmingDsmlOpen) {
+            const auto& kmp = dsml_open_kmp();
+            for (size_t idx = 0; idx < utf8_chunk.size(); ++idx) {
+                const char ch = utf8_chunk[idx];
+                dsml_open_buf_.push_back(ch);
+                const int cur_len = static_cast<int>(dsml_open_buf_.size());
+                int matched_pat = -1;
+                bool any_prefix = false;
+                for (int p = 0; p < DsmlOpenKmpSpec::kNumPats; ++p) {
+                    kmp_q_[p] = kmp.step(p, kmp_q_[p], ch);
+                    if (kmp_q_[p] == cur_len) {
+                        any_prefix = true;
+                        if (cur_len == kmp.lens[p]) {
+                            matched_pat = p;
+                            break;
+                        }
+                    }
+                }
+                if (matched_pat >= 0) {
+                    const std::string_view rem(utf8_chunk.data() + idx + 1, utf8_chunk.size() - (idx + 1));
+                    state_ = State::InToolCalls;
+                    if (kmp.is_wrapper[matched_pat]) {
+                        dsml_sub_ = DsmlSub::BetweenInvokes;
+                        dsml_tag_buf_.clear();
+                    } else {
+                        dsml_sub_ = DsmlSub::ReadingInvokeHeader;
+                        dsml_tag_buf_ = dsml_open_buf_;
+                    }
+                    dsml_pre_ws_.clear();
+                    dsml_open_buf_.clear();
+                    if (!rem.empty()) {
+                        step_token_gated_dsml_bytes(rem, out_tool_deltas, call_id_seed);
+                    }
+                    return;
+                }
+                if (!any_prefix) {
+                    // False alarm after `<｜DSML｜`: restore held bytes cleanly into content!
+                    pending_ += dsml_pre_ws_;
+                    pending_ += "<";
+                    pending_ += kDsmlTok;
+                    pending_ += dsml_open_buf_;
+                    if (idx + 1 < utf8_chunk.size()) {
+                        pending_.append(utf8_chunk.data() + idx + 1, utf8_chunk.size() - (idx + 1));
+                    }
+                    dsml_pre_ws_.clear();
+                    dsml_open_buf_.clear();
+                    state_ = State::InContent;
+                    break;
+                }
+            }
+            if (state_ == State::ConfirmingDsmlOpen) return;
+        } else if (state_ == State::InToolCalls) {
+            step_token_gated_dsml_bytes(utf8_chunk, out_tool_deltas, call_id_seed);
+            return;
+        } else {
+            pending_ += utf8_chunk;
+        }
+    }
+
+    // In `State::InContent`, hold at most 1..3 trailing bytes matching a prefix of {"\n\n<", "\n<", "<"}
+    if (state_ == State::InContent && !pending_.empty()) {
+        size_t hold = 0;
+        const size_t n = pending_.size();
+        if (n >= 3 && pending_.compare(n - 3, 3, "\n\n<") == 0) {
+            hold = 3;
+        } else if (n >= 2 && (pending_.compare(n - 2, 2, "\n\n") == 0 || pending_.compare(n - 2, 2, "\n<") == 0)) {
+            hold = 2;
+        } else if (pending_.back() == '\n' || pending_.back() == '<') {
+            hold = 1;
+        }
+        const size_t emit_n = n - hold;
+        if (emit_n > 0) {
+            out_content_delta.append(pending_.data(), emit_n);
+            content_acc_.append(pending_.data(), emit_n);
+            pending_.erase(0, emit_n);
+        }
+    }
+}
 
 void Dsv41StreamParser::scan_incremental_tools(
     std::vector<Dsv41ToolStreamDelta>* out_tool_deltas,
@@ -1442,9 +2335,6 @@ void Dsv41StreamParser::scan_incremental_tools(
                 return;
             }
 
-            // Once >= 1 <｜DSML｜invoke>...</｜DSML｜invoke> has completed, the ONLY valid next DSML construct
-            // after whitespace is a parallel <｜DSML｜ invoke...> / <｜DSML｜invoke...>; any closing tag or
-            // non-invoke continuation closes the tool block immediately without runaway generation!
             if (next_tool_idx_ > 0) {
                 const std::string p_inv1 = std::string("<") + kDsmlTok + " invoke";
                 const std::string p_inv2 = std::string("<") + kDsmlTok + "invoke";
@@ -1458,7 +2348,7 @@ void Dsv41StreamParser::scan_incremental_tools(
                 if (!match1 && !match2) {
                     if (rem >= 2 && full_raw_[ws] == '<' && full_raw_[ws + 1] == '/') {
                         if (full_raw_.find('>', ws + 2) == std::string::npos && rem < 64) {
-                            return;  // Wait for '>' of closing wrapper tag so stream cuts cleanly right at '>'
+                            return;
                         }
                     } else if (rem == 1 && full_raw_[ws] == '<') {
                         return;
@@ -1495,7 +2385,7 @@ void Dsv41StreamParser::scan_incremental_tools(
                 std::snprintf(id_buf, sizeof(id_buf), "call_dsv41_%llu_%llu",
                               static_cast<unsigned long long>(call_id_seed),
                               static_cast<unsigned long long>(next_tool_idx_));
-                out_tool_deltas->push_back(Dsv41ToolStreamDelta{next_tool_idx_, id_buf, bare_name, "", true});
+                out_tool_deltas->push_back(Dsv41ToolStreamDelta{next_tool_idx_, id_buf, bare_name, "", true, false});
             }
         } else {
             size_t inv_close_len = 0;
@@ -1514,7 +2404,7 @@ void Dsv41StreamParser::scan_incremental_tools(
                               static_cast<unsigned long long>(next_tool_idx_));
                 std::string args_json = decode_dsml_invoke_body_to_json(full_raw_, open_invoke_body_pos_, inv_end);
                 out_tool_deltas->push_back(Dsv41ToolStreamDelta{
-                    next_tool_idx_, id_buf, open_invoke_name_, std::move(args_json), false});
+                    next_tool_idx_, id_buf, open_invoke_name_, std::move(args_json), false, true});
             }
             open_invoke_started_ = false;
             tool_bytes_ = 0;
@@ -1648,11 +2538,21 @@ void Dsv41StreamParser::feed(
 void Dsv41StreamParser::force_close_thinking(std::string& out_reasoning_delta) {
     out_reasoning_delta.clear();
     if (state_ != State::InThinking) return;
+    if (!utf8_tail_.empty()) {
+        const std::string tail = bytes_to_utf8_lossy(utf8_tail_);
+        utf8_tail_.clear();
+        push_assistant_seg_txt(assistant_segs_, tail);
+        full_raw_ += tail;
+        out_reasoning_delta += tail;
+        reasoning_acc_ += tail;
+    }
     const std::string tag(kThinkEnd);
     const size_t raw_te = full_raw_.size();
     full_raw_ += tag;
+    push_assistant_seg_tok(assistant_segs_, Dsv41SpecialTokens::kThinkEnd);
     if (!pending_.empty()) {
-        out_reasoning_delta = pending_;
+        out_reasoning_delta += pending_;
+        reasoning_acc_ += pending_;
         pending_.clear();
     }
     has_real_think_end_ = true;
@@ -1670,6 +2570,71 @@ void Dsv41StreamParser::finish(
     out_reasoning_delta.clear();
     out_content_delta.clear();
     if (out_tool_deltas) out_tool_deltas->clear();
+
+    if (token_gated_mode_) {
+        if (!utf8_tail_.empty()) {
+            const std::string tail = bytes_to_utf8_lossy(utf8_tail_);
+            utf8_tail_.clear();
+            push_assistant_seg_txt(assistant_segs_, tail);
+            full_raw_ += tail;
+            if (state_ == State::InThinking) {
+                out_reasoning_delta += tail;
+                reasoning_acc_ += tail;
+            } else if (state_ == State::InToolCalls) {
+                step_token_gated_dsml_bytes(tail, out_tool_deltas, call_id_seed);
+            } else {
+                pending_ += tail;
+            }
+        }
+        if (state_ == State::ConfirmingDsmlOpen) {
+            pending_ += dsml_pre_ws_;
+            pending_ += "<";
+            pending_ += kDsmlTok;
+            pending_ += dsml_open_buf_;
+            dsml_pre_ws_.clear();
+            dsml_open_buf_.clear();
+            state_ = State::InContent;
+        }
+        if (state_ == State::InThinking && !pending_.empty()) {
+            out_reasoning_delta += pending_;
+            reasoning_acc_ += pending_;
+            pending_.clear();
+        } else if (state_ == State::InContent && !pending_.empty()) {
+            out_content_delta += pending_;
+            content_acc_ += pending_;
+            pending_.clear();
+        } else if (state_ == State::InToolCalls && open_invoke_started_) {
+            std::string close_tail;
+            if (dsml_sub_ == DsmlSub::StreamingStringParamValue) {
+                if (!param_val_pending_.empty()) {
+                    append_json_escaped_inner(close_tail, param_val_pending_);
+                    param_val_pending_.clear();
+                }
+                close_tail += "\"}";
+            } else if (dsml_sub_ == DsmlSub::BufferingJsonParamValue) {
+                close_tail += json_quote_str(param_val_pending_);
+                param_val_pending_.clear();
+                close_tail += "}";
+            } else if (cur_tool_param_count_ == 0) {
+                close_tail = "{\"_truncated\":true}";
+            } else {
+                close_tail = "}";
+            }
+            cur_tool_json_acc_ += close_tail;
+            parsed_tools_.push_back(Dsv41ParsedToolCall{cur_tool_id_, cur_tool_name_, cur_tool_json_acc_});
+            if (out_tool_deltas) {
+                out_tool_deltas->push_back(Dsv41ToolStreamDelta{
+                    next_tool_idx_, cur_tool_id_, cur_tool_name_, std::move(close_tail), false, /*is_end=*/true});
+            }
+            open_invoke_started_ = false;
+            ++next_tool_idx_;
+        }
+
+        out_final.reasoning_content = reasoning_acc_;
+        out_final.content = content_acc_;
+        out_final.tool_calls = parsed_tools_;
+        return;
+    }
 
     const std::string eos(kEosTok);
     if (pending_.size() >= eos.size() && pending_.compare(pending_.size() - eos.size(), eos.size(), eos) == 0) {
@@ -1721,7 +2686,7 @@ void Dsv41StreamParser::finish(
                           static_cast<unsigned long long>(call_id_seed),
                           static_cast<unsigned long long>(next_tool_idx_));
             out_tool_deltas->push_back(Dsv41ToolStreamDelta{
-                next_tool_idx_, id_buf, open_invoke_name_, "{\"_truncated\":true}", false});
+                next_tool_idx_, id_buf, open_invoke_name_, "{\"_truncated\":true}", false, true});
             open_invoke_started_ = false;
             ++next_tool_idx_;
         }

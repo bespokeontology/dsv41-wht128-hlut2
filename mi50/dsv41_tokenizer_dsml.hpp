@@ -7,10 +7,13 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
 namespace dsv41 {
+
+struct Dsv41ImageSource;
 
 struct Dsv41SpecialTokens {
     static constexpr int32_t kBos       = 0;       // <｜begin▁of▁sentence｜>
@@ -20,9 +23,36 @@ struct Dsv41SpecialTokens {
     static constexpr int32_t kUser      = 128803;  // <｜User｜>
     static constexpr int32_t kAssistant = 128804;  // <｜Assistant｜>
     static constexpr int32_t kThinkOpen = 128821;  // <think>
-    static constexpr int32_t kThinkEnd  = 128822;  // </think>
-    static constexpr int32_t kDsml      = 128825;  // ｜DSML｜
-    static constexpr int32_t kImage     = 129264;  // <｜deepseek_image｜>
+    static constexpr int32_t kThinkEnd       = 128822;  // </think>
+    static constexpr int32_t kDsml           = 128825;  // ｜DSML｜
+    static constexpr int32_t kLatestReminder = 128828;  // <｜latest_reminder｜>
+    static constexpr int32_t kImage          = 129264;  // <｜deepseek_image｜>
+};
+
+// Segment-structured prompt representation (deepseek-recipe token-ID anti-injection):
+// Structural/image markers are carried as exact integer token IDs (`Kind::TokenId`), while
+// ordinary user/tool/assistant text is carried as `Kind::OrdinaryText` and encoded strictly
+// with base-vocabulary BPE (`parse_special = false`).
+struct PromptSegment {
+    enum class Kind : uint8_t { OrdinaryText = 0, TokenId = 1 };
+    Kind kind = Kind::OrdinaryText;
+    int32_t token_id = -1;
+    int32_t repeat = 1;
+    std::string text;
+
+    static PromptSegment txt(std::string s) {
+        PromptSegment seg;
+        seg.kind = Kind::OrdinaryText;
+        seg.text = std::move(s);
+        return seg;
+    }
+    static PromptSegment tok(int32_t id, int32_t count = 1) {
+        PromptSegment seg;
+        seg.kind = Kind::TokenId;
+        seg.token_id = id;
+        seg.repeat = count;
+        return seg;
+    }
 };
 
 struct Dsv41ParsedToolCall {
@@ -50,8 +80,12 @@ public:
     size_t vocab_size() const { return id_to_token_.size(); }
 
     std::vector<int32_t> encode(const std::string& text, bool parse_special = true) const;
+    // OpenMP-parallel segment BPE (`parse_special = false` on OrdinaryText, direct ID insertion on TokenId)
+    std::vector<int32_t> encode_segments(const std::vector<PromptSegment>& segments) const;
     std::string decode(const std::vector<int32_t>& ids, bool skip_special_tokens = false) const;
     std::string decode_single(int32_t id, bool skip_special_tokens = false) const;
+    // O(1) precomputed raw byte-level payload for cross-token UTF-8 streaming without U+FFFD splits
+    std::string_view raw_bytes_single(int32_t id, bool skip_special_tokens = false) const;
     const std::string& id_to_token(int32_t id) const;
     int32_t token_to_id(const std::string& tok) const;
 
@@ -62,19 +96,21 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     std::vector<std::string> id_to_token_;
+    std::vector<std::string> id_to_raw_bytes_;
     std::vector<uint8_t> id_is_special_;
     std::unordered_map<std::string, int32_t> token_to_id_;
 };
 
-// Renders OpenAI chat request (messages, tools, response_format, reasoning_effort, thinking_mode)
-// into exact DeepSeek-V4.1-Flash-1017 prompt text per hf_meta/encoding/encoding.py!
-std::string render_dsv41_chat_prompt(
+// Renders OpenAI chat request into anti-injection `PromptSegment` sequence per deepseek-recipe:
+// structural & image markers are emitted as `Kind::TokenId`; all ordinary text is `Kind::OrdinaryText`.
+std::vector<PromptSegment> render_dsv41_chat_segments(
     const JsonValue& messages,
     const JsonValue* tools,
     const JsonValue* response_format,
     const JsonValue* reasoning_effort_val,
     std::string& out_thinking_mode,
-    int& out_budget);
+    int& out_budget,
+    std::vector<Dsv41ImageSource>* out_images = nullptr);
 
 enum class ThinkEndClass {
     NeedMoreLookahead,
@@ -100,6 +136,7 @@ struct Dsv41ToolStreamDelta {
     std::string name;
     std::string arguments_delta;
     bool is_start = false;
+    bool is_end = false;
 };
 
 // Incremental streaming filter for SSE: emits reasoning_content deltas during <think>...</think>,
@@ -107,6 +144,20 @@ struct Dsv41ToolStreamDelta {
 class Dsv41StreamParser {
 public:
     explicit Dsv41StreamParser(const std::string& thinking_mode);
+
+    // Token-ID-gated streaming parser (deepseek-recipe):
+    //   - Exits `<think>` strictly on `token_id == Dsv41SpecialTokens::kThinkEnd` (128822)
+    //   - Enters `DSML` tool parsing strictly on `token_id == Dsv41SpecialTokens::kDsml` (128825)
+    //     matched via incremental KMP automaton
+    //   - Buffers incomplete UTF-8 multi-byte tails across tokens and streams live `arguments_delta`
+    //     JSON fragments without full-object buffering
+    void feed_token(
+        int32_t token_id,
+        std::string_view raw_piece,
+        std::string& out_reasoning_delta,
+        std::string& out_content_delta,
+        std::vector<Dsv41ToolStreamDelta>* out_tool_deltas = nullptr,
+        uint64_t call_id_seed = 1);
 
     void feed(
         const std::string& piece,
@@ -123,14 +174,33 @@ public:
         std::vector<Dsv41ToolStreamDelta>* out_tool_deltas = nullptr);
 
     const std::string& raw_accumulated() const { return full_raw_; }
+    const std::vector<PromptSegment>& assistant_segments() const { return assistant_segs_; }
     bool in_thinking() const { return state_ == State::InThinking; }
     bool in_tool_calls() const { return state_ == State::InToolCalls; }
     bool should_stop_generation() const { return tool_block_closed_ || tool_runaway_; }
 
 private:
     void scan_incremental_tools(std::vector<Dsv41ToolStreamDelta>* out_tool_deltas, uint64_t call_id_seed);
+    void step_token_gated_dsml_bytes(
+        std::string_view utf8_chunk,
+        std::vector<Dsv41ToolStreamDelta>* out_tool_deltas,
+        uint64_t call_id_seed);
+    void on_token_gated_dsml_marker(
+        std::string& out_content_delta,
+        std::vector<Dsv41ToolStreamDelta>* out_tool_deltas,
+        uint64_t call_id_seed);
 
-    enum class State { InThinking, InContent, InToolCalls };
+    enum class State { InThinking, InContent, ConfirmingDsmlOpen, InToolCalls };
+    enum class DsmlSub {
+        BetweenInvokes,
+        ReadingInvokeHeader,
+        BetweenParams,
+        ReadingParamHeader,
+        StreamingStringParamValue,
+        BufferingJsonParamValue,
+        ReadingCloseTag
+    };
+
     std::string thinking_mode_;
     State state_;
     std::string full_raw_;
@@ -145,6 +215,28 @@ private:
     size_t tool_bytes_ = 0;
     bool tool_block_closed_ = false;
     bool tool_runaway_ = false;
+
+    // Token-ID-gated KMP & incremental JSON delta state
+    bool token_gated_mode_ = false;
+    std::string utf8_tail_;
+    std::string reasoning_acc_;
+    std::string content_acc_;
+    std::vector<Dsv41ParsedToolCall> parsed_tools_;
+    std::vector<PromptSegment> assistant_segs_;
+    std::string dsml_pre_ws_;
+    std::string dsml_open_buf_;
+    int kmp_q_[6] = {0, 0, 0, 0, 0, 0};
+    DsmlSub dsml_sub_ = DsmlSub::BetweenInvokes;
+    std::string dsml_tag_buf_;
+    std::string param_val_pending_;
+    std::string cur_tool_id_;
+    std::string cur_tool_name_;
+    std::string cur_tool_json_acc_;
+    size_t cur_tool_param_count_ = 0;
+    std::string cur_param_name_;
+    bool cur_param_is_string_ = true;
+    bool close_is_invoke_ = false;
+    bool close_is_wrapper_ = false;
 };
 
 }  // namespace dsv41

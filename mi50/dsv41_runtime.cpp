@@ -1,13 +1,14 @@
-// Pure-C++17 Heterogeneous Runtime for DeepSeek-V4.1-Flash-1017 (Wave 7B Canonical)
-//   - 2x Tenstorrent Blackhole P150A (64 GiB GDDR6 + 247.82 MiB pure active L1, TP2 via zero-SDMA /dsv41_p150_ipc): HLUT2 Routed Experts [216..383]
+// Pure-C++17 Heterogeneous Runtime for DeepSeek-V4.1-Flash-1017 (Speed Wave 3)
 //   - 3x AMD Instinct MI50 (96 GiB HBM2, TP3): CSA2 Sparse Attention, Strict 20L CED Prefill,
-//     mHC Sinkhorn, Shared Experts, HLUT2 Routed Experts [0..215] + MTP [0..127], 3-Stage DSpark (M=6 Chain / M=8 Dirac Causal Tree)
+//     mHC Sinkhorn, Shared Experts, HLUT2 Routed Experts [0..215] + MTP [0..127], 3-Stage DSpark (M=6)
+//   - 2x Tenstorrent Blackhole P150A (64 GiB GDDR6, TP2 via /dsv41_p150_ipc): HLUT2 Routed Experts [216..383]
 //   - EPYC 384 GiB DDR4 + Dual-NVMe: Pre-Faulted 189 GiB Engram + RewindBank + 128-tok RadixBlockCache + SWA Replay
 // Zero Python anywhere.
 
 #include "dsv41_runtime.hpp"
-#include "../src/dsv41_rarebal.hpp"
 #include "dsv41_kolmogorov_tree_verifier.hpp"
+#include "dsv41_nvme_kv_cache.hpp"
+#include "../src/dsv41_rarebal.hpp"
 #include "dsv41_think_loop_guard.hpp"
 #include "dsv41_tree_spec.hpp"
 
@@ -203,45 +204,9 @@ T* alloc_gpu_buf(size_t count, std::vector<void*>& alloc_tracker, bool zero_init
     return static_cast<T*>(d_ptr);
 }
 
-struct RadixKey128 {
-    uint64_t lo = 0;
-    uint64_t hi = 0;
-    bool operator==(const RadixKey128& o) const noexcept { return lo == o.lo && hi == o.hi; }
-};
-
-struct RadixKeyHash {
-    size_t operator()(const RadixKey128& k) const noexcept {
-        return static_cast<size_t>(k.lo ^ (k.hi * 0x9E3779B97F4A7C15ULL));
-    }
-};
-
-inline RadixKey128 step_radix_hash(RadixKey128 parent, const int32_t* toks128) noexcept {
-    uint64_t h1 = parent.lo ^ 0xCBF29CE484222325ULL;
-    uint64_t h2 = parent.hi ^ 0x84222325CBF29CE4ULL;
-    for (int i = 0; i < kRadixBlockTokens; ++i) {
-        const uint64_t v = static_cast<uint32_t>(toks128[i]);
-        h1 ^= v + 0x9E3779B97F4A7C15ULL + (h1 << 6) + (h1 >> 2);
-        h1 *= 0x100000001B3ULL;
-        h2 ^= (v * 0xBF58476D1CE4E5B9ULL) + (h2 << 7) + (h2 >> 3);
-        h2 *= 0x94D049BB133111EBULL;
-    }
-    return RadixKey128{h1, h2};
+inline RadixKey128 step_radix_hash(RadixKey128 parent, const int32_t* toks128, uint64_t extra_salt = 0ULL) noexcept {
+    return step_radix_hash_salted(parent, toks128, extra_salt);
 }
-
-struct RadixBlockEntry {
-    RadixKey128 key{};
-    std::array<int32_t, kRadixBlockTokens> tokens{};
-    alignas(64) std::array<uint8_t, kRadixBlockBytes> data{};
-};
-
-struct RewindSnapshot {
-    int pos = 0;
-    int win_valid_from_20_39 = 0;
-    bool mtp_seeded = false;
-    std::vector<int32_t> tokens;
-    std::vector<uint16_t> win_kv_slab;    // [43 * 128 * 512] BF16 (5.375 MiB)
-    std::vector<float> comp_state_slab;   // [3 * 4 * 512] F32 (24 KiB)
-};
 
 struct EngramGpuWeights {
     uint16_t* d_q_w   = nullptr;  // [4, 5120] BF16
@@ -422,6 +387,7 @@ struct TpRankContext {
     uint16_t* d_idx_weights_bf16 = nullptr; // [M, 16]
 
     uint16_t* d_engram_in_bf16[2]{};        // [2][M, 2048] double-buffered async prefetch
+    uint8_t*  d_image_mask = nullptr;       // [M] uint8_t multimodal token mask (1 = inside image span)
 
     float*          d_gate_logits_f32 = nullptr; // [M, 384]
     int32_t*        d_topk_ids        = nullptr; // [M, 6]
@@ -484,6 +450,9 @@ struct Dsv41Runtime::Impl {
     bool dual_stream_overlap = true;
     bool rtc_active_in_chunk = false;
     Dsv41TreeWidthMode tree_width_mode = Dsv41TreeWidthMode::Auto;
+    int tree16_max_context = Dsv41AdaptiveTreeWidthController::kAutoTree16MaxContext;
+    bool tree_static_m8 = false;
+    int tree_dyn8_max_depth = 5;
 
     // Coherent mapped pinned DDR4 Markov embedding [129280, 256] BF16 (63.1 MiB in DDR4 -> 0 B HBM2!) + GPU DSpark slot
     uint16_t* h_markov_embed_mapped = nullptr;
@@ -492,40 +461,101 @@ struct Dsv41Runtime::Impl {
     std::vector<uint16_t> markov_embed_host_bf16;
     std::mutex markov_host_mtx;
 
-    // Prefix Reuse Hierarchy:
+    // Prefix Reuse Hierarchy (Wave 8.2 DeepInfer Pure-Block Layout):
     //   Tier 0: Resident GPU KV [0..cached_tokens.size()) (0.0 ms exact continuation)
-    //   Tier 1: RewindBank ring of 32 full SWA + r=2 snapshots (< 0.5 ms single-slab DMA)
-    //   Tier 2: DDR4 RadixBlockCache (65,536 x 128-tok blocks @ 890 B/tok) + Dual-NVMe GlobalPrefixCache + SWA Replay
+    //   Tier 1: In-RAM 20-Layer EncoderStateBlock (20 x 134 x 528 B ~= 1.35 MiB/slot, 0 decoder SWA cached)
+    //   Tier 2: DDR4 RadixBlockCache + Pure-Block NVMe CSA2 KV (.kvblk @ 890 B/tok, 0 B SWA on disk)
+    //           with KEEP_TOKENS = 140 + 128-token Encoder SWA Bounded Replay
     std::vector<int32_t> cached_tokens;
+    std::vector<uint64_t> cached_block_salts;
+    Dsv41VitEngine vit_engine;
     int win_valid_from_20_39 = 0;
     bool mtp_window_seeded = false;
     int exported_radix_blocks = 0;
-    RadixKey128 exported_radix_key{};
+    RadixKey128 model_overlay_uuid{1ULL, 0ULL};
+    RadixKey128 exported_radix_key{1ULL, 0ULL};
 
-    std::deque<RewindSnapshot> rewind_bank;
+    inline RadixKey128 root_radix_key() const noexcept { return model_overlay_uuid; }
+    inline uint64_t get_cached_blk_salt(int b) const noexcept {
+        return (b >= 0 && static_cast<size_t>(b) < cached_block_salts.size())
+            ? cached_block_salts[static_cast<size_t>(b)]
+            : 0ULL;
+    }
+
+    std::unordered_map<RadixKey128, std::shared_ptr<EncoderStateBlock>, RadixKeyHash> encoder_state_map;
+    std::deque<RadixKey128> encoder_state_fifo;
+    std::shared_ptr<EncoderStateBlock> pending_enc_state;
     std::unordered_map<RadixKey128, std::shared_ptr<RadixBlockEntry>, RadixKeyHash> radix_map;
     std::deque<RadixKey128> radix_fifo;
-    std::string nvme_radix_dirs[2];
+    Dsv41NvmeKvStore nvme_store;
 
-    // Async Dual-NVMe Radix writer thread
+    // Async POSIX NVMe Pure-Block CSA2 (.kvblk) writer thread (0 B SWA on disk!)
     std::mutex nvme_mtx;
     std::condition_variable nvme_cv;
+    std::condition_variable nvme_drained_cv;
     std::deque<std::shared_ptr<RadixBlockEntry>> nvme_write_queue;
+    std::vector<RadixKey128> nvme_touch_queue;
+    bool nvme_writing_active = false;
     bool stop_workers = false;
     std::thread nvme_writer_thread;
 
-    // Async Engram CPU gather + H2D prefetch worker thread
+    // Async Engram CPU gather + H2D prefetch worker thread (monotonic seq + early anchor row-0 prefetch!)
     struct EngramJob {
+        uint64_t seq = 0ULL;
         int slot = 0;
         int engram_idx = 0;
+        int s_start = 0;
         int M = 0;
+        bool anchor_only = false;
+        std::array<int64_t, 24> anchor_hashes{};
+        bool has_image_mask = false;
+        std::array<uint8_t, 512> image_mask{};
     };
     std::mutex eg_mtx;
     std::condition_variable eg_cv;
     std::condition_variable eg_done_cv;
     std::deque<EngramJob> eg_queue;
-    bool eg_slot_ready[2]{false, false};
+    uint64_t eg_next_seq[2]{0ULL, 0ULL};
+    uint64_t eg_done_seq[2]{0ULL, 0ULL};
+    uint64_t eg_wait_seq[2]{0ULL, 0ULL};
+    uint64_t eg_anchor_seq[2]{0ULL, 0ULL};
+    bool eg_prev_was_anchor[2]{false, false};
+    int engram_anchor_pos = -1;
+    int32_t engram_anchor_tok = -1;
     std::thread eg_worker_thread;
+
+    // Persistent async post-process(step N-1) worker thread overlapped with step N silicon!
+    struct PostProcItem {
+        int32_t tok_id = -1;
+        size_t gen_len_after = 0;
+    };
+    std::mutex pp_mtx;
+    std::condition_variable pp_cv;
+    std::condition_variable pp_done_cv;
+    std::deque<PostProcItem> pp_queue;
+    const TokenStreamCallback* pp_active_cb = nullptr;
+    bool pp_busy = false;
+    bool pp_aborted = false;
+    size_t pp_stop_gen_len = 0;
+    std::thread postproc_worker_thread;
+
+    // Last 256 weights of `confidence_head.proj.weight` [1, 5376] for exact 0-launch pool parent scoring!
+    std::array<float, kMarkovRank> conf_proj_tail256_f32{};
+
+    inline float dot_markov_conf_tail(int32_t tok_id) const noexcept {
+        if (tok_id < 0 || size_t(tok_id) * kMarkovRank + kMarkovRank > markov_embed_host_bf16.size()) {
+            return 0.0f;
+        }
+        const uint16_t* emb = markov_embed_host_bf16.data() + size_t(tok_id) * kMarkovRank;
+        float acc = 0.0f;
+        for (size_t j = 0; j < kMarkovRank; ++j) {
+            const uint32_t u = uint32_t(emb[j]) << 16;
+            float fv = 0.0f;
+            std::memcpy(&fv, &u, sizeof(float));
+            acc += conf_proj_tail256_f32[j] * fv;
+        }
+        return acc;
+    }
 
     // Reusable host scratch buffers
     std::vector<int64_t> engram_hashes_buf;
@@ -590,12 +620,15 @@ struct Dsv41Runtime::Impl {
         {
             std::lock_guard<std::mutex> lk1(nvme_mtx);
             std::lock_guard<std::mutex> lk2(eg_mtx);
+            std::lock_guard<std::mutex> lk3(pp_mtx);
             stop_workers = true;
         }
         nvme_cv.notify_all();
         eg_cv.notify_all();
+        pp_cv.notify_all();
         if (nvme_writer_thread.joinable()) nvme_writer_thread.join();
         if (eg_worker_thread.joinable()) eg_worker_thread.join();
+        if (postproc_worker_thread.joinable()) postproc_worker_thread.join();
 
         for (int tp = 0; tp < kTpSize; ++tp) {
             (void)hipSetDevice(tp);
@@ -660,44 +693,35 @@ struct Dsv41Runtime::Impl {
     }
 
     void start_background_workers() {
-        const std::string root_env = (std::getenv("DSV41_ROOT") != nullptr)
-                                         ? std::string(std::getenv("DSV41_ROOT"))
-                                         : std::string(".");
-        nvme_radix_dirs[0] = (std::getenv("DSV41_RADIX_DIR_0") != nullptr)
-                                 ? std::string(std::getenv("DSV41_RADIX_DIR_0"))
-                                 : (root_env + "/radix_cache_nvme0");
-        nvme_radix_dirs[1] = (std::getenv("DSV41_RADIX_DIR_1") != nullptr)
-                                 ? std::string(std::getenv("DSV41_RADIX_DIR_1"))
-                                 : (root_env + "/radix_cache_nvme1");
-        (void)::mkdir(nvme_radix_dirs[0].c_str(), 0775);
-        (void)::mkdir(nvme_radix_dirs[1].c_str(), 0775);
-
         nvme_writer_thread = std::thread([this]() {
             while (true) {
-                std::shared_ptr<RadixBlockEntry> item;
+                std::shared_ptr<RadixBlockEntry> blk_item;
+                std::vector<RadixKey128> touch_items;
                 {
                     std::unique_lock<std::mutex> lk(nvme_mtx);
-                    nvme_cv.wait(lk, [&]() { return stop_workers || !nvme_write_queue.empty(); });
-                    if (stop_workers && nvme_write_queue.empty()) break;
-                    item = std::move(nvme_write_queue.front());
-                    nvme_write_queue.pop_front();
+                    nvme_cv.wait(lk, [&]() {
+                        return stop_workers || !nvme_write_queue.empty() || !nvme_touch_queue.empty();
+                    });
+                    if (stop_workers && nvme_write_queue.empty() && nvme_touch_queue.empty()) break;
+                    if (!nvme_write_queue.empty()) {
+                        blk_item = std::move(nvme_write_queue.front());
+                        nvme_write_queue.pop_front();
+                    } else if (!nvme_touch_queue.empty()) {
+                        touch_items.swap(nvme_touch_queue);
+                    }
+                    nvme_writing_active = true;
                 }
-                if (!item) continue;
-                const int drive = int(item->key.lo & 1ULL);
-                char fn[256];
-                std::snprintf(fn, sizeof(fn), "%s/%016llx_%016llx.rblk",
-                              nvme_radix_dirs[drive].c_str(),
-                              static_cast<unsigned long long>(item->key.lo),
-                              static_cast<unsigned long long>(item->key.hi));
-                std::ifstream chk(fn, std::ios::binary);
-                if (chk.good()) continue;
-                const std::string tmp_fn = std::string(fn) + ".tmp";
-                std::ofstream out(tmp_fn, std::ios::binary | std::ios::trunc);
-                if (out) {
-                    out.write(reinterpret_cast<const char*>(item->tokens.data()), sizeof(item->tokens));
-                    out.write(reinterpret_cast<const char*>(item->data.data()), item->data.size());
-                    out.close();
-                    if (out.good()) (void)::rename(tmp_fn.c_str(), fn);
+                if (blk_item && nvme_store.enabled()) {
+                    (void)nvme_store.write_block_atomic(*blk_item, model_overlay_uuid);
+                } else if (!touch_items.empty() && nvme_store.enabled()) {
+                    nvme_store.touch_blocks_mtime(touch_items);
+                }
+                {
+                    std::lock_guard<std::mutex> lk(nvme_mtx);
+                    nvme_writing_active = false;
+                    if (nvme_write_queue.empty() && nvme_touch_queue.empty()) {
+                        nvme_drained_cv.notify_all();
+                    }
                 }
             }
         });
@@ -712,30 +736,95 @@ struct Dsv41Runtime::Impl {
                     job = eg_queue.front();
                     eg_queue.pop_front();
                 }
-                if (engram_cpu.has_table_shard(job.engram_idx) && job.M > 0) {
+                if (engram_cpu.has_table_shard(job.engram_idx) && job.M > job.s_start) {
                     for (int tp = 0; tp < 3; ++tp) {
                         (void)hipSetDevice(tp);
                         (void)hipEventSynchronize(ctx[tp].ev_engram_consumed[job.slot]);
+                        if (eg_prev_was_anchor[job.slot] && job.s_start == 0) {
+                            (void)hipEventSynchronize(ctx[tp].ev_engram_ready[job.slot]);
+                        }
                     }
-                    engram_cpu.gather_dequant_tp3(
-                        job.engram_idx, engram_hashes_buf.data(), job.M, nullptr,
-                        ctx[0].h_engram_bf16[job.slot],
-                        ctx[1].h_engram_bf16[job.slot],
-                        ctx[2].h_engram_bf16[job.slot]);
-                    for (int tp = 0; tp < 3; ++tp) {
-                        (void)hipSetDevice(tp);
-                        auto& c = ctx[tp];
-                        (void)hipMemcpyAsync(c.d_engram_in_bf16[job.slot], c.h_engram_bf16[job.slot],
-                                             size_t(job.M) * 2048u * sizeof(uint16_t),
-                                             hipMemcpyHostToDevice, c.engram_stream);
-                        (void)hipEventRecord(c.ev_engram_ready[job.slot], c.engram_stream);
+                    if (job.anchor_only) {
+                        int64_t row0_pair[48]{};
+                        std::memcpy(row0_pair + size_t(job.engram_idx) * 24ULL,
+                                    job.anchor_hashes.data(),
+                                    24ULL * sizeof(int64_t));
+                        engram_cpu.gather_dequant_tp3(
+                            job.engram_idx, row0_pair, 1, nullptr,
+                            ctx[0].h_engram_bf16[job.slot],
+                            ctx[1].h_engram_bf16[job.slot],
+                            ctx[2].h_engram_bf16[job.slot],
+                            0);
+                        for (int tp = 0; tp < 3; ++tp) {
+                            (void)hipSetDevice(tp);
+                            auto& c = ctx[tp];
+                            (void)hipMemcpyAsync(c.d_engram_in_bf16[job.slot], c.h_engram_bf16[job.slot],
+                                                 2048u * sizeof(uint16_t),
+                                                 hipMemcpyHostToDevice, c.engram_stream);
+                            (void)hipEventRecord(c.ev_engram_ready[job.slot], c.engram_stream);
+                        }
+                        eg_prev_was_anchor[job.slot] = true;
+                    } else {
+                        engram_cpu.gather_dequant_tp3(
+                            job.engram_idx, engram_hashes_buf.data(), job.M,
+                            job.has_image_mask ? job.image_mask.data() : nullptr,
+                            ctx[0].h_engram_bf16[job.slot],
+                            ctx[1].h_engram_bf16[job.slot],
+                            ctx[2].h_engram_bf16[job.slot],
+                            job.s_start);
+                        const size_t elem_off = size_t(job.s_start) * 2048u;
+                        const size_t elem_cnt = size_t(job.M - job.s_start) * 2048u;
+                        for (int tp = 0; tp < 3; ++tp) {
+                            (void)hipSetDevice(tp);
+                            auto& c = ctx[tp];
+                            (void)hipMemcpyAsync(c.d_engram_in_bf16[job.slot] + elem_off,
+                                                 c.h_engram_bf16[job.slot] + elem_off,
+                                                 elem_cnt * sizeof(uint16_t),
+                                                 hipMemcpyHostToDevice, c.engram_stream);
+                            (void)hipEventRecord(c.ev_engram_ready[job.slot], c.engram_stream);
+                        }
+                        eg_prev_was_anchor[job.slot] = false;
                     }
                 }
                 {
                     std::lock_guard<std::mutex> lk(eg_mtx);
-                    eg_slot_ready[job.slot] = true;
+                    eg_done_seq[job.slot] = job.seq;
                 }
                 eg_done_cv.notify_all();
+            }
+        });
+
+        postproc_worker_thread = std::thread([this]() {
+            while (true) {
+                PostProcItem item;
+                const TokenStreamCallback* cb_ptr = nullptr;
+                bool skip_call = false;
+                {
+                    std::unique_lock<std::mutex> lk(pp_mtx);
+                    pp_cv.wait(lk, [&]() { return stop_workers || !pp_queue.empty(); });
+                    if (stop_workers && pp_queue.empty()) break;
+                    item = pp_queue.front();
+                    pp_queue.pop_front();
+                    cb_ptr = pp_active_cb;
+                    skip_call = pp_aborted || (cb_ptr == nullptr) || !(*cb_ptr);
+                    pp_busy = true;
+                }
+                bool keep = true;
+                if (!skip_call) {
+                    keep = (*cb_ptr)(item.tok_id);
+                }
+                {
+                    std::lock_guard<std::mutex> lk(pp_mtx);
+                    if (!skip_call && !keep && !pp_aborted) {
+                        pp_aborted = true;
+                        pp_stop_gen_len = item.gen_len_after;
+                        pp_queue.clear();
+                    }
+                    pp_busy = false;
+                    if (pp_queue.empty()) {
+                        pp_done_cv.notify_all();
+                    }
+                }
             }
         });
     }
@@ -871,6 +960,18 @@ struct Dsv41Runtime::Impl {
         } else if (block_id == kNumLayers + 2) {
             b.d_mtp_final_norm = upload_tensor_to_gpu<uint16_t>(st, "norm.weight", allocs);
             b.d_conf_proj_w    = upload_tensor_to_gpu<uint16_t>(st, "confidence_head.proj.weight", allocs);
+            if (tp == 0) {
+                const auto& cp = st.at("confidence_head.proj.weight");
+                if (size_t(cp.byte_size()) >= size_t(kDim + kMarkovRank) * sizeof(uint16_t)) {
+                    const uint16_t* cp_bf16 = reinterpret_cast<const uint16_t*>(st.tensor_bytes("confidence_head.proj.weight"));
+                    for (size_t j = 0; j < kMarkovRank; ++j) {
+                        const uint32_t u = uint32_t(cp_bf16[size_t(kDim) + j]) << 16;
+                        float fv = 0.0f;
+                        std::memcpy(&fv, &u, sizeof(float));
+                        conf_proj_tail256_f32[j] = fv;
+                    }
+                }
+            }
             b.d_markov_head_w  = upload_tensor_to_gpu<uint16_t>(st, "markov_head.head.weight", allocs);
             {
                 std::lock_guard<std::mutex> lk(markov_host_mtx);
@@ -1066,6 +1167,7 @@ struct Dsv41Runtime::Impl {
 
         c.d_engram_in_bf16[0] = alloc_gpu_buf<uint16_t>(M * 2048u, c.device_allocs);
         c.d_engram_in_bf16[1] = alloc_gpu_buf<uint16_t>(M * 2048u, c.device_allocs);
+        c.d_image_mask        = alloc_gpu_buf<uint8_t>(M, c.device_allocs, true);
 
         c.d_gate_logits_f32 = alloc_gpu_buf<float>(M * kBackboneExperts, c.device_allocs);
         c.d_topk_ids        = alloc_gpu_buf<int32_t>(M * kBackboneTopk, c.device_allocs);
@@ -1096,12 +1198,12 @@ struct Dsv41Runtime::Impl {
         c.h_logits_part    = alloc_pinned<float>(tp, 16u * size_t(c.vocab_rows));
         c.h_engram_bf16[0] = alloc_pinned<uint16_t>(tp, M * 2048u);
         c.h_engram_bf16[1] = alloc_pinned<uint16_t>(tp, M * 2048u);
+        c.h_radix_stage    = alloc_pinned<uint8_t>(tp, 8u * 1024u * 1024u);
+        c.h_radix_stage2   = alloc_pinned<uint8_t>(tp, 8u * 1024u * 1024u);
         if (tp == 0) {
             c.h_topk_ids     = alloc_pinned<int32_t>(tp, M * kBackboneTopk);
             c.h_topk_w       = alloc_pinned<float>(tp, M * kBackboneTopk);
             c.h_x_moe_bf16   = alloc_pinned<uint16_t>(tp, M * kDim);
-            c.h_radix_stage  = alloc_pinned<uint8_t>(tp, 8u * 1024u * 1024u);
-            c.h_radix_stage2 = alloc_pinned<uint8_t>(tp, 8u * 1024u * 1024u);
             c.h_routed_pairs = alloc_pinned<Mi50RoutedPair>(tp, M * kBackboneTopk);
             c.h_active_exp   = alloc_pinned<int32_t>(tp, 256u);
             c.h_csr_offsets  = alloc_pinned<int32_t>(tp, 257u);
@@ -1532,7 +1634,7 @@ struct Dsv41Runtime::Impl {
     // Run MoE FFN + mHC post for block `block_id` (0..42):
     //   - MTP blocks (40..42): 100% device-resident pair-dispatched HLUT2 (M<=16) + FP32 ring mHC post!
     //   - Backbone blocks (0..39): fused ffn_norm WHT128 + router_stream P150A overlap + FP32 ring mHC post (M<=64)!
-    void forward_block_moe(int block_id, int M, int in_h_slot, int out_h_slot) {
+    void forward_block_moe(int block_id, int M, int in_h_slot, int out_h_slot, bool use_image_mask = false) {
         const auto& b0 = ctx[0].blocks[block_id];
         const int top_k = b0.top_k;
         const bool is_backbone = (block_id < kNumLayers);
@@ -1550,7 +1652,7 @@ struct Dsv41Runtime::Impl {
 
                 launch_bf16_gemm(c.d_x_bf16, b.d_gate_w, nullptr, c.d_gate_logits_f32,
                                  M, b.n_routed_experts, kDim, true, c.stream);
-                launch_moe_gate(c.d_gate_logits_f32, b.d_gate_bias, b.d_gate_bias_vl, nullptr,
+                launch_moe_gate(c.d_gate_logits_f32, b.d_gate_bias, nullptr, nullptr,
                                 c.d_topk_ids, c.d_topk_weights,
                                 M, b.n_routed_experts, top_k, kRouteScale, c.stream);
                 if (tp == 0 && rarebal_collector && rarebal_collector->active) {
@@ -1635,7 +1737,8 @@ struct Dsv41Runtime::Impl {
                 const auto& b = c.blocks[block_id];
                 launch_bf16_gemm(c.d_x_bf16, b.d_gate_w, nullptr, c.d_gate_logits_f32,
                                  M, b.n_routed_experts, kDim, true, c.stream);
-                launch_moe_gate(c.d_gate_logits_f32, b.d_gate_bias, b.d_gate_bias_vl, nullptr,
+                launch_moe_gate(c.d_gate_logits_f32, b.d_gate_bias, b.d_gate_bias_vl,
+                                use_image_mask ? c.d_image_mask : nullptr,
                                 c.d_topk_ids, c.d_topk_weights,
                                 M, b.n_routed_experts, top_k, kRouteScale, c.stream);
                 if (tp == 0) {
@@ -1725,7 +1828,8 @@ struct Dsv41Runtime::Impl {
             DSV41_HIP_CHECK(hipStreamWaitEvent(c0.router_stream, c0.ev_x_ready, 0));
             launch_bf16_gemm(c0.d_x_bf16, bm0.d_gate_w, nullptr, c0.d_gate_logits_f32,
                              M, bm0.n_routed_experts, kDim, true, c0.router_stream);
-            launch_moe_gate(c0.d_gate_logits_f32, bm0.d_gate_bias, bm0.d_gate_bias_vl, nullptr,
+            launch_moe_gate(c0.d_gate_logits_f32, bm0.d_gate_bias, bm0.d_gate_bias_vl,
+                            use_image_mask ? c0.d_image_mask : nullptr,
                             c0.d_topk_ids, c0.d_topk_weights,
                             M, bm0.n_routed_experts, top_k, kRouteScale, c0.router_stream);
             DSV41_HIP_CHECK(hipMemcpyAsync(c0.h_topk_ids, c0.d_topk_ids, size_t(M) * top_k * sizeof(int32_t),
@@ -2001,24 +2105,69 @@ struct Dsv41Runtime::Impl {
         accum_mi50_moe_ms += std::max(0.0, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_moe0).count() - p150_wait_this_ms);
     }
 
-    // Enqueue async CPU gather + PCIe H2D prefetch for Engram slot (0=L1, 1=L14)
-    void enqueue_engram_prefetch(int slot, int engram_idx, int M) {
-        if (!engram_cpu.has_table_shard(engram_idx) || M <= 0) return;
+    // Kick off non-image EPYC AVX2 Engram gather + PCIe H2D for BOTH L1 and L14 row 0 right at token acceptance!
+    void enqueue_anchor_engram_prefetch(int32_t anchor_tok, int pos) {
+        if (anchor_tok < 0 || anchor_tok == Dsv41SpecialTokens::kEos || pos < 0) {
+            engram_anchor_pos = -1;
+            return;
+        }
+        if (!engram_cpu.has_table_shard(0) && !engram_cpu.has_table_shard(1)) {
+            engram_anchor_pos = -1;
+            return;
+        }
+        int64_t h48[48]{};
+        engram_cpu.compute_anchor_row0_hashes(anchor_tok, pos, false, h48);
         {
             std::lock_guard<std::mutex> lk(eg_mtx);
-            eg_slot_ready[slot] = false;
-            eg_queue.push_back(EngramJob{slot, engram_idx, M});
+            for (int s = 0; s < 2; ++s) {
+                if (!engram_cpu.has_table_shard(s)) continue;
+                EngramJob job;
+                job.seq = ++eg_next_seq[s];
+                job.slot = s;
+                job.engram_idx = s;
+                job.s_start = 0;
+                job.M = 1;
+                job.anchor_only = true;
+                std::memcpy(job.anchor_hashes.data(), h48 + size_t(s) * 24ULL, 24ULL * sizeof(int64_t));
+                eg_anchor_seq[s] = job.seq;
+                eg_queue.push_back(job);
+            }
+        }
+        engram_anchor_pos = pos;
+        engram_anchor_tok = anchor_tok;
+        eg_cv.notify_one();
+    }
+
+    // Enqueue async CPU gather + PCIe H2D prefetch for Engram slot (0=L1, 1=L14) over rows [s_start .. M-1]
+    void enqueue_engram_prefetch(int slot, int engram_idx, int M, const uint8_t* image_mask = nullptr, int s_start = 0) {
+        if (!engram_cpu.has_table_shard(engram_idx) || M <= s_start) return;
+        EngramJob job;
+        job.slot = slot;
+        job.engram_idx = engram_idx;
+        job.s_start = s_start;
+        job.M = M;
+        if (image_mask != nullptr) {
+            job.has_image_mask = true;
+            const int n_copy = std::min(M, 512);
+            std::memcpy(job.image_mask.data(), image_mask, static_cast<size_t>(n_copy));
+        }
+        {
+            std::lock_guard<std::mutex> lk(eg_mtx);
+            job.seq = ++eg_next_seq[slot];
+            eg_wait_seq[slot] = job.seq;
+            eg_queue.push_back(job);
         }
         eg_cv.notify_one();
     }
 
     // Consume prefetched Engram slot + run FP8 wkv + TP3 all-reduce + gated residual add
-    void forward_engram_layer(int slot, int engram_idx, int h_slot, int M) {
+    void forward_engram_layer(int slot, int engram_idx, int h_slot, int M, bool use_image_mask = false) {
         if (!engram_cpu.has_table_shard(engram_idx) || M <= 0) return;
         const auto te0 = std::chrono::steady_clock::now();
         {
             std::unique_lock<std::mutex> lk(eg_mtx);
-            eg_done_cv.wait(lk, [&]() { return eg_slot_ready[slot]; });
+            const uint64_t target_seq = eg_wait_seq[slot];
+            eg_done_cv.wait(lk, [&]() { return eg_done_seq[slot] >= target_seq; });
         }
         accum_engram_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - te0).count();
 
@@ -2053,7 +2202,8 @@ struct Dsv41Runtime::Impl {
                 auto& c = ctx[tp];
                 const auto& eg = c.engram[engram_idx];
                 launch_engram_gate_add(c.d_h_bf16[h_slot] + size_t(m0) * kHcMult * kDim,
-                                       c.d_sum_f32, eg.d_q_w, eg.d_k_w, nullptr,
+                                       c.d_sum_f32, eg.d_q_w, eg.d_k_w,
+                                       use_image_mask ? (c.d_image_mask + m0) : nullptr,
                                        sub_m, kNormEps, c.stream);
             }
         }
@@ -2076,7 +2226,9 @@ struct Dsv41Runtime::Impl {
         uint64_t tree_depth_nibbles = 0ULL,
         uint64_t tree_parent_nibbles = 0ULL,
         const int32_t* tree_parents = nullptr,
-        const uint32_t* tree_depths = nullptr)
+        const uint32_t* tree_depths = nullptr,
+        const uint8_t* chunk_image_mask = nullptr,
+        const std::vector<Dsv41PreparedImage>* prepared_images = nullptr)
     {
         if (!skip_global_kv_write && M > 0) {
             const int b_first = start_pos / kRadixBlockTokens;
@@ -2086,27 +2238,83 @@ struct Dsv41Runtime::Impl {
             }
         }
 
+        bool any_img_in_chunk = false;
+        if (chunk_image_mask != nullptr) {
+            for (int i = 0; i < M; ++i) {
+                if (chunk_image_mask[i] != 0u) {
+                    any_img_in_chunk = true;
+                    break;
+                }
+            }
+        }
+        const uint8_t* active_img_mask = any_img_in_chunk ? chunk_image_mask : nullptr;
+
         // 1. Compute CPU Engram 4-gram hashes & kick off async DDR4 gather + PCIe H2D for BOTH L1 and L14!
+        const bool anchor_prefetched =
+            (!any_img_in_chunk && M >= 1 && M <= 16 &&
+             start_pos == engram_anchor_pos && token_ids[0] == engram_anchor_tok);
+        engram_anchor_pos = -1;
+
         if (tree_anc_mask.active() && tree_parents != nullptr && tree_depths != nullptr) {
             engram_cpu.compute_hashes_tree(token_ids, tree_parents, tree_depths, M, start_pos, engram_hashes_buf);
         } else {
-            engram_cpu.compute_hashes(token_ids, M, start_pos, nullptr, engram_hashes_buf);
+            engram_cpu.compute_hashes(token_ids, M, start_pos, active_img_mask, engram_hashes_buf);
         }
-        enqueue_engram_prefetch(0, 0, M);
-        enqueue_engram_prefetch(1, 1, M);
+        if (anchor_prefetched) {
+            if (M == 1) {
+                for (int s = 0; s < 2; ++s) {
+                    if (engram_cpu.has_table_shard(s)) eg_wait_seq[s] = eg_anchor_seq[s];
+                }
+            } else {
+                enqueue_engram_prefetch(0, 0, M, active_img_mask, 1);
+                enqueue_engram_prefetch(1, 1, M, active_img_mask, 1);
+            }
+        } else {
+            enqueue_engram_prefetch(0, 0, M, active_img_mask, 0);
+            enqueue_engram_prefetch(1, 1, M, active_img_mask, 0);
+        }
 
-        // 2. Upload token_ids + TP3 Embedding
+        // 2. Upload token_ids (+ optional image_mask) + TP3 Embedding
         for (int tp = 0; tp < 3; ++tp) {
             DSV41_HIP_CHECK(hipSetDevice(tp));
             auto& c = ctx[tp];
             DSV41_HIP_CHECK(hipMemcpyAsync(c.d_token_ids, token_ids, size_t(M) * sizeof(int32_t),
                                            hipMemcpyHostToDevice, c.stream));
+            if (any_img_in_chunk) {
+                DSV41_HIP_CHECK(hipMemcpyAsync(c.d_image_mask, chunk_image_mask, size_t(M) * sizeof(uint8_t),
+                                               hipMemcpyHostToDevice, c.stream));
+            }
             launch_tp_embed_bf16(c.d_token_ids, c.d_embed_w, c.d_part_bf16,
                                  M, kDim, c.vocab_offset, c.vocab_rows, c.stream);
         }
         all_reduce_tp3_bf16(ctx[0].d_part_bf16, ctx[1].d_part_bf16, ctx[2].d_part_bf16,
                             ctx[0].d_x_bf16,    ctx[1].d_x_bf16,    ctx[2].d_x_bf16,
                             size_t(M) * kDim);
+
+        // Overwrite visual span rows [ov_start .. ov_end) with Dsv41VitEngine merged BF16 embeddings!
+        if (any_img_in_chunk && prepared_images != nullptr) {
+            for (const auto& img : *prepared_images) {
+                const int ov_start = std::max(start_pos, img.span_start);
+                const int ov_end   = std::min(start_pos + M, img.span_start + img.span_len);
+                if (ov_start >= ov_end) continue;
+                const size_t n_rows = static_cast<size_t>(ov_end - ov_start);
+                const size_t src_off = static_cast<size_t>(ov_start - img.span_start) * size_t(kDim);
+                const size_t dst_off = static_cast<size_t>(ov_start - start_pos) * size_t(kDim);
+                if (src_off + n_rows * size_t(kDim) > img.merged_bf16.size()) {
+                    throw std::runtime_error("Prepared image merged_bf16 missing or undersized during prefill splice");
+                }
+                const uint16_t* src_ptr = img.merged_bf16.data() + src_off;
+                for (int tp = 0; tp < 3; ++tp) {
+                    DSV41_HIP_CHECK(hipSetDevice(tp));
+                    DSV41_HIP_CHECK(hipMemcpyAsync(
+                        ctx[tp].d_x_bf16 + dst_off,
+                        src_ptr,
+                        n_rows * size_t(kDim) * sizeof(uint16_t),
+                        hipMemcpyHostToDevice,
+                        ctx[tp].stream));
+                }
+            }
+        }
 
         int h_slot = 0;
         for (int tp = 0; tp < 3; ++tp) {
@@ -2135,14 +2343,14 @@ struct Dsv41Runtime::Impl {
 
         for (int l = 0; l < stop_layer; ++l) {
             if (l == 1) {
-                forward_engram_layer(0, 0, h_slot, M);
+                forward_engram_layer(0, 0, h_slot, M, any_img_in_chunk);
                 if (use_rtc) {
                     DSV41_HIP_CHECK(hipSetDevice(0));
                     launch_stamp_gpu_rtc(d_stage_rtc, ctx[0].stream);
                 }
             }
             if (l == 14) {
-                forward_engram_layer(1, 1, h_slot, M);
+                forward_engram_layer(1, 1, h_slot, M, any_img_in_chunk);
                 if (use_rtc) {
                     DSV41_HIP_CHECK(hipSetDevice(0));
                     launch_stamp_gpu_rtc(d_stage_rtc, ctx[0].stream);
@@ -2193,7 +2401,7 @@ struct Dsv41Runtime::Impl {
                                            b.d_signs_h, c.d_x_rot_f16, (tp == 0) ? c.d_part_bf16 : nullptr);
             }
 
-            forward_block_moe(l, M, next_slot, h_slot);
+            forward_block_moe(l, M, next_slot, h_slot, any_img_in_chunk);
         }
 
         if (encoder_only) {
@@ -2263,9 +2471,78 @@ struct Dsv41Runtime::Impl {
         }
     }
 
+    // Helper: Assemble a 20-layer EncoderStateBlock (1,415,040 B) when decode crosses a 128-token boundary!
+    void build_pending_encoder_state_from_stage(
+        int start_pos,
+        int accepted_A,
+        const uint32_t* accepted_tree_nodes)
+    {
+        const int b_cross = (start_pos + accepted_A) / kRadixBlockTokens;
+        const int pos_128 = b_cross * kRadixBlockTokens;
+        const int k_pre   = pos_128 - start_pos;
+        if (pos_128 <= 0 || k_pre < 0 || k_pre > accepted_A) return;
+
+        constexpr size_t kEncRingElems = kEncoderStateLayers * kEncoderStateRingRows * kEncoderStateHeadDim;
+        uint16_t* ring_bf16 = reinterpret_cast<uint16_t*>(ctx[0].h_radix_stage);
+        const uint16_t* step_bf16 = ring_bf16 + kEncRingElems;
+
+        // Apply [start_pos .. pos_128) rows onto the pre-commit 20L SWA ring
+        for (size_t l = 0; l < kEncoderStateLayers; ++l) {
+            uint16_t* rl = ring_bf16 + l * kEncoderStateRingRows * kEncoderStateHeadDim;
+            const uint16_t* sl = step_bf16 + l * size_t(kMaxTreeNodes) * kEncoderStateHeadDim;
+            for (int s = 0; s < k_pre; ++s) {
+                const size_t dst_r = static_cast<size_t>((start_pos + s) & (kWindowSize - 1));
+                const size_t src_r = accepted_tree_nodes ? static_cast<size_t>(accepted_tree_nodes[s]) : static_cast<size_t>(s);
+                std::memcpy(rl + dst_r * kEncoderStateHeadDim,
+                            sl + src_r * kEncoderStateHeadDim,
+                            kEncoderStateHeadDim * sizeof(uint16_t));
+            }
+        }
+
+        // Gather up to 6 post-boundary DSpark slack rows [pos_128 .. start_pos + accepted_A)
+        const uint32_t slack_cnt = static_cast<uint32_t>(
+            std::min<int>(accepted_A - k_pre, static_cast<int>(kEncoderStateSlackRows)));
+        std::vector<uint16_t> slack_buf;
+        if (slack_cnt > 0u) {
+            slack_buf.resize(kEncoderStateLayers * kEncoderStateSlackRows * kEncoderStateHeadDim, 0u);
+            for (size_t l = 0; l < kEncoderStateLayers; ++l) {
+                const uint16_t* sl = step_bf16 + l * size_t(kMaxTreeNodes) * kEncoderStateHeadDim;
+                uint16_t* dl = slack_buf.data() + l * kEncoderStateSlackRows * kEncoderStateHeadDim;
+                for (uint32_t r = 0u; r < slack_cnt; ++r) {
+                    const size_t step_idx = static_cast<size_t>(k_pre) + r;
+                    const size_t src_r = accepted_tree_nodes ? static_cast<size_t>(accepted_tree_nodes[step_idx]) : step_idx;
+                    std::memcpy(dl + r * kEncoderStateHeadDim,
+                                sl + src_r * kEncoderStateHeadDim,
+                                kEncoderStateHeadDim * sizeof(uint16_t));
+                }
+            }
+        }
+
+        auto blk = std::make_shared<EncoderStateBlock>();
+        blk->pos = pos_128;
+        pack_encoder_state_block(
+            ring_bf16,
+            slack_cnt > 0u ? slack_buf.data() : nullptr,
+            kEncoderStateSlackRows,
+            slack_cnt,
+            *blk);
+        pending_enc_state = std::move(blk);
+    }
+
     // Commit ONLY `accepted_A` (1 <= accepted_A <= M_verified) verified tokens to backbone window + r=2 state!
     void commit_verified_backbone_state(int start_pos, int M_verified, int accepted_A) {
         const int new_pos = start_pos + accepted_A;
+        const bool crosses_128 = (start_pos / kRadixBlockTokens) < (new_pos / kRadixBlockTokens);
+        if (crosses_128) {
+            constexpr size_t kEncRingBytes = kEncoderStateLayers * kEncoderStateRingRows * kEncoderStateHeadDim * sizeof(uint16_t);
+            constexpr size_t kEncStepBytes = kEncoderStateLayers * size_t(kMaxTreeNodes) * kEncoderStateHeadDim * sizeof(uint16_t);
+            DSV41_HIP_CHECK(hipSetDevice(0));
+            DSV41_HIP_CHECK(hipEventSynchronize(ctx[0].ev_radix_stage[0]));
+            DSV41_HIP_CHECK(hipMemcpyAsync(ctx[0].h_radix_stage, ctx[0].d_win_kv_slab,
+                                           kEncRingBytes, hipMemcpyDeviceToHost, ctx[0].stream));
+            DSV41_HIP_CHECK(hipMemcpyAsync(ctx[0].h_radix_stage + kEncRingBytes, ctx[0].d_last_win_kv_slab,
+                                           kEncStepBytes, hipMemcpyDeviceToHost, ctx[0].stream));
+        }
         for (int tp = 0; tp < 3; ++tp) {
             DSV41_HIP_CHECK(hipSetDevice(tp));
             auto& c = ctx[tp];
@@ -2292,6 +2569,9 @@ struct Dsv41Runtime::Impl {
             DSV41_HIP_CHECK(hipSetDevice(tp));
             DSV41_HIP_CHECK(hipStreamSynchronize(ctx[tp].stream));
         }
+        if (crosses_128) {
+            build_pending_encoder_state_from_stage(start_pos, accepted_A, nullptr);
+        }
     }
 
     // Alias-free two-kernel GPU commit of ONLY the verified root-to-leaf path `accepted_nodes[0..accepted_A-1]`
@@ -2303,6 +2583,17 @@ struct Dsv41Runtime::Impl {
         const uint32_t* accepted_nodes,
         const int32_t* accepted_tokens)
     {
+        const bool crosses_128 = (start_pos / kRadixBlockTokens) < ((start_pos + accepted_A) / kRadixBlockTokens);
+        if (crosses_128) {
+            constexpr size_t kEncRingBytes = kEncoderStateLayers * kEncoderStateRingRows * kEncoderStateHeadDim * sizeof(uint16_t);
+            constexpr size_t kEncStepBytes = kEncoderStateLayers * size_t(kMaxTreeNodes) * kEncoderStateHeadDim * sizeof(uint16_t);
+            DSV41_HIP_CHECK(hipSetDevice(0));
+            DSV41_HIP_CHECK(hipEventSynchronize(ctx[0].ev_radix_stage[0]));
+            DSV41_HIP_CHECK(hipMemcpyAsync(ctx[0].h_radix_stage, ctx[0].d_win_kv_slab,
+                                           kEncRingBytes, hipMemcpyDeviceToHost, ctx[0].stream));
+            DSV41_HIP_CHECK(hipMemcpyAsync(ctx[0].h_radix_stage + kEncRingBytes, ctx[0].d_last_win_kv_slab,
+                                           kEncStepBytes, hipMemcpyDeviceToHost, ctx[0].stream));
+        }
         uint64_t acc_nodes_nibbles = 0ULL;
         for (int d = 0; d < accepted_A; ++d) {
             acc_nodes_nibbles |= (uint64_t(accepted_nodes[d] & 0xFu) << (4 * d));
@@ -2335,6 +2626,9 @@ struct Dsv41Runtime::Impl {
         for (int tp = 0; tp < 3; ++tp) {
             DSV41_HIP_CHECK(hipSetDevice(tp));
             DSV41_HIP_CHECK(hipStreamSynchronize(ctx[tp].stream));
+        }
+        if (crosses_128) {
+            build_pending_encoder_state_from_stage(start_pos, accepted_A, accepted_nodes);
         }
     }
 
@@ -2851,8 +3145,21 @@ struct Dsv41Runtime::Impl {
         reset_kv();
     }
 
+    static constexpr uint64_t pack_pool_slots(
+        int s0, int s1 = 0, int s2 = 0, int s3 = 0,
+        int s4 = 0, int s5 = 0, int s6 = 0, int s7 = 0) noexcept {
+        return (uint64_t(s0 & 0xFF)) |
+               (uint64_t(s1 & 0xFF) << 8) |
+               (uint64_t(s2 & 0xFF) << 16) |
+               (uint64_t(s3 & 0xFF) << 24) |
+               (uint64_t(s4 & 0xFF) << 32) |
+               (uint64_t(s5 & 0xFF) << 40) |
+               (uint64_t(s6 & 0xFF) << 48) |
+               (uint64_t(s7 & 0xFF) << 56);
+    }
+
     // Run 3-stage DSpark draft blocks (mtp_0..2) from `anchor_token` at `cur_pos` (zero staging, zero MoE host sync!),
-    // with confidence-gated GPU-resident deterministic M=8 or M=16 causal-tree expansion!
+    // with confidence-gated single-pass ConfidenceHead Dynamic M=8 (`DeepSelect8`), static M=8, or DeepSelect top-15 M=16 causal-tree expansion!
     int forward_dspark_draft(
         int32_t anchor_token,
         int cur_pos,
@@ -2864,7 +3171,9 @@ struct Dsv41Runtime::Impl {
         int target_tree_nodes = 0,
         int rem_budget = 0,
         int* out_used_tree_nodes = nullptr,
-        std::array<int32_t, kMaxTreeNodes>* out_tree_tokens = nullptr)
+        std::array<int32_t, kMaxTreeNodes>* out_tree_tokens = nullptr,
+        Dsv41DeepSelectPlan16* out_tree16_plan = nullptr,
+        Dsv41DeepSelectPlan8* out_tree8_plan = nullptr)
     {
         if (out_used_tree_nodes) *out_used_tree_nodes = 0;
         constexpr int B = kDSparkBlockSize;  // 5
@@ -2950,7 +3259,6 @@ struct Dsv41Runtime::Impl {
 
         // Base MTP head logits [5, vocab_rows] on GPU (saves raw hc_pre in tp=0 d_sub_bf16 for ConfidenceHead
         // and preserves unmutated rows [1..2] or [1..4] at offset +8*vocab_rows for M=8 / M=16 causal-tree top-B!)
-        const int min_tree_budget = (target_tree_nodes == 16) ? 6 : 4;
         for (int tp = 0; tp < 3; ++tp) {
             DSV41_HIP_CHECK(hipSetDevice(tp));
             auto& c = ctx[tp];
@@ -2959,8 +3267,8 @@ struct Dsv41Runtime::Impl {
                                        c.d_x_bf16, (tp == 0) ? c.d_sub_bf16 : nullptr, B, kNormEps, c.stream);
             launch_bf16_gemm(c.d_x_bf16, c.d_head_w, nullptr, c.d_logits_part_f32,
                              B, c.vocab_rows, kDim, true, c.stream);
-            if (target_tree_nodes >= 8 && rem_budget >= min_tree_budget) {
-                const size_t save_rows = (target_tree_nodes == 16) ? 4u : 2u;
+            if (target_tree_nodes >= 8 && rem_budget >= 4) {
+                const size_t save_rows = (!tree_static_m8 || target_tree_nodes == 16) ? 4u : 2u;
                 DSV41_HIP_CHECK(hipMemcpyAsync(c.d_logits_part_f32 + 8u * size_t(c.vocab_rows),
                                                c.d_logits_part_f32 + 1u * size_t(c.vocab_rows),
                                                save_rows * size_t(c.vocab_rows) * sizeof(float),
@@ -3039,96 +3347,334 @@ struct Dsv41Runtime::Impl {
             const float p_root_top1 = (ctrl->out_root_top1_prob >= 0.0f)
                 ? ctrl->out_root_top1_prob
                 : (1.0f / (1.0f + std::exp(-ctrl->out_conf_logits[0])));
-            const float tree_conf_thresh = (target_tree_nodes == 16) ? 0.85f : kTree8Top1ConfThresh;
-            if (target_tree_nodes >= 8 && out_used_tree_nodes && out_tree_tokens &&
-                rem_budget >= min_tree_budget &&
-                p_root_top1 < tree_conf_thresh &&
+            const bool fixed_t16 = (tree_width_mode == Dsv41TreeWidthMode::Fixed16);
+            const float t16_conf_thresh = fixed_t16 ? 0.85f : 0.65f;
+            const bool run_t16 = (target_tree_nodes == 16 && rem_budget >= 6 &&
+                                  (fixed_t16 || cur_pos < tree16_max_context) &&
+                                  p_root_top1 < t16_conf_thresh);
+            const bool run_t8  = !run_t16 && (target_tree_nodes >= 8 && rem_budget >= 4 &&
+                                              p_root_top1 < kTree8Top1ConfThresh);
+            if ((run_t16 || run_t8) && out_used_tree_nodes && out_tree_tokens &&
                 ctrl->out_drafts[0] != Dsv41SpecialTokens::kEos)
             {
                 ctrl->tree_tokens[0] = anchor_token;
+                ctrl->tree_probs[0] = 1.0f;
+                for (int u = 1; u < kDsparkPoolMaxNodes; ++u) {
+                    ctrl->tree_tokens[u] = -1;
+                    ctrl->tree_probs[u] = 0.0f;
+                }
                 std::atomic_thread_fence(std::memory_order_release);
-                if (target_tree_nodes == 16) {
-                    // Balanced M = 16 depth-5 causal tree: kTree16Parents = {-1, 0, 0, 0, 0, 1, 1, 2, 2, 3, 4, 5, 6, 7, 11, 14}
+                if (run_t16) {
+                    // Wave 8.2D DeepSelect 29-node (28-candidate) depth-5 draft pool across 3x MI50 (1 single stream sync, 0 B extra HBM2/L1):
+                    //   Stage 0 (root 0):      1..4   (top-4)
+                    //   Stages 1..4 (d=2):     5..8 (u=1), 9..11 (u=2), 12..13 (u=3), 14..15 (u=4)
+                    //   Stages 5..9 (d=3):     16..18 (u=5), 19..20 (u=6), 21..22 (u=9), 23 (u=10), 24 (u=12)
+                    //   Stages 10..11 (d=4):   25..26 (u=16), 27 (u=21)
+                    //   Stage 12 (d=5):        28 (u=25)
                     for (int tp = 0; tp < 3; ++tp) {
                         DSV41_HIP_CHECK(hipSetDevice(tp));
                         auto& c = ctx[tp];
                         const auto& m2 = c.blocks[kNumLayers + 2];
                         const size_t vr = size_t(c.vocab_rows);
 
-                        // Stage 0: root top-4 {t1, t2, t3, t4}
+                        // Stage 0: root top-4 {1, 2, 3, 4}
                         launch_dspark_tree_topk_tp3(
                             ctrl, c.d_logits_part_f32, nullptr,
-                            dseq, 0, 1, 4, 0u, 0, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                            dseq, 0, 1, 4, 0ULL, 0, tp, c.vocab_offset, c.vocab_rows, c.stream);
 
-                        // Markov Batch 1 (M=4) for {t1, t2, t3, t4} -> Stages 1..4 (depth 2: {t5..t10})
+                        // Markov Batch 1 (M=4) for {1, 2, 3, 4} -> Stages 1..4 (depth 2: {5..15})
                         uint16_t* emb_b1 = c.d_markov_sum_bf16 + 8u * kMarkovRank;
                         launch_dspark_prepare_tree_markov_emb(
-                            ctrl, h_markov_embed_mapped, emb_b1, dseq, 1u << 0, 0x4321u, 4, c.stream);
+                            ctrl, h_markov_embed_mapped, emb_b1, dseq, 1u << 0,
+                            pack_pool_slots(1, 2, 3, 4), 4, c.stream);
                         launch_bf16_gemm(emb_b1, m2.d_markov_head_w,
                                          nullptr, c.d_markov_logits_f32,
                                          4, c.vocab_rows, kMarkovRank, true, c.stream);
                         launch_dspark_tree_topk_tp3(
                             ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32 + 0u * vr,
-                            dseq, 1, 5, 2, 0x1u, 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                            dseq, 1, 5, 4, pack_pool_slots(1), 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
                         launch_dspark_tree_topk_tp3(
                             ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32 + 1u * vr,
-                            dseq, 2, 7, 2, 0x2u, 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                            dseq, 2, 9, 3, pack_pool_slots(2), 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
                         launch_dspark_tree_topk_tp3(
                             ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32 + 2u * vr,
-                            dseq, 3, 9, 1, 0x3u, 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                            dseq, 3, 12, 2, pack_pool_slots(3), 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
                         launch_dspark_tree_topk_tp3(
                             ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32 + 3u * vr,
-                            dseq, 4, 10, 1, 0x4u, 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                            dseq, 4, 14, 2, pack_pool_slots(4), 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
 
-                        // Markov Batch 2 (M=3) for {t5, t6, t7} -> Stages 5..7 (depth 3: {t11, t12, t13})
+                        // Markov Batch 2 (M=5) for {5, 6, 9, 10, 12} -> Stages 5..9 (depth 3: {16..24})
                         uint16_t* emb_b2 = c.d_markov_sum_bf16 + 12u * kMarkovRank;
                         launch_dspark_prepare_tree_markov_emb(
-                            ctrl, h_markov_embed_mapped, emb_b2, dseq, (1u << 1) | (1u << 2), 0x765u, 3, c.stream);
+                            ctrl, h_markov_embed_mapped, emb_b2, dseq,
+                            (1u << 1) | (1u << 2) | (1u << 3),
+                            pack_pool_slots(5, 6, 9, 10, 12), 5, c.stream);
                         launch_bf16_gemm(emb_b2, m2.d_markov_head_w,
                                          nullptr, c.d_markov_logits_f32 + 4u * vr,
-                                         3, c.vocab_rows, kMarkovRank, true, c.stream);
+                                         5, c.vocab_rows, kMarkovRank, true, c.stream);
                         launch_dspark_tree_topk_tp3(
                             ctrl, c.d_logits_part_f32 + 9u * vr, c.d_markov_logits_f32 + 4u * vr,
-                            dseq, 5, 11, 1, 0x51u, 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                            dseq, 5, 16, 3, pack_pool_slots(1, 5), 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
                         launch_dspark_tree_topk_tp3(
                             ctrl, c.d_logits_part_f32 + 9u * vr, c.d_markov_logits_f32 + 5u * vr,
-                            dseq, 6, 12, 1, 0x61u, 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                            dseq, 6, 19, 2, pack_pool_slots(1, 6), 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
                         launch_dspark_tree_topk_tp3(
                             ctrl, c.d_logits_part_f32 + 9u * vr, c.d_markov_logits_f32 + 6u * vr,
-                            dseq, 7, 13, 1, 0x72u, 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                            dseq, 7, 21, 2, pack_pool_slots(2, 9), 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                        launch_dspark_tree_topk_tp3(
+                            ctrl, c.d_logits_part_f32 + 9u * vr, c.d_markov_logits_f32 + 7u * vr,
+                            dseq, 8, 23, 1, pack_pool_slots(2, 10), 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                        launch_dspark_tree_topk_tp3(
+                            ctrl, c.d_logits_part_f32 + 9u * vr, c.d_markov_logits_f32 + 8u * vr,
+                            dseq, 9, 24, 1, pack_pool_slots(3, 12), 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
 
-                        // Markov Batch 3 (M=1) for {t11} -> Stage 8 (depth 4: {t14})
-                        uint16_t* emb_b3 = c.d_markov_sum_bf16 + 15u * kMarkovRank;
+                        // Markov Batch 3 (M=2) for {16, 21} -> Stages 10..11 (depth 4: {25..27})
+                        uint16_t* emb_b3 = c.d_markov_sum_bf16 + 17u * kMarkovRank;
                         launch_dspark_prepare_tree_markov_emb(
-                            ctrl, h_markov_embed_mapped, emb_b3, dseq, 1u << 5, 0xBu, 1, c.stream);
+                            ctrl, h_markov_embed_mapped, emb_b3, dseq,
+                            (1u << 5) | (1u << 7),
+                            pack_pool_slots(16, 21), 2, c.stream);
                         launch_bf16_gemm(emb_b3, m2.d_markov_head_w,
-                                         nullptr, c.d_markov_logits_f32 + 7u * vr,
-                                         1, c.vocab_rows, kMarkovRank, true, c.stream);
+                                         nullptr, c.d_markov_logits_f32 + 9u * vr,
+                                         2, c.vocab_rows, kMarkovRank, true, c.stream);
                         launch_dspark_tree_topk_tp3(
-                            ctrl, c.d_logits_part_f32 + 10u * vr, c.d_markov_logits_f32 + 7u * vr,
-                            dseq, 8, 14, 1, 0xB51u, 3, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                            ctrl, c.d_logits_part_f32 + 10u * vr, c.d_markov_logits_f32 + 9u * vr,
+                            dseq, 10, 25, 2, pack_pool_slots(1, 5, 16), 3, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                        launch_dspark_tree_topk_tp3(
+                            ctrl, c.d_logits_part_f32 + 10u * vr, c.d_markov_logits_f32 + 10u * vr,
+                            dseq, 11, 27, 1, pack_pool_slots(2, 9, 21), 3, tp, c.vocab_offset, c.vocab_rows, c.stream);
 
-                        // Markov Batch 4 (M=1) for {t14} -> Stage 9 (depth 5: {t15})
-                        uint16_t* emb_b4 = c.d_markov_sum_bf16 + 16u * kMarkovRank;
+                        // Markov Batch 4 (M=1) for {25} -> Stage 12 (depth 5: {28})
+                        uint16_t* emb_b4 = c.d_markov_sum_bf16 + 19u * kMarkovRank;
                         launch_dspark_prepare_tree_markov_emb(
-                            ctrl, h_markov_embed_mapped, emb_b4, dseq, 1u << 8, 0xEu, 1, c.stream);
+                            ctrl, h_markov_embed_mapped, emb_b4, dseq,
+                            (1u << 10),
+                            pack_pool_slots(25), 1, c.stream);
                         launch_bf16_gemm(emb_b4, m2.d_markov_head_w,
-                                         nullptr, c.d_markov_logits_f32 + 8u * vr,
+                                         nullptr, c.d_markov_logits_f32 + 11u * vr,
                                          1, c.vocab_rows, kMarkovRank, true, c.stream);
                         launch_dspark_tree_topk_tp3(
-                            ctrl, c.d_logits_part_f32 + 11u * vr, c.d_markov_logits_f32 + 8u * vr,
-                            dseq, 9, 15, 1, 0xEB51u, 4, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                            ctrl, c.d_logits_part_f32 + 11u * vr, c.d_markov_logits_f32 + 11u * vr,
+                            dseq, 12, 28, 1, pack_pool_slots(1, 5, 16, 25), 4, tp, c.vocab_offset, c.vocab_rows, c.stream);
                     }
                     DSV41_HIP_CHECK(hipSetDevice(0));
                     DSV41_HIP_CHECK(hipStreamSynchronize(ctx[0].stream));
+
+                    // Score all 28 draft candidates via exact DSparkConfidenceHead decomposition + stage draft probs q_u!
+                    float base_conf_logit[5]{};
+                    for (int s = 0; s < 5; ++s) {
+                        float tail_dot = 0.0f;
+                        if (s == 0) {
+                            tail_dot = dot_markov_conf_tail(anchor_token);
+                        } else if (ctrl->out_fallback_step < 0 && ctrl->out_drafted_cnt >= s &&
+                                   ctrl->out_drafts[s - 1] >= 0 &&
+                                   ctrl->out_drafts[s - 1] != Dsv41SpecialTokens::kEos) {
+                            tail_dot = dot_markov_conf_tail(ctrl->out_drafts[s - 1]);
+                        }
+                        base_conf_logit[s] = ctrl->out_conf_logits[s] - tail_dot;
+                    }
+
+                    std::array<double, kDeepSelectPoolNodes> parent_gate{};
+                    std::array<bool, kDeepSelectPoolNodes> parent_gate_ready{};
+                    std::array<double, kDeepSelectPoolNodes> pool_conf{};
+                    pool_conf[0] = 1.0;
+                    for (int u = 1; u < kDeepSelectPoolNodes; ++u) {
+                        const int p = kDeepSelectPoolParents[size_t(u)];
+                        if (!parent_gate_ready[size_t(p)]) {
+                            const uint32_t dp = kDeepSelectPoolDepths[size_t(p)];
+                            const int32_t p_tok = ctrl->tree_tokens[p];
+                            const float clog = base_conf_logit[dp] + dot_markov_conf_tail(p_tok);
+                            parent_gate[size_t(p)] = 1.0 / (1.0 + std::exp(-double(std::clamp(clog, -40.0f, 40.0f))));
+                            parent_gate_ready[size_t(p)] = true;
+                        }
+                        const double q_u = std::clamp(double(ctrl->tree_probs[u]), 0.0, 1.0);
+                        pool_conf[size_t(u)] = std::clamp(parent_gate[size_t(p)] * q_u, 0.0, 1.0);
+                    }
+
+                    Dsv41DeepSelectPlan16 local_plan{};
+                    Dsv41DeepSelectPlan16* plan_dst = out_tree16_plan ? out_tree16_plan : &local_plan;
+                    const bool plan_ok = deep_select_top15_confidence_tree(
+                        kDeepSelectPoolNodes,
+                        kDeepSelectPoolParents.data(),
+                        ctrl->tree_tokens,
+                        pool_conf.data(),
+                        Dsv41SpecialTokens::kEos,
+                        plan_dst);
+                    if (!plan_ok) {
+                        plan_dst->parents = kTree16Parents;
+                        plan_dst->depths  = kTree16Depths;
+                        plan_dst->anc_mask256 = kTree16AncMask256;
+                        plan_dst->depth_nibbles64 = kTree16DepthNibbles64;
+                        plan_dst->parent_nibbles64 = kTree16ParentNibbles64;
+                        plan_dst->valid_node_mask = 0xFFFFu;
+                        plan_dst->max_depth = 5;
+                        const std::array<int, 16> fallback_pool = {
+                            0, 1, 2, 3, 4, 5, 6, 9, 10, 12, 14, 16, 19, 21, 25, 28};
+                        for (int m = 0; m < kTree16NumNodes; ++m) {
+                            plan_dst->tokens[size_t(m)] = ctrl->tree_tokens[fallback_pool[size_t(m)]];
+                        }
+                    }
                     for (int m = 0; m < kMaxTreeNodes; ++m) {
-                        (*out_tree_tokens)[size_t(m)] = ctrl->tree_tokens[m];
+                        const int32_t tok = plan_dst->tokens[size_t(m)];
+                        (*out_tree_tokens)[size_t(m)] = (tok >= 0) ? tok : kDSparkNoiseId;
                     }
                     *out_used_tree_nodes = 16;
-                    return kMaxTreeNodes - 1;
+                    return std::max(1, plan_dst->max_depth);
                 }
 
-                // Width-[3,2,1,1] M = 8 causal tree across all 3 MI50 ranks with 1 single stream sync!
+                if (!tree_static_m8) {
+                    // Wave 8.3B Single-Pass ConfidenceHead Dynamic M = 8 (`DeepSelect8`, 16 -> 8 pool, 0 B extra HBM2):
+                    //   Stage 0 (root 0):      1..4   (top-4, depth 1)
+                    //   Batch 1 (B=3, {1,2,3}): 5..7 (u=1), 8..9 (u=2), 10 (u=3)  [depth 2]
+                    //   Batch 2 (B=2, {5,8}):   11..12 (u=5), 13 (u=8)            [depth 3]
+                    //   Batch 3 (B=1, {11}):    14 (u=11)                         [depth 4]
+                    //   Batch 4 (B=1, {14}):    15 (u=14)                         [depth 5 -> up to 6 emitted tokens/burst!]
+                    const int dyn8_max_depth = std::clamp(std::min(tree_dyn8_max_depth, rem_budget - 1), 1, 5);
+                    for (int tp = 0; tp < 3; ++tp) {
+                        DSV41_HIP_CHECK(hipSetDevice(tp));
+                        auto& c = ctx[tp];
+                        const auto& m2 = c.blocks[kNumLayers + 2];
+                        const size_t vr = size_t(c.vocab_rows);
+
+                        // Stage 0: root top-4 {1, 2, 3, 4}
+                        launch_dspark_tree_topk_tp3(
+                            ctrl, c.d_logits_part_f32, nullptr,
+                            dseq, 0, 1, 4, 0ULL, 0, tp, c.vocab_offset, c.vocab_rows, c.stream);
+
+                        if (dyn8_max_depth >= 2) {
+                            // Batch 1 (B=3) for parents {1, 2, 3} -> Stages 1..3 (depth 2: {5..10})
+                            uint16_t* emb_b1 = c.d_markov_sum_bf16 + 8u * kMarkovRank;
+                            launch_dspark_prepare_tree_markov_emb(
+                                ctrl, h_markov_embed_mapped, emb_b1, dseq, 1u << 0,
+                                pack_pool_slots(1, 2, 3), 3, c.stream);
+                            launch_bf16_gemm(emb_b1, m2.d_markov_head_w,
+                                             nullptr, c.d_markov_logits_f32 + 0u * vr,
+                                             3, c.vocab_rows, kMarkovRank, true, c.stream);
+                            launch_dspark_tree_topk_tp3(
+                                ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32 + 0u * vr,
+                                dseq, 1, 5, 3, pack_pool_slots(1), 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                            launch_dspark_tree_topk_tp3(
+                                ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32 + 1u * vr,
+                                dseq, 2, 8, 2, pack_pool_slots(2), 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                            launch_dspark_tree_topk_tp3(
+                                ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32 + 2u * vr,
+                                dseq, 3, 10, 1, pack_pool_slots(3), 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                        }
+
+                        if (dyn8_max_depth >= 3) {
+                            // Batch 2 (B=2) for parents {5, 8} -> Stages 4..5 (depth 3: {11..13})
+                            uint16_t* emb_b2 = c.d_markov_sum_bf16 + 11u * kMarkovRank;
+                            launch_dspark_prepare_tree_markov_emb(
+                                ctrl, h_markov_embed_mapped, emb_b2, dseq,
+                                (1u << 1) | (1u << 2),
+                                pack_pool_slots(5, 8), 2, c.stream);
+                            launch_bf16_gemm(emb_b2, m2.d_markov_head_w,
+                                             nullptr, c.d_markov_logits_f32 + 3u * vr,
+                                             2, c.vocab_rows, kMarkovRank, true, c.stream);
+                            launch_dspark_tree_topk_tp3(
+                                ctrl, c.d_logits_part_f32 + 9u * vr, c.d_markov_logits_f32 + 3u * vr,
+                                dseq, 4, 11, 2, pack_pool_slots(1, 5), 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                            launch_dspark_tree_topk_tp3(
+                                ctrl, c.d_logits_part_f32 + 9u * vr, c.d_markov_logits_f32 + 4u * vr,
+                                dseq, 5, 13, 1, pack_pool_slots(2, 8), 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                        }
+
+                        if (dyn8_max_depth >= 4) {
+                            // Batch 3 (B=1) for parent {11} -> Stage 6 (depth 4: {14})
+                            uint16_t* emb_b3 = c.d_markov_sum_bf16 + 13u * kMarkovRank;
+                            launch_dspark_prepare_tree_markov_emb(
+                                ctrl, h_markov_embed_mapped, emb_b3, dseq,
+                                (1u << 4),
+                                pack_pool_slots(11), 1, c.stream);
+                            launch_bf16_gemm(emb_b3, m2.d_markov_head_w,
+                                             nullptr, c.d_markov_logits_f32 + 5u * vr,
+                                             1, c.vocab_rows, kMarkovRank, true, c.stream);
+                            launch_dspark_tree_topk_tp3(
+                                ctrl, c.d_logits_part_f32 + 10u * vr, c.d_markov_logits_f32 + 5u * vr,
+                                dseq, 6, 14, 1, pack_pool_slots(1, 5, 11), 3, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                        }
+
+                        if (dyn8_max_depth >= 5) {
+                            // Batch 4 (B=1) for parent {14} -> Stage 7 (depth 5: {15})
+                            uint16_t* emb_b4 = c.d_markov_sum_bf16 + 14u * kMarkovRank;
+                            launch_dspark_prepare_tree_markov_emb(
+                                ctrl, h_markov_embed_mapped, emb_b4, dseq,
+                                (1u << 6),
+                                pack_pool_slots(14), 1, c.stream);
+                            launch_bf16_gemm(emb_b4, m2.d_markov_head_w,
+                                             nullptr, c.d_markov_logits_f32 + 6u * vr,
+                                             1, c.vocab_rows, kMarkovRank, true, c.stream);
+                            launch_dspark_tree_topk_tp3(
+                                ctrl, c.d_logits_part_f32 + 11u * vr, c.d_markov_logits_f32 + 6u * vr,
+                                dseq, 7, 15, 1, pack_pool_slots(1, 5, 11, 14), 4, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                        }
+                    }
+                    DSV41_HIP_CHECK(hipSetDevice(0));
+                    DSV41_HIP_CHECK(hipStreamSynchronize(ctx[0].stream));
+
+                    // Score all 15 draft candidates via exact DSparkConfidenceHead decomposition (0 extra GPU launches / 0 B HBM2)!
+                    float base_conf_logit[5]{};
+                    for (int s = 0; s < 5; ++s) {
+                        float tail_dot = 0.0f;
+                        if (s == 0) {
+                            tail_dot = dot_markov_conf_tail(anchor_token);
+                        } else if (ctrl->out_fallback_step < 0 && ctrl->out_drafted_cnt >= s &&
+                                   ctrl->out_drafts[s - 1] >= 0 &&
+                                   ctrl->out_drafts[s - 1] != Dsv41SpecialTokens::kEos) {
+                            tail_dot = dot_markov_conf_tail(ctrl->out_drafts[s - 1]);
+                        }
+                        base_conf_logit[s] = ctrl->out_conf_logits[s] - tail_dot;
+                    }
+
+                    std::array<double, kDeepSelect8PoolNodes> parent_gate{};
+                    std::array<bool, kDeepSelect8PoolNodes> parent_gate_ready{};
+                    std::array<double, kDeepSelect8PoolNodes> pool_conf{};
+                    pool_conf[0] = 1.0;
+                    for (int u = 1; u < kDeepSelect8PoolNodes; ++u) {
+                        const int p = kDeepSelect8PoolParents[size_t(u)];
+                        if (!parent_gate_ready[size_t(p)]) {
+                            const uint32_t dp = kDeepSelect8PoolDepths[size_t(p)];
+                            const int32_t p_tok = ctrl->tree_tokens[p];
+                            const float clog = (p_tok >= 0) ? (base_conf_logit[dp] + dot_markov_conf_tail(p_tok)) : -40.0f;
+                            parent_gate[size_t(p)] = 1.0 / (1.0 + std::exp(-double(std::clamp(clog, -40.0f, 40.0f))));
+                            parent_gate_ready[size_t(p)] = true;
+                        }
+                        const double q_u = std::clamp(double(ctrl->tree_probs[u]), 0.0, 1.0);
+                        pool_conf[size_t(u)] = std::clamp(parent_gate[size_t(p)] * q_u, 0.0, 1.0);
+                    }
+
+                    Dsv41DeepSelectPlan8 local_plan8{};
+                    Dsv41DeepSelectPlan8* plan8_dst = out_tree8_plan ? out_tree8_plan : &local_plan8;
+                    const bool plan8_ok = deep_select_top7_confidence_tree8(
+                        kDeepSelect8PoolNodes,
+                        kDeepSelect8PoolParents.data(),
+                        ctrl->tree_tokens,
+                        pool_conf.data(),
+                        Dsv41SpecialTokens::kEos,
+                        plan8_dst,
+                        static_cast<uint32_t>(dyn8_max_depth));
+                    if (!plan8_ok) {
+                        plan8_dst->parents = kTree8Parents;
+                        plan8_dst->depths  = kTree8Depths;
+                        plan8_dst->anc_mask64 = kTree8AncMask64;
+                        plan8_dst->depth_nibbles32 = static_cast<uint32_t>(kTree8DepthNibbles64);
+                        plan8_dst->parent_nibbles32 = static_cast<uint32_t>(kTree8ParentNibbles64);
+                        plan8_dst->valid_node_mask = 0xFFu;
+                        plan8_dst->max_depth = std::min(3, dyn8_max_depth);
+                        const std::array<int, 8> fallback8_pool = {0, 1, 2, 3, 5, 6, 8, 11};
+                        for (int m = 0; m < kTree8NumNodes; ++m) {
+                            plan8_dst->tokens[size_t(m)] = ctrl->tree_tokens[fallback8_pool[size_t(m)]];
+                        }
+                    }
+                    for (int m = 0; m < kTree8NumNodes; ++m) {
+                        const int32_t tok = plan8_dst->tokens[size_t(m)];
+                        (*out_tree_tokens)[size_t(m)] = (tok >= 0) ? tok : kDSparkNoiseId;
+                    }
+                    *out_used_tree_nodes = 8;
+                    return std::max(1, plan8_dst->max_depth);
+                }
+
+                // Canonical static Width-[3,2,1,1] M = 8 (`0x9345231309050301ULL`) fallback (--dspark-static-m8)
                 for (int tp = 0; tp < 3; ++tp) {
                     DSV41_HIP_CHECK(hipSetDevice(tp));
                     auto& c = ctx[tp];
@@ -3138,40 +3684,54 @@ struct Dsv41Runtime::Impl {
                     // Stage 0: root top-3 {t1, t2, t3} from row 0 (already contains base_0 + markov_0 + rep_penalty)
                     launch_dspark_tree_topk_tp3(
                         ctrl, c.d_logits_part_f32, nullptr,
-                        dseq, 0, 1, 3, 0u, 0, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                        dseq, 0, 1, 3, 0ULL, 0, tp, c.vocab_offset, c.vocab_rows, c.stream);
 
                     // Markov GEMM (M=2) for t1 and t2 -> Stages 1 & 2 ({t4, t5} under t1, {t6} under t2)
                     uint16_t* emb_t12 = c.d_markov_sum_bf16 + 8u * kMarkovRank;
                     launch_dspark_prepare_tree_markov_emb(
-                        ctrl, h_markov_embed_mapped, emb_t12, dseq, 1u << 0, 0x21u, 2, c.stream);
+                        ctrl, h_markov_embed_mapped, emb_t12, dseq, 1u << 0,
+                        pack_pool_slots(1, 2), 2, c.stream);
                     launch_bf16_gemm(emb_t12, m2.d_markov_head_w,
                                      nullptr, c.d_markov_logits_f32,
                                      2, c.vocab_rows, kMarkovRank, true, c.stream);
                     launch_dspark_tree_topk_tp3(
                         ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32,
-                        dseq, 1, 4, 2, 0x1u, 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                        dseq, 1, 4, 2, pack_pool_slots(1), 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
                     launch_dspark_tree_topk_tp3(
                         ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32 + vr,
-                        dseq, 2, 6, 1, 0x2u, 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                        dseq, 2, 6, 1, pack_pool_slots(2), 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
 
                     // Markov GEMM (M=1) for t4 -> Stage 3 ({t7} under t4)
                     uint16_t* emb_t4 = c.d_markov_sum_bf16 + 10u * kMarkovRank;
                     launch_dspark_prepare_tree_markov_emb(
-                        ctrl, h_markov_embed_mapped, emb_t4, dseq, 1u << 1, 0x4u, 1, c.stream);
+                        ctrl, h_markov_embed_mapped, emb_t4, dseq, 1u << 1,
+                        pack_pool_slots(4), 1, c.stream);
                     launch_bf16_gemm(emb_t4, m2.d_markov_head_w,
                                      nullptr, c.d_markov_logits_f32 + 2u * vr,
                                      1, c.vocab_rows, kMarkovRank, true, c.stream);
                     launch_dspark_tree_topk_tp3(
                         ctrl, c.d_logits_part_f32 + 9u * vr, c.d_markov_logits_f32 + 2u * vr,
-                        dseq, 3, 7, 1, 0x41u, 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                        dseq, 3, 7, 1, pack_pool_slots(1, 4), 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
                 }
                 DSV41_HIP_CHECK(hipSetDevice(0));
                 DSV41_HIP_CHECK(hipStreamSynchronize(ctx[0].stream));
+                if (out_tree8_plan) {
+                    out_tree8_plan->parents = kTree8Parents;
+                    out_tree8_plan->depths  = kTree8Depths;
+                    out_tree8_plan->anc_mask64 = kTree8AncMask64;
+                    out_tree8_plan->depth_nibbles32 = static_cast<uint32_t>(kTree8DepthNibbles64);
+                    out_tree8_plan->parent_nibbles32 = static_cast<uint32_t>(kTree8ParentNibbles64);
+                    out_tree8_plan->valid_node_mask = 0xFFu;
+                    out_tree8_plan->max_depth = 3;
+                    for (int m = 0; m < kTree8NumNodes; ++m) {
+                        out_tree8_plan->tokens[size_t(m)] = ctrl->tree_tokens[m];
+                    }
+                }
                 for (int m = 0; m < kTree8NumNodes; ++m) {
-                    (*out_tree_tokens)[size_t(m)] = ctrl->tree_tokens[m];
+                    (*out_tree_tokens)[size_t(m)] = (ctrl->tree_tokens[m] >= 0) ? ctrl->tree_tokens[m] : kDSparkNoiseId;
                 }
                 *out_used_tree_nodes = 8;
-                return kTree8NumNodes - 1;  // 7 drafted tree candidates (M = 8 verify nodes)
+                return 3;  // Max depth of canonical static Width-[3,2,1,1] M = 8 tree!
             }
 
             drafted_cnt = std::max(1, std::min(B, int(ctrl->out_drafted_cnt)));
@@ -3303,10 +3863,14 @@ struct Dsv41Runtime::Impl {
     // Clear persistent GPU SWA + r=2 state to cold start (preserving DDR4 RewindBank & RadixBlockCache!)
     void clear_gpu_kv_state() {
         cached_tokens.clear();
+        cached_block_salts.clear();
+        pending_enc_state.reset();
+        engram_anchor_pos = -1;
+        engram_anchor_tok = -1;
         win_valid_from_20_39 = 0;
         mtp_window_seeded = false;
         exported_radix_blocks = 0;
-        exported_radix_key = RadixKey128{};
+        exported_radix_key = root_radix_key();
         for (int tp = 0; tp < 3; ++tp) {
             reset_r2_compressor_state_gpu(tp);
             DSV41_HIP_CHECK(hipSetDevice(tp));
@@ -3316,111 +3880,125 @@ struct Dsv41Runtime::Impl {
         }
     }
 
-    // Save current SWA + r=2 state into 32-entry RewindBank (single-slab 5.375 MiB D2H on tp=0, < 0.4 ms!)
-    void save_rewind_snapshot() {
-        const int cur_pos = static_cast<int>(cached_tokens.size());
-        if (cur_pos <= 0) return;
-        for (const auto& s : rewind_bank) {
-            if (s.pos == cur_pos && s.tokens == cached_tokens) return;
-        }
-        RewindSnapshot snap;
-        snap.pos = cur_pos;
-        snap.win_valid_from_20_39 = win_valid_from_20_39;
-        snap.mtp_seeded = mtp_window_seeded;
-        snap.tokens = cached_tokens;
-        snap.win_kv_slab.resize(kWinKvSlabElems);
-        snap.comp_state_slab.resize(kCompStateSlabElems);
-
+    // Extract a single 128-token block slot `blk` (113,920 B across Slots 0..3) from tp=0 into `dst_113920`
+    void extract_single_radix_block_from_gpu(int blk, uint8_t* dst_113920) {
         DSV41_HIP_CHECK(hipSetDevice(0));
-        DSV41_HIP_CHECK(hipMemcpyAsync(snap.win_kv_slab.data(), ctx[0].d_win_kv_slab,
-                                       kWinKvSlabElems * sizeof(uint16_t), hipMemcpyDeviceToHost, ctx[0].stream));
-        DSV41_HIP_CHECK(hipMemcpyAsync(snap.comp_state_slab.data(), ctx[0].d_comp_kv_state_slab,
-                                       kCompStateSlabElems * sizeof(float), hipMemcpyDeviceToHost, ctx[0].stream));
-        DSV41_HIP_CHECK(hipStreamSynchronize(ctx[0].stream));
-
-        if (rewind_bank.size() >= 32u) {
-            rewind_bank.pop_front();
+        auto& c0 = ctx[0];
+        DSV41_HIP_CHECK(hipEventSynchronize(c0.ev_radix_stage[0]));
+        size_t off = 0;
+        for (int s = 0; s < 4; ++s) {
+            const size_t n_slots = (s < 3) ? 64u : 128u;
+            const size_t sb = size_t(blk) * n_slots;
+            const size_t hot_cap = size_t(c0.hot_comp_cap[s]);
+            if (sb < hot_cap) {
+                DSV41_HIP_CHECK(hipMemcpyAsync(c0.h_radix_stage + off, c0.d_comp_kv_fp4[s] + sb * 256u,
+                                               n_slots * 256u, hipMemcpyDeviceToHost, c0.stream));
+                off += n_slots * 256u;
+                DSV41_HIP_CHECK(hipMemcpyAsync(c0.h_radix_stage + off, c0.d_comp_kv_e4m3[s] + sb * 32u,
+                                               n_slots * 32u, hipMemcpyDeviceToHost, c0.stream));
+                off += n_slots * 32u;
+            } else {
+                const size_t ext_sb = sb - hot_cap;
+                std::memcpy(c0.h_radix_stage + off, c0.h_ext_comp_kv_fp4[s] + ext_sb * 256u, n_slots * 256u);
+                off += n_slots * 256u;
+                std::memcpy(c0.h_radix_stage + off, c0.h_ext_comp_kv_e4m3[s] + ext_sb * 32u, n_slots * 32u);
+                off += n_slots * 32u;
+            }
+            DSV41_HIP_CHECK(hipMemcpyAsync(c0.h_radix_stage + off, c0.d_index_k_fp4[s] + sb * 64u,
+                                           n_slots * 64u, hipMemcpyDeviceToHost, c0.stream));
+            off += n_slots * 64u;
+            DSV41_HIP_CHECK(hipMemcpyAsync(c0.h_radix_stage + off, c0.d_index_k_ue8m0[s] + sb * 4u,
+                                           n_slots * 4u, hipMemcpyDeviceToHost, c0.stream));
+            off += n_slots * 4u;
         }
-        rewind_bank.push_back(std::move(snap));
+        DSV41_HIP_CHECK(hipStreamSynchronize(c0.stream));
+        std::memcpy(dst_113920, c0.h_radix_stage, kRadixBlockBytes);
     }
 
-    // Restore SWA + r=2 state from RewindBank snapshot onto all 3 GPUs (< 0.5 ms!)
-    void restore_rewind_snapshot_gpu(const RewindSnapshot& snap, bool also_restore_global_kv_from_radix,
-                                     const std::vector<std::shared_ptr<RadixBlockEntry>>& radix_prefix)
-    {
-        if (also_restore_global_kv_from_radix && !radix_prefix.empty()) {
-            restore_radix_blocks_gpu(radix_prefix);
+    // Insert a 20-layer EncoderStateBlock (1.35 MiB, 0 decoder SWA cached) into bounded RAM FIFO cache
+    void insert_encoder_state_block(std::shared_ptr<EncoderStateBlock> blk) {
+        if (!blk || blk->pos <= 0 || (blk->pos % kRadixBlockTokens) != 0) return;
+        auto it = encoder_state_map.find(blk->key);
+        if (it != encoder_state_map.end()) {
+            it->second = std::move(blk);
+            return;
         }
+        if (encoder_state_map.size() >= kMaxRamEncoderStateBlocks && !encoder_state_fifo.empty()) {
+            encoder_state_map.erase(encoder_state_fifo.front());
+            encoder_state_fifo.pop_front();
+        }
+        encoder_state_fifo.push_back(blk->key);
+        encoder_state_map[blk->key] = std::move(blk);
+    }
+
+    // Snapshot ONLY the first 20 (CED encoder) SWA layers at an exact 128-token boundary into RAM EncoderStateBlock!
+    void capture_encoder_state_at_exact_128_gpu(int pos_128, RadixKey128 key) {
+        if (pos_128 <= 0 || (pos_128 % kRadixBlockTokens) != 0) return;
+        if (encoder_state_map.find(key) != encoder_state_map.end()) return;
+
+        constexpr size_t kEncRingBytes = kEncoderStateLayers * kEncoderStateRingRows * kEncoderStateHeadDim * sizeof(uint16_t);
+        DSV41_HIP_CHECK(hipSetDevice(0));
+        auto& c0 = ctx[0];
+        DSV41_HIP_CHECK(hipEventSynchronize(c0.ev_radix_stage[0]));
+        DSV41_HIP_CHECK(hipMemcpyAsync(c0.h_radix_stage, c0.d_win_kv_slab,
+                                       kEncRingBytes, hipMemcpyDeviceToHost, c0.stream));
+        DSV41_HIP_CHECK(hipStreamSynchronize(c0.stream));
+
+        auto blk = std::make_shared<EncoderStateBlock>();
+        blk->pos = pos_128;
+        blk->key = key;
+        pack_encoder_state_block(
+            reinterpret_cast<const uint16_t*>(c0.h_radix_stage),
+            nullptr,
+            0u,
+            0u,
+            *blk);
+        insert_encoder_state_block(std::move(blk));
+    }
+
+    // Restore ONLY the 20 encoder SWA layers (2.50 MiB BF16 unpacked from 1.35 MiB StateBlock) onto all 3 MI50 GPUs!
+    void restore_encoder_state_block_gpu(const EncoderStateBlock& blk) {
+        constexpr size_t kEncRingBytes = kEncoderStateLayers * kEncoderStateRingRows * kEncoderStateHeadDim * sizeof(uint16_t);
+        for (int tp = 0; tp < 3; ++tp) {
+            DSV41_HIP_CHECK(hipEventSynchronize(ctx[tp].ev_radix_stage[0]));
+        }
+        unpack_encoder_state_block(blk, reinterpret_cast<uint16_t*>(ctx[0].h_radix_stage));
+        std::memcpy(ctx[1].h_radix_stage, ctx[0].h_radix_stage, kEncRingBytes);
+        std::memcpy(ctx[2].h_radix_stage, ctx[0].h_radix_stage, kEncRingBytes);
+
         for (int tp = 0; tp < 3; ++tp) {
             DSV41_HIP_CHECK(hipSetDevice(tp));
-            DSV41_HIP_CHECK(hipMemcpyAsync(ctx[tp].d_win_kv_slab, snap.win_kv_slab.data(),
-                                           kWinKvSlabElems * sizeof(uint16_t), hipMemcpyHostToDevice, ctx[tp].stream));
-            DSV41_HIP_CHECK(hipMemcpyAsync(ctx[tp].d_comp_kv_state_slab, snap.comp_state_slab.data(),
-                                           kCompStateSlabElems * sizeof(float), hipMemcpyHostToDevice, ctx[tp].stream));
+            DSV41_HIP_CHECK(hipMemcpyAsync(ctx[tp].d_win_kv_slab, ctx[tp].h_radix_stage,
+                                           kEncRingBytes, hipMemcpyHostToDevice, ctx[tp].stream));
+            DSV41_HIP_CHECK(hipEventRecord(ctx[tp].ev_radix_stage[0], ctx[tp].stream));
         }
         for (int tp = 0; tp < 3; ++tp) {
             DSV41_HIP_CHECK(hipSetDevice(tp));
             DSV41_HIP_CHECK(hipStreamSynchronize(ctx[tp].stream));
         }
-        cached_tokens = snap.tokens;
-        win_valid_from_20_39 = snap.win_valid_from_20_39;
-        mtp_window_seeded = snap.mtp_seeded;
-        engram_cpu.compute_hashes(cached_tokens.data(), snap.pos, 0, nullptr, engram_hashes_buf);
-        exported_radix_blocks = 0;
-        exported_radix_key = RadixKey128{};
-        const int full_blks = snap.pos / kRadixBlockTokens;
-        for (int b = 0; b < full_blks; ++b) {
-            exported_radix_key = step_radix_hash(exported_radix_key, cached_tokens.data() + b * kRadixBlockTokens);
-            exported_radix_blocks = b + 1;
-        }
     }
 
-    // Export newly completed 128-token blocks [exported_radix_blocks .. cached_tokens.size()/128) to DDR4 + async NVMe!
+    // Export newly completed 128-token blocks [exported_radix_blocks .. cached_tokens.size()/128) to DDR4 + async NVMe
+    // (0 B SWA written to NVMe; captures 20L RAM EncoderStateBlock at exact/crossed 128-token boundaries!)
     void export_new_radix_blocks() {
-        const int total_blks = static_cast<int>(cached_tokens.size()) / kRadixBlockTokens;
+        const int cur_len = static_cast<int>(cached_tokens.size());
+        const int total_blks = cur_len / kRadixBlockTokens;
         if (total_blks <= exported_radix_blocks) return;
-
-        DSV41_HIP_CHECK(hipSetDevice(0));
-        auto& c0 = ctx[0];
 
         while (exported_radix_blocks < total_blks) {
             const int blk = exported_radix_blocks;
+            const int blk_end_pos = (blk + 1) * kRadixBlockTokens;
             const int32_t* blk_toks = cached_tokens.data() + blk * kRadixBlockTokens;
-            const RadixKey128 key = step_radix_hash(exported_radix_key, blk_toks);
+            const uint64_t salt = get_cached_blk_salt(blk);
+            const RadixKey128 key = step_radix_hash(exported_radix_key, blk_toks, salt);
 
-            if (radix_map.find(key) == radix_map.end()) {
+            auto it = radix_map.find(key);
+            if (it == radix_map.end()) {
                 auto entry = std::make_shared<RadixBlockEntry>();
                 entry->key = key;
+                entry->extra_salt = salt;
                 std::memcpy(entry->tokens.data(), blk_toks, kRadixBlockTokens * sizeof(int32_t));
-
-                size_t off = 0;
-                for (int s = 0; s < 4; ++s) {
-                    const size_t n_slots = (s < 3) ? 64u : 128u;
-                    const size_t sb = size_t(blk) * n_slots;
-                    const size_t hot_cap = size_t(c0.hot_comp_cap[s]);
-                    if (sb < hot_cap) {
-                        DSV41_HIP_CHECK(hipMemcpyAsync(c0.h_radix_stage + off, c0.d_comp_kv_fp4[s] + sb * 256u,
-                                                       n_slots * 256u, hipMemcpyDeviceToHost, c0.stream));
-                        off += n_slots * 256u;
-                        DSV41_HIP_CHECK(hipMemcpyAsync(c0.h_radix_stage + off, c0.d_comp_kv_e4m3[s] + sb * 32u,
-                                                       n_slots * 32u, hipMemcpyDeviceToHost, c0.stream));
-                        off += n_slots * 32u;
-                    } else {
-                        const size_t ext_sb = sb - hot_cap;
-                        std::memcpy(c0.h_radix_stage + off, c0.h_ext_comp_kv_fp4[s] + ext_sb * 256u, n_slots * 256u);
-                        off += n_slots * 256u;
-                        std::memcpy(c0.h_radix_stage + off, c0.h_ext_comp_kv_e4m3[s] + ext_sb * 32u, n_slots * 32u);
-                        off += n_slots * 32u;
-                    }
-                    DSV41_HIP_CHECK(hipMemcpyAsync(c0.h_radix_stage + off, c0.d_index_k_fp4[s] + sb * 64u,
-                                                   n_slots * 64u, hipMemcpyDeviceToHost, c0.stream));
-                    off += n_slots * 64u;
-                    DSV41_HIP_CHECK(hipMemcpyAsync(c0.h_radix_stage + off, c0.d_index_k_ue8m0[s] + sb * 4u,
-                                                   n_slots * 4u, hipMemcpyDeviceToHost, c0.stream));
-                    off += n_slots * 4u;
-                }
-                DSV41_HIP_CHECK(hipStreamSynchronize(c0.stream));
-                std::memcpy(entry->data.data(), c0.h_radix_stage, kRadixBlockBytes);
+                extract_single_radix_block_from_gpu(blk, entry->data.data());
 
                 if (radix_map.size() >= kMaxDdr4RadixBlocks && !radix_fifo.empty()) {
                     radix_map.erase(radix_fifo.front());
@@ -3429,11 +4007,27 @@ struct Dsv41Runtime::Impl {
                 radix_map[key] = entry;
                 radix_fifo.push_back(key);
 
+                if (nvme_store.enabled()) {
+                    {
+                        std::lock_guard<std::mutex> lk(nvme_mtx);
+                        nvme_write_queue.push_back(entry);
+                    }
+                    nvme_cv.notify_one();
+                }
+            } else if (nvme_store.enabled() && !nvme_store.has_block_on_disk(key)) {
                 {
                     std::lock_guard<std::mutex> lk(nvme_mtx);
-                    nvme_write_queue.push_back(entry);
+                    nvme_write_queue.push_back(it->second);
                 }
                 nvme_cv.notify_one();
+            }
+
+            if (pending_enc_state && pending_enc_state->pos == blk_end_pos) {
+                pending_enc_state->key = key;
+                insert_encoder_state_block(std::move(pending_enc_state));
+                pending_enc_state.reset();
+            } else if (cur_len == blk_end_pos) {
+                capture_encoder_state_at_exact_128_gpu(blk_end_pos, key);
             }
 
             if (size_t(blk) < gpu_slot_radix_keys.size()) {
@@ -3444,46 +4038,213 @@ struct Dsv41Runtime::Impl {
         }
     }
 
-    // Lookup longest matching chain of 128-token Radix blocks in DDR4 + Dual-NVMe (up to max_blocks)
-    std::vector<std::shared_ptr<RadixBlockEntry>> lookup_radix_chain(const int32_t* prompt_toks, int max_blocks) {
+    // Stage `nb <= 64` blocks `[b0 .. b0+nb)` (within same hot/ext half of 4096) into pinned buffer `ping`
+    // using a single OpenMP parallel loop and enqueue async SDMA across all 3 MI50 ranks!
+    void stage_and_enqueue_radix_chunk_gpu(const std::shared_ptr<RadixBlockEntry>* blk_arr,
+                                           int b0, int nb, int& ping)
+    {
+        if (nb <= 0) return;
+        if (b0 < 4096 && b0 + nb > 4096) {
+            const int nb1 = 4096 - b0;
+            stage_and_enqueue_radix_chunk_gpu(blk_arr, b0, nb1, ping);
+            stage_and_enqueue_radix_chunk_gpu(blk_arr + nb1, 4096, nb - nb1, ping);
+            return;
+        }
+
+        uint8_t* stage_tp[3]{};
+        for (int tp = 0; tp < 3; ++tp) {
+            DSV41_HIP_CHECK(hipEventSynchronize(ctx[tp].ev_radix_stage[ping]));
+            stage_tp[tp] = (ping == 0 || ctx[tp].h_radix_stage2 == nullptr)
+                ? ctx[tp].h_radix_stage
+                : ctx[tp].h_radix_stage2;
+        }
+
+        size_t stage_off = 0;
+        size_t slice_offs[16]{};
+        size_t slice_lens[16]{};
+        size_t entry_offs[16]{};
+        size_t chunk_bs[16]{};
+        int idx = 0;
+        size_t entry_off = 0;
+        for (int s = 0; s < 4; ++s) {
+            const size_t n_slots = (s < 3) ? 64u : 128u;
+            const size_t lens[4] = {n_slots * 256u, n_slots * 32u, n_slots * 64u, n_slots * 4u};
+            for (int c = 0; c < 4; ++c) {
+                const size_t chunk_b = lens[c];
+                slice_offs[idx] = stage_off;
+                slice_lens[idx] = size_t(nb) * chunk_b;
+                entry_offs[idx] = entry_off;
+                chunk_bs[idx]   = chunk_b;
+                stage_off += size_t(nb) * chunk_b;
+                entry_off += chunk_b;
+                ++idx;
+            }
+        }
+
+        #pragma omp parallel for schedule(static) num_threads(16) if(nb >= 4)
+        for (int k = 0; k < nb; ++k) {
+            const uint8_t* base_src = blk_arr[k]->data.data();
+            for (int q = 0; q < 16; ++q) {
+                const uint8_t* src_p = base_src + entry_offs[q];
+                const size_t chunk_b = chunk_bs[q];
+                const size_t dst_off = slice_offs[q] + size_t(k) * chunk_b;
+                std::memcpy(stage_tp[0] + dst_off, src_p, chunk_b);
+                std::memcpy(stage_tp[1] + dst_off, src_p, chunk_b);
+                std::memcpy(stage_tp[2] + dst_off, src_p, chunk_b);
+            }
+        }
+
+        for (int tp = 0; tp < 3; ++tp) {
+            DSV41_HIP_CHECK(hipSetDevice(tp));
+            auto& c = ctx[tp];
+            uint8_t* stage = stage_tp[tp];
+            int q = 0;
+            for (int s = 0; s < 4; ++s) {
+                const size_t n_slots = (s < 3) ? 64u : 128u;
+                const size_t sb = size_t(b0) * n_slots;
+                const size_t hot_cap = size_t(c.hot_comp_cap[s]);
+                if (sb < hot_cap) {
+                    DSV41_HIP_CHECK(hipMemcpyAsync(c.d_comp_kv_fp4[s] + sb * 256u, stage + slice_offs[q],
+                                                   slice_lens[q], hipMemcpyHostToDevice, c.stream));
+                    ++q;
+                    DSV41_HIP_CHECK(hipMemcpyAsync(c.d_comp_kv_e4m3[s] + sb * 32u, stage + slice_offs[q],
+                                                   slice_lens[q], hipMemcpyHostToDevice, c.stream));
+                    ++q;
+                } else {
+                    const size_t ext_sb = sb - hot_cap;
+                    std::memcpy(c.h_ext_comp_kv_fp4[s] + ext_sb * 256u, stage + slice_offs[q], slice_lens[q]);
+                    ++q;
+                    std::memcpy(c.h_ext_comp_kv_e4m3[s] + ext_sb * 32u, stage + slice_offs[q], slice_lens[q]);
+                    ++q;
+                }
+                DSV41_HIP_CHECK(hipMemcpyAsync(c.d_index_k_fp4[s] + sb * 64u, stage + slice_offs[q],
+                                               slice_lens[q], hipMemcpyHostToDevice, c.stream));
+                ++q;
+                DSV41_HIP_CHECK(hipMemcpyAsync(c.d_index_k_ue8m0[s] + sb * 4u, stage + slice_offs[q],
+                                               slice_lens[q], hipMemcpyHostToDevice, c.stream));
+                ++q;
+            }
+            DSV41_HIP_CHECK(hipEventRecord(c.ev_radix_stage[ping], c.stream));
+        }
+
+        for (int k = 0; k < nb; ++k) {
+            if (size_t(b0 + k) < gpu_slot_radix_keys.size()) {
+                gpu_slot_radix_keys[size_t(b0 + k)] = blk_arr[k]->key;
+            }
+        }
+        if (ctx[0].h_radix_stage2 != nullptr) {
+            ping ^= 1;
+        }
+    }
+
+    // Lookup longest matching chain of 128-token Radix blocks in Tier-0 DDR4 + Tier-1 NVMe (QD=16 pipelined pread + GPU SDMA!)
+    std::vector<std::shared_ptr<RadixBlockEntry>> lookup_radix_chain(
+        const int32_t* prompt_toks,
+        int max_blocks,
+        const uint64_t* block_extra_salts = nullptr,
+        int* out_nvme_blocks = nullptr,
+        double* out_nvme_read_ms = nullptr,
+        bool stream_nvme_to_gpus = false)
+    {
+        if (out_nvme_blocks) *out_nvme_blocks = 0;
+        if (out_nvme_read_ms) *out_nvme_read_ms = 0.0;
         std::vector<std::shared_ptr<RadixBlockEntry>> hits;
         if (max_blocks <= 0) return hits;
-        hits.reserve(max_blocks);
-        RadixKey128 key{};
-        for (int b = 0; b < max_blocks; ++b) {
-            const int32_t* blk_toks = prompt_toks + b * kRadixBlockTokens;
-            key = step_radix_hash(key, blk_toks);
+        hits.reserve(size_t(max_blocks));
 
-            auto it = radix_map.find(key);
+        std::vector<RadixKey128> chain_keys(static_cast<size_t>(max_blocks));
+        RadixKey128 key = root_radix_key();
+        for (int b = 0; b < max_blocks; ++b) {
+            const uint64_t salt = block_extra_salts ? block_extra_salts[b] : 0ULL;
+            key = step_radix_hash(key, prompt_toks + b * kRadixBlockTokens, salt);
+            chain_keys[size_t(b)] = key;
+        }
+
+        int b = 0;
+        while (b < max_blocks) {
+            const int32_t* blk_toks = prompt_toks + b * kRadixBlockTokens;
+            const uint64_t salt = block_extra_salts ? block_extra_salts[b] : 0ULL;
+            auto it = radix_map.find(chain_keys[size_t(b)]);
             if (it != radix_map.end() &&
-                std::memcmp(it->second->tokens.data(), blk_toks, kRadixBlockTokens * sizeof(int32_t)) == 0) {
+                it->second->extra_salt == salt &&
+                std::memcmp(it->second->tokens.data(), blk_toks, kRadixBlockTokens * sizeof(int32_t)) == 0)
+            {
                 hits.push_back(it->second);
+                ++b;
                 continue;
             }
+            break;
+        }
 
-            // On-demand Dual-NVMe GlobalPrefixCache check
-            const int drive = int(key.lo & 1ULL);
-            char fn[256];
-            std::snprintf(fn, sizeof(fn), "%s/%016llx_%016llx.rblk",
-                          nvme_radix_dirs[drive].c_str(),
-                          static_cast<unsigned long long>(key.lo),
-                          static_cast<unsigned long long>(key.hi));
-            std::ifstream in(fn, std::ios::binary);
-            if (!in) break;
-            auto entry = std::make_shared<RadixBlockEntry>();
-            entry->key = key;
-            in.read(reinterpret_cast<char*>(entry->tokens.data()), sizeof(entry->tokens));
-            if (!in || std::memcmp(entry->tokens.data(), blk_toks, sizeof(entry->tokens)) != 0) break;
-            in.read(reinterpret_cast<char*>(entry->data.data()), entry->data.size());
-            if (!in) break;
+        if (b < max_blocks && nvme_store.enabled()) {
+            const auto t_io0 = std::chrono::steady_clock::now();
+            int nvme_loaded = 0;
+            int ping = 0;
+            bool any_streamed_gpu = false;
+            std::vector<RadixKey128> touched_keys;
+            touched_keys.reserve(static_cast<size_t>(max_blocks - b));
+            while (b < max_blocks) {
+                const int b_start = b;
+                const int batch = std::min(64, max_blocks - b);
+                // Single contiguous allocation per 64-block batch avoids per-thread mmap_sem page-fault contention!
+                std::shared_ptr<RadixBlockEntry[]> slab(new RadixBlockEntry[static_cast<size_t>(batch)]);
+                std::vector<uint8_t> batch_ok(static_cast<size_t>(batch), 0u);
 
-            if (radix_map.size() >= kMaxDdr4RadixBlocks && !radix_fifo.empty()) {
-                radix_map.erase(radix_fifo.front());
-                radix_fifo.pop_front();
+                #pragma omp parallel for schedule(static) num_threads(16) if(batch >= 4)
+                for (int k = 0; k < batch; ++k) {
+                    const int idx = b_start + k;
+                    const int32_t* blk_toks = prompt_toks + idx * kRadixBlockTokens;
+                    const uint64_t salt = block_extra_salts ? block_extra_salts[idx] : 0ULL;
+                    if (nvme_store.read_block_pread(chain_keys[size_t(idx)], model_overlay_uuid,
+                                                    blk_toks, salt, slab[static_cast<size_t>(k)], false))
+                    {
+                        batch_ok[size_t(k)] = 1u;
+                    }
+                }
+
+                bool stopped = false;
+                int valid_nb = 0;
+                for (int k = 0; k < batch; ++k) {
+                    if (!batch_ok[size_t(k)]) {
+                        stopped = true;
+                        break;
+                    }
+                    std::shared_ptr<RadixBlockEntry> entry(slab, &slab[static_cast<size_t>(k)]);
+                    touched_keys.push_back(entry->key);
+                    if (radix_map.size() >= kMaxDdr4RadixBlocks && !radix_fifo.empty()) {
+                        radix_map.erase(radix_fifo.front());
+                        radix_fifo.pop_front();
+                    }
+                    radix_map[entry->key] = entry;
+                    radix_fifo.push_back(entry->key);
+                    hits.push_back(std::move(entry));
+                    ++nvme_loaded;
+                    ++valid_nb;
+                    ++b;
+                }
+                if (stream_nvme_to_gpus && valid_nb > 0) {
+                    stage_and_enqueue_radix_chunk_gpu(&hits[static_cast<size_t>(b_start)], b_start, valid_nb, ping);
+                    any_streamed_gpu = true;
+                }
+                if (stopped) break;
             }
-            radix_map[key] = entry;
-            radix_fifo.push_back(key);
-            hits.push_back(entry);
+            if (any_streamed_gpu) {
+                for (int tp = 0; tp < 3; ++tp) {
+                    DSV41_HIP_CHECK(hipSetDevice(tp));
+                    DSV41_HIP_CHECK(hipStreamSynchronize(ctx[tp].stream));
+                }
+            }
+            if (!touched_keys.empty()) {
+                {
+                    std::lock_guard<std::mutex> lk(nvme_mtx);
+                    nvme_touch_queue.insert(nvme_touch_queue.end(), touched_keys.begin(), touched_keys.end());
+                }
+                nvme_cv.notify_one();
+            }
+            const double dt_io = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_io0).count();
+            if (out_nvme_blocks) *out_nvme_blocks = nvme_loaded;
+            if (out_nvme_read_ms) *out_nvme_read_ms = dt_io;
         }
         return hits;
     }
@@ -3501,7 +4262,6 @@ struct Dsv41Runtime::Impl {
                    gpu_slot_radix_keys[size_t(b)] == k;
         };
 
-        uint8_t* stage_bufs[2] = {ctx[0].h_radix_stage, ctx[0].h_radix_stage2 ? ctx[0].h_radix_stage2 : ctx[0].h_radix_stage};
         int ping = 0;
         bool any_uploaded = false;
         int cur = 0;
@@ -3518,79 +4278,8 @@ struct Dsv41Runtime::Impl {
                 ++cur;
                 ++nb;
             }
-
-            // Wait for any previous H2D DMAs reading `stage_bufs[ping]` across all 3 ranks before overwriting it
-            for (int tp = 0; tp < 3; ++tp) {
-                DSV41_HIP_CHECK(hipEventSynchronize(ctx[tp].ev_radix_stage[ping]));
-            }
-            uint8_t* stage = stage_bufs[ping];
-
-            size_t stage_off = 0;
-            size_t slice_offs[16]{};
-            size_t slice_lens[16]{};
-
-            int idx = 0;
-            size_t entry_off = 0;
-            for (int s = 0; s < 4; ++s) {
-                const size_t n_slots = (s < 3) ? 64u : 128u;
-                const size_t lens[4] = {n_slots * 256u, n_slots * 32u, n_slots * 64u, n_slots * 4u};
-                for (int c = 0; c < 4; ++c) {
-                    const size_t chunk_b = lens[c];
-                    slice_offs[idx] = stage_off;
-                    slice_lens[idx] = size_t(nb) * chunk_b;
-                    #pragma omp parallel for num_threads(8) if(nb >= 16)
-                    for (int k = 0; k < nb; ++k) {
-                        std::memcpy(stage + stage_off + size_t(k) * chunk_b,
-                                    blocks[b0 + k]->data.data() + entry_off,
-                                    chunk_b);
-                    }
-                    stage_off += size_t(nb) * chunk_b;
-                    entry_off += chunk_b;
-                    ++idx;
-                }
-            }
-
-            for (int tp = 0; tp < 3; ++tp) {
-                DSV41_HIP_CHECK(hipSetDevice(tp));
-                auto& c = ctx[tp];
-                int q = 0;
-                for (int s = 0; s < 4; ++s) {
-                    const size_t n_slots = (s < 3) ? 64u : 128u;
-                    const size_t sb = size_t(b0) * n_slots;
-                    const size_t hot_cap = size_t(c.hot_comp_cap[s]);
-                    if (sb < hot_cap) {
-                        DSV41_HIP_CHECK(hipMemcpyAsync(c.d_comp_kv_fp4[s] + sb * 256u, stage + slice_offs[q],
-                                                       slice_lens[q], hipMemcpyHostToDevice, c.stream));
-                        ++q;
-                        DSV41_HIP_CHECK(hipMemcpyAsync(c.d_comp_kv_e4m3[s] + sb * 32u, stage + slice_offs[q],
-                                                       slice_lens[q], hipMemcpyHostToDevice, c.stream));
-                        ++q;
-                    } else {
-                        const size_t ext_sb = sb - hot_cap;
-                        std::memcpy(c.h_ext_comp_kv_fp4[s] + ext_sb * 256u, stage + slice_offs[q], slice_lens[q]);
-                        ++q;
-                        std::memcpy(c.h_ext_comp_kv_e4m3[s] + ext_sb * 32u, stage + slice_offs[q], slice_lens[q]);
-                        ++q;
-                    }
-                    DSV41_HIP_CHECK(hipMemcpyAsync(c.d_index_k_fp4[s] + sb * 64u, stage + slice_offs[q],
-                                                   slice_lens[q], hipMemcpyHostToDevice, c.stream));
-                    ++q;
-                    DSV41_HIP_CHECK(hipMemcpyAsync(c.d_index_k_ue8m0[s] + sb * 4u, stage + slice_offs[q],
-                                                   slice_lens[q], hipMemcpyHostToDevice, c.stream));
-                    ++q;
-                }
-                DSV41_HIP_CHECK(hipEventRecord(c.ev_radix_stage[ping], c.stream));
-            }
-
-            for (int k = 0; k < nb; ++k) {
-                if (size_t(b0 + k) < gpu_slot_radix_keys.size()) {
-                    gpu_slot_radix_keys[size_t(b0 + k)] = blocks[b0 + k]->key;
-                }
-            }
+            stage_and_enqueue_radix_chunk_gpu(&blocks[static_cast<size_t>(b0)], b0, nb, ping);
             any_uploaded = true;
-            if (ctx[0].h_radix_stage2 != nullptr) {
-                ping ^= 1;
-            }
         }
 
         if (any_uploaded) {
@@ -3608,7 +4297,8 @@ Dsv41Runtime::~Dsv41Runtime() = default;
 void Dsv41Runtime::reset_session_cache() {
     std::lock_guard<std::mutex> lk(gen_mtx_);
     if (impl_ && ready_) {
-        impl_->rewind_bank.clear();
+        impl_->encoder_state_map.clear();
+        impl_->encoder_state_fifo.clear();
         impl_->clear_gpu_kv_state();
     }
 }
@@ -3640,15 +4330,78 @@ void Dsv41Runtime::set_dspark_tree_width(int width_mode) {
     }
 }
 
+void Dsv41Runtime::set_dspark_tree16_max_context(int max_ctx) {
+    std::lock_guard<std::mutex> lk(gen_mtx_);
+    if (impl_) {
+        impl_->tree16_max_context = std::max(0, max_ctx);
+    }
+}
+
+void Dsv41Runtime::set_dspark_static_m8(bool enable) {
+    std::lock_guard<std::mutex> lk(gen_mtx_);
+    if (impl_) {
+        impl_->tree_static_m8 = enable;
+    }
+}
+
+void Dsv41Runtime::set_dspark_dyn8_max_depth(int max_depth) {
+    std::lock_guard<std::mutex> lk(gen_mtx_);
+    if (impl_) {
+        impl_->tree_dyn8_max_depth = std::clamp(max_depth, 2, 5);
+    }
+}
+
+void Dsv41Runtime::set_nvme_kv_cache(const std::string& cache_dir, double max_gb) {
+    std::lock_guard<std::mutex> lk(gen_mtx_);
+    if (impl_) {
+        const uint64_t max_bytes = (max_gb > 0.0)
+            ? static_cast<uint64_t>(max_gb * double(1ULL << 30))
+            : 0ULL;
+        impl_->nvme_store.configure(cache_dir, max_bytes);
+        if (impl_->nvme_store.enabled()) {
+            std::printf("[DSV41_RT] NVMe CSA2 KV Cache ENABLED: dir=%s cap=%.2f GiB (cur=%.2f MiB)\n",
+                        cache_dir.c_str(),
+                        double(max_bytes) / double(1ULL << 30),
+                        double(impl_->nvme_store.total_bytes()) / double(1ULL << 20));
+            std::fflush(stdout);
+        }
+    }
+}
+
+void Dsv41Runtime::flush_nvme_kv_cache() {
+    if (!impl_) return;
+    std::unique_lock<std::mutex> lk(impl_->nvme_mtx);
+    impl_->nvme_drained_cv.wait(lk, [&]() {
+        return impl_->stop_workers ||
+               (impl_->nvme_write_queue.empty() &&
+                impl_->nvme_touch_queue.empty() &&
+                !impl_->nvme_writing_active);
+    });
+}
+
 void Dsv41Runtime::clear_all_caches() {
     std::lock_guard<std::mutex> lk(gen_mtx_);
     if (impl_ && ready_) {
-        impl_->rewind_bank.clear();
+        impl_->encoder_state_map.clear();
+        impl_->encoder_state_fifo.clear();
         impl_->radix_map.clear();
         impl_->radix_fifo.clear();
         std::fill(impl_->gpu_slot_radix_keys.begin(), impl_->gpu_slot_radix_keys.end(), RadixKey128{});
         impl_->clear_gpu_kv_state();
     }
+}
+
+std::vector<float> Dsv41Runtime::last_logits_row0() const {
+    if (!impl_ || impl_->host_full_logits.size() < static_cast<size_t>(kVocabSize)) {
+        return {};
+    }
+    return std::vector<float>(
+        impl_->host_full_logits.begin(),
+        impl_->host_full_logits.begin() + kVocabSize);
+}
+
+bool Dsv41Runtime::vision_ready() const noexcept {
+    return ready_ && impl_ && impl_->vit_engine.ready();
 }
 
 void Dsv41Runtime::init(
@@ -3657,10 +4410,13 @@ void Dsv41Runtime::init(
     const std::string& p150_shm_name,
     int max_seq_len,
     const std::string& rarebal_overlay_path,
-    const std::string& capture_rarebal_dir)
+    const std::string& capture_rarebal_dir,
+    const std::string& vit_weights_path)
 {
     std::lock_guard<std::mutex> lk(gen_mtx_);
     impl_->max_seq_len = max_seq_len;
+    impl_->model_overlay_uuid = compute_model_overlay_uuid(mi50_packed_root, rarebal_overlay_path);
+    impl_->exported_radix_key = impl_->model_overlay_uuid;
     if (!rarebal_overlay_path.empty()) {
         impl_->rarebal_overlay_mmap = std::make_unique<SafetensorsMmap>(rarebal_overlay_path);
         std::printf("[DSV41_RT] Loaded RAREBAL-LDLQ hot-expert overlay mmap: %s (%zu tensors)\n",
@@ -3678,7 +4434,7 @@ void Dsv41Runtime::init(
     tokenizer_.build_engram_compressed_map(comp_map, comp_vocab);
     impl_->engram_cpu.init_hash_tables(comp_map, comp_vocab, max_seq_len);
 
-    // Mmap both 94.56 GiB Engram shards concurrently across Dual-NVMe controllers (NVMe0 + NVMe1)
+    // Mmap both 94.56 GiB Engram shards (Layer 1 on NVMe0, Layer 14 on NVMe1)
     for (int e_idx = 0; e_idx < 2; ++e_idx) {
         const int lid = (e_idx == 0) ? 1 : 14;
         const std::string meta_p = mi50_packed_root + "/engram_layer_" + std::to_string(lid) + ".table_path";
@@ -3879,8 +4635,32 @@ void Dsv41Runtime::init(
         (void)hipGetLastError();
     }
 
+    if (!vit_weights_path.empty()) {
+        impl_->vit_engine.init(vit_weights_path, 2);
+    }
+
+    double free_mib[3]{0.0, 0.0, 0.0};
+    for (int tp = 0; tp < 3; ++tp) {
+        DSV41_HIP_CHECK(hipSetDevice(tp));
+        size_t free_b = 0, total_b = 0;
+        DSV41_HIP_CHECK(hipMemGetInfo(&free_b, &total_b));
+        free_mib[tp] = double(free_b) / (1024.0 * 1024.0);
+    }
+    DSV41_HIP_CHECK(hipSetDevice(0));
+
+    // Pre-warm OpenMP 16-thread pool + 96 MiB glibc heap arena so cold-restart request #1 pays 0 page-fault overhead
+    #pragma omp parallel num_threads(16)
+    {
+        asm volatile("" ::: "memory");
+    }
+    {
+        std::vector<uint8_t> warm_arena(96u << 20, 1u);
+        asm volatile("" : : "r"(warm_arena.data()) : "memory");
+    }
+
     const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    std::printf("[DSV41_RT] Heterogeneous 3x MI50 + 2x Blackhole P150A + Pre-Faulted 189 GiB Engram READY in %.2f s!\n", dt);
+    std::printf("[DSV41_RT] Heterogeneous 3x MI50 (free HBM2: %.1f / %.1f / %.1f MiB, ViT=%d) + 2x Blackhole P150A + Pre-Faulted 189 GiB Engram READY in %.2f s!\n",
+                free_mib[0], free_mib[1], free_mib[2], impl_->vit_engine.ready() ? 1 : 0, dt);
     std::fflush(stdout);
     ready_ = true;
 }
@@ -3917,21 +4697,79 @@ bool Dsv41Runtime::capture_rarebal_corpus(const std::vector<int32_t>& corpus_ids
 }
 
 std::vector<int32_t> Dsv41Runtime::generate(
-    const std::vector<int32_t>& prompt_ids,
+    const std::vector<int32_t>& raw_prompt_ids,
     const Dsv41GenParams& params,
     TokenStreamCallback on_token,
     Dsv41GenStats& out_stats,
-    ProgressCallback on_progress)
+    ProgressCallback on_progress,
+    const std::vector<Dsv41ImageSource>* images)
 {
     std::lock_guard<std::mutex> lk(gen_mtx_);
     out_stats = Dsv41GenStats{};
-    if (!ready_ || prompt_ids.empty()) return {};
+    if (!ready_ || raw_prompt_ids.empty()) return {};
     impl_->reset_stage_timers();
+
+    const bool has_images = (images != nullptr && !images->empty());
+    std::vector<int32_t> expanded_prompt_ids;
+    std::vector<uint8_t> prompt_image_mask;
+    std::vector<Dsv41PreparedImage> prepared_images;
+    if (has_images) {
+        if (!impl_->vit_engine.ready()) {
+            throw std::runtime_error("Multimodal image input supplied, but Dsv41VitEngine is not initialized (--vit-weights)");
+        }
+        expand_deepseek_vl_prompt(raw_prompt_ids, *images, expanded_prompt_ids, prompt_image_mask, prepared_images);
+    } else {
+        for (int32_t t : raw_prompt_ids) {
+            if (t == kDsv41ImageTokenId) {
+                throw std::runtime_error("Prompt contains <｜deepseek_image｜> token without attached images");
+            }
+        }
+    }
+    const std::vector<int32_t>& prompt_ids = has_images ? expanded_prompt_ids : raw_prompt_ids;
 
     const int P = static_cast<int>(prompt_ids.size());
     if (P >= impl_->max_seq_len - 8) {
         throw std::runtime_error("Prompt length " + std::to_string(P) + " exceeds max_seq_len " + std::to_string(impl_->max_seq_len));
     }
+
+    const int num_prompt_blks = (P + kRadixBlockTokens - 1) / kRadixBlockTokens;
+    std::vector<uint64_t> prompt_block_salts(static_cast<size_t>(std::max(1, num_prompt_blks)), 0ULL);
+    if (has_images) {
+        for (size_t ii = 0; ii < prepared_images.size(); ++ii) {
+            const auto& img = prepared_images[ii];
+            if (img.span_len <= 0) continue;
+            const int b0 = img.span_start / kRadixBlockTokens;
+            const int b1 = (img.span_start + img.span_len - 1) / kRadixBlockTokens;
+            for (int b = b0; b <= b1 && static_cast<size_t>(b) < prompt_block_salts.size(); ++b) {
+                const int ov0 = std::max(b * kRadixBlockTokens, img.span_start) - img.span_start;
+                const uint64_t mix = img.cache_salt ^
+                                     (uint64_t(ii + 1u) * 0x9E3779B97F4A7C15ULL) ^
+                                     (uint64_t(uint32_t(ov0)) * 0xBF58476D1CE4E5B9ULL);
+                prompt_block_salts[static_cast<size_t>(b)] ^= mix;
+                if (prompt_block_salts[static_cast<size_t>(b)] == 0ULL) {
+                    prompt_block_salts[static_cast<size_t>(b)] = 1ULL;
+                }
+            }
+        }
+    }
+    const uint64_t* prompt_salts_ptr = has_images ? prompt_block_salts.data() : nullptr;
+
+    auto ensure_images_encoded_from = [&](int min_pos) {
+        if (!has_images) return;
+        for (auto& img : prepared_images) {
+            if ((img.span_start + img.span_len) > min_pos && img.merged_bf16.empty()) {
+                out_stats.vit_encode_ms += impl_->vit_engine.encode_prepared_image(img);
+                out_stats.images_encoded += 1;
+            }
+        }
+    };
+    auto sync_cached_salts_to = [&](int cur_len) {
+        const size_t n_blks = static_cast<size_t>((std::max(0, cur_len) + kRadixBlockTokens - 1) / kRadixBlockTokens);
+        impl_->cached_block_salts.resize(n_blks, 0ULL);
+        for (size_t b = 0; b < n_blks; ++b) {
+            impl_->cached_block_salts[b] = (b < prompt_block_salts.size()) ? prompt_block_salts[b] : 0ULL;
+        }
+    };
 
     struct DpmWarmGuard {
         Dsv41Runtime::Impl* impl;
@@ -3957,10 +4795,10 @@ std::vector<int32_t> Dsv41Runtime::generate(
     } dpm_guard(impl_.get());
 
     out_stats.prompt_tokens = P;
-    if (impl_->rarebal_collector) {
+    if (impl_->rarebal_collector && !has_images) {
         impl_->run_rarebal_capture_on_prompt(prompt_ids, on_progress);
     }
-    const int ced_split = (P > kWindowSize) ? (((P - kWindowSize) / 2) * 2) : 0;
+    const int ced_split = (P > kDeepInferKeepTokens) ? (((P - kDeepInferKeepTokens) / 2) * 2) : 0;
 
     std::mt19937_64 rng;
     if (params.seed != 0) {
@@ -3971,10 +4809,10 @@ std::vector<int32_t> Dsv41Runtime::generate(
                  uint64_t(std::chrono::high_resolution_clock::now().time_since_epoch().count()));
     }
 
-    // 1. Multi-Tier Prefix Reuse Hierarchy:
+    // 1. DeepInfer Multi-Tier Pure-Block Prefix Reuse Hierarchy:
     //    Tier 0: Exact in-VRAM LCP continuation (0.00 ms, even OR odd boundary!)
-    //    Tier 1: RewindBank 32-snapshot ring (< 0.5 ms single-slab DMA)
-    //    Tier 2: DDR4 RadixBlockCache + Dual-NVMe GlobalPrefixCache (890 B/tok) + 128-token SWA Bounded Replay!
+    //    Tier 1: In-RAM 20-Layer EncoderStateBlock (1.35 MiB/slot, 0 decoder SWA cached) + DDR4/NVMe CSA2 Block KV
+    //    Tier 2: Pure-Block NVMe CSA2 KV (.kvblk @ 890 B/tok, 0 B SWA on disk) + KEEP_TOKENS=140 + 128-tok Encoder SWA Bounded Replay!
     auto mono_ns = []() -> int64_t {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(
                    std::chrono::steady_clock::now().time_since_epoch())
@@ -3984,7 +4822,11 @@ std::vector<int32_t> Dsv41Runtime::generate(
     const int64_t t_reuse_begin_ns = mono_ns();
     size_t lcp = 0;
     const size_t max_match = std::min(impl_->cached_tokens.size(), prompt_ids.size() > 1 ? prompt_ids.size() - 1 : 0);
-    while (lcp < max_match && impl_->cached_tokens[lcp] == prompt_ids[lcp]) {
+    while (lcp < max_match &&
+           impl_->cached_tokens[lcp] == prompt_ids[lcp] &&
+           impl_->get_cached_blk_salt(static_cast<int>(lcp) / kRadixBlockTokens) ==
+               prompt_block_salts[lcp / static_cast<size_t>(kRadixBlockTokens)])
+    {
         ++lcp;
     }
 
@@ -3992,75 +4834,98 @@ std::vector<int32_t> Dsv41Runtime::generate(
     if (!impl_->cached_tokens.empty() && lcp == impl_->cached_tokens.size()) {
         // Tier 0: Exact in-VRAM continuation (including odd/even multi-turn tool loop!)
         pos = static_cast<int>(lcp);
+        sync_cached_salts_to(pos);
     } else {
-        // Find best matching RewindBank snapshot strictly < P
-        const RewindSnapshot* best_snap = nullptr;
-        for (const auto& s : impl_->rewind_bank) {
-            if (s.pos < P && s.pos > (best_snap ? best_snap->pos : 0)) {
-                if (std::memcmp(s.tokens.data(), prompt_ids.data(), size_t(s.pos) * sizeof(int32_t)) == 0) {
-                    best_snap = &s;
-                }
-            }
-        }
+        const auto t_nvme_all0 = std::chrono::steady_clock::now();
+        const int L_cap = std::max(0, P - kDeepInferKeepTokens);
+        const int max_rblks = L_cap / kRadixBlockTokens;
+        int nvme_blk_hits = 0;
+        double nvme_blk_read_ms = 0.0;
+        auto radix_hits = impl_->lookup_radix_chain(
+            prompt_ids.data(), max_rblks, prompt_salts_ptr, &nvme_blk_hits, &nvme_blk_read_ms, /*stream_nvme_to_gpus=*/true);
+        const int hit_blks = static_cast<int>(radix_hits.size());
+        const int L1 = hit_blks * kRadixBlockTokens;
 
-        // Lookup 128-token RadixBlockCache chain up to (P - 1) / 128
-        const int max_rblks = (P - 1) / kRadixBlockTokens;
-        auto radix_hits = impl_->lookup_radix_chain(prompt_ids.data(), max_rblks);
-        const int R = static_cast<int>(radix_hits.size()) * kRadixBlockTokens;
-        const int snap_pos = best_snap ? best_snap->pos : 0;
-
-        if (best_snap && snap_pos >= R - kWindowSize) {
-            // Tier 1: RewindBank avoids SWA Bounded Replay! Also refresh Global KV if current GPU cache diverged < snap_pos
-            const bool need_global_dma = (static_cast<int>(lcp) < snap_pos);
-            std::vector<std::shared_ptr<RadixBlockEntry>> snap_rblks;
-            const int needed_blks = snap_pos / kRadixBlockTokens;
-            if (need_global_dma && static_cast<int>(radix_hits.size()) >= needed_blks) {
-                snap_rblks.assign(radix_hits.begin(), radix_hits.begin() + needed_blks);
-                impl_->restore_rewind_snapshot_gpu(*best_snap, true, snap_rblks);
-                pos = snap_pos;
-            } else if (!need_global_dma) {
-                impl_->restore_rewind_snapshot_gpu(*best_snap, false, snap_rblks);
-                pos = snap_pos;
-            }
-        }
-
-        if (pos == 0 && R > 0) {
-            // Tier 2: Restore Global KV for [0..R) via coalesced PCIe DMA + 128-token SWA Bounded Replay on [R-128..R)!
+        if (L1 > 0) {
             impl_->clear_gpu_kv_state();
             impl_->restore_radix_blocks_gpu(radix_hits);
-            impl_->engram_cpu.compute_hashes(prompt_ids.data(), R - kWindowSize, 0, nullptr, impl_->engram_hashes_buf);
-
-            const int replay_start = R - kWindowSize;
-            const bool replay_enc_only = (R <= ced_split);
-            const bool replay_seed_mtp = (!replay_enc_only);
-            if (!replay_enc_only) {
-                impl_->win_valid_from_20_39 = replay_start;
+            if (nvme_blk_hits > 0) {
+                out_stats.nvme_hit_tokens = nvme_blk_hits * kRadixBlockTokens;
+                out_stats.nvme_hydrate_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t_nvme_all0).count();
             }
 
-            impl_->forward_backbone_chunk(
-                prompt_ids.data() + replay_start,
-                replay_start,
-                kWindowSize,
-                replay_enc_only,
-                0,
-                true,             // commit_window_immediately
-                replay_seed_mtp,  // capture_dspark_hidden
-                replay_start,     // chunk_swa_floor = R - 128!
-                true              // skip_global_kv_write = true!
-            );
-            if (replay_enc_only) {
-                impl_->win_valid_from_20_39 = R;
+            const RadixKey128 last_key = radix_hits.back()->key;
+            auto enc_it = impl_->encoder_state_map.find(last_key);
+            if (enc_it != impl_->encoder_state_map.end() && enc_it->second && enc_it->second->pos == L1) {
+                // Tier 1: In-RAM 20-Layer EncoderStateBlock hit at L1 (0 SWA replay tokens!)
+                impl_->restore_encoder_state_block_gpu(*enc_it->second);
+                impl_->engram_cpu.compute_hashes(
+                    prompt_ids.data(), L1, 0,
+                    has_images ? prompt_image_mask.data() : nullptr,
+                    impl_->engram_hashes_buf);
+                impl_->win_valid_from_20_39 = L1;
+                impl_->cached_tokens.assign(prompt_ids.begin(), prompt_ids.begin() + L1);
+                sync_cached_salts_to(L1);
+                impl_->exported_radix_blocks = hit_blks;
+                impl_->exported_radix_key = last_key;
+                pos = L1;
+                out_stats.radix_hit_tokens = L1;
+                out_stats.swa_replay_tokens = 0;
             } else {
-                impl_->update_mtp_window_from_target_hidden(replay_start, kWindowSize, 0);
-            }
+                // Tier 2: Cold NVMe / RAM Block KV hit -> keep hydrated CSA2 Block KV [0..L1) untouched
+                // (`skip_global_kv_write = true`) and run 128-token Encoder SWA Bounded Replay on [L_eff .. L1)!
+                int L_eff = std::max(0, L1 - kWindowSize);
+                if (has_images) {
+                    bool adjusted = true;
+                    while (adjusted) {
+                        adjusted = false;
+                        for (const auto& img : prepared_images) {
+                            if (img.span_len > 0 && img.span_start < L_eff && L_eff < img.span_start + img.span_len) {
+                                L_eff = (img.span_start / kRadixBlockTokens) * kRadixBlockTokens;
+                                adjusted = true;
+                            }
+                        }
+                    }
+                }
+                ensure_images_encoded_from(L_eff);
+                if (L_eff > 0) {
+                    impl_->engram_cpu.compute_hashes(
+                        prompt_ids.data(), L_eff, 0,
+                        has_images ? prompt_image_mask.data() : nullptr,
+                        impl_->engram_hashes_buf);
+                }
 
-            impl_->cached_tokens.assign(prompt_ids.begin(), prompt_ids.begin() + R);
-            impl_->exported_radix_blocks = static_cast<int>(radix_hits.size());
-            impl_->exported_radix_key = radix_hits.back()->key;
-            pos = R;
-            out_stats.radix_hit_tokens = R;
-            out_stats.swa_replay_tokens = kWindowSize;
-        } else if (pos == 0) {
+                int rep_pos = L_eff;
+                while (rep_pos < L1) {
+                    const int rep_m = std::min(L1 - rep_pos, kMaxChunkM);
+                    impl_->forward_backbone_chunk(
+                        prompt_ids.data() + rep_pos,
+                        rep_pos,
+                        rep_m,
+                        true,           // encoder_only = true (20L CED only!)
+                        0,
+                        true,           // commit_window_immediately
+                        false,          // capture_dspark_hidden = false
+                        L_eff,          // chunk_swa_floor = L_eff (max(L_eff, i - 127) .. i)
+                        true,           // skip_global_kv_write = true (hydrated CSA2 Block KV untouched!)
+                        {}, 0ULL, 0ULL, nullptr, nullptr,
+                        has_images ? (prompt_image_mask.data() + rep_pos) : nullptr,
+                        has_images ? &prepared_images : nullptr
+                    );
+                    rep_pos += rep_m;
+                }
+                impl_->capture_encoder_state_at_exact_128_gpu(L1, last_key);
+                impl_->win_valid_from_20_39 = L1;
+                impl_->cached_tokens.assign(prompt_ids.begin(), prompt_ids.begin() + L1);
+                sync_cached_salts_to(L1);
+                impl_->exported_radix_blocks = hit_blks;
+                impl_->exported_radix_key = last_key;
+                pos = L1;
+                out_stats.radix_hit_tokens = L1;
+                out_stats.swa_replay_tokens = L1 - L_eff;
+            }
+        } else {
             impl_->clear_gpu_kv_state();
         }
     }
@@ -4085,11 +4950,17 @@ std::vector<int32_t> Dsv41Runtime::generate(
         }
     }
 
-    // 2. Strict 20-Layer CED Early-Exit Prefill over [pos .. P - 1]:
+    // Encode any uncached visual spans overlapping [pos .. P) on tp=2 Dsv41VitEngine!
+    ensure_images_encoded_from(pos);
+    sync_cached_salts_to(P);
+
+    // 2. Strict 20-Layer CED Early-Exit Prefill over [pos .. P - 1] with KEEP_TOKENS = 140:
     //    - Phase A [pos .. ced_split): 20-layer Encoder-Only + Layer 20 Compressor/Indexer.k (kMaxChunkM = 512)!
-    //    - Phase B [max(pos, ced_split) .. P): Final <= 129 tokens run full 40-layer Decoder + seed DSpark MTP window!
+    //    - Phase B [max(pos, ced_split) .. P): Final >= 140 tokens run full 40-layer Decoder (Decoder SWA Bounded Replay)!
+    const int ced_128_top = (ced_split / kRadixBlockTokens) * kRadixBlockTokens;
     while (pos < ced_split) {
-        const int rem_enc = ced_split - pos;
+        const int target_top = (pos < ced_128_top) ? ced_128_top : ced_split;
+        const int rem_enc = target_top - pos;
         int chunk_m = std::min(rem_enc, kMaxChunkM);
         // Align odd `pos` back to an even r=2 boundary on the first encoder chunk!
         if ((pos & 1) != 0) {
@@ -4105,13 +4976,21 @@ std::vector<int32_t> Dsv41Runtime::generate(
             true,   // encoder_only = true!
             0,
             true,
-            false
+            false,
+            0,
+            false,
+            {}, 0ULL, 0ULL, nullptr, nullptr,
+            has_images ? (prompt_image_mask.data() + pos) : nullptr,
+            has_images ? &prepared_images : nullptr
         );
         impl_->cached_tokens.insert(impl_->cached_tokens.end(),
                                     prompt_ids.begin() + pos,
                                     prompt_ids.begin() + pos + chunk_m);
         pos += chunk_m;
         impl_->win_valid_from_20_39 = pos;
+        if (pos / kRadixBlockTokens > impl_->exported_radix_blocks) {
+            impl_->export_new_radix_blocks();
+        }
         const int64_t tc1_ns = mono_ns();
         if (on_progress) {
             Dsv41ProgressUpdate upd{};
@@ -4124,14 +5003,17 @@ std::vector<int32_t> Dsv41Runtime::generate(
             upd.begin_ns = tc0_ns;
             upd.end_ns = tc1_ns;
             if (!on_progress(upd)) {
+                sync_cached_salts_to(pos);
                 impl_->export_new_radix_blocks();
                 return {};
             }
         }
     }
 
+    const int p_128_top = (P / kRadixBlockTokens) * kRadixBlockTokens;
     while (pos < P) {
-        const int rem_dec = P - pos;
+        const int target_top = (pos < p_128_top && p_128_top < P) ? p_128_top : P;
+        const int rem_dec = target_top - pos;
         int chunk_m = std::min(rem_dec, kMaxDecChunkM);
         if (pos + chunk_m < P && ((pos + chunk_m) & 1) != 0 && chunk_m > 1) {
             --chunk_m;
@@ -4147,7 +5029,12 @@ std::vector<int32_t> Dsv41Runtime::generate(
             false,  // full 40-layer Decoder!
             is_last_chunk ? 1 : 0,
             true,
-            need_mtp_seed
+            need_mtp_seed,
+            0,
+            false,
+            {}, 0ULL, 0ULL, nullptr, nullptr,
+            has_images ? (prompt_image_mask.data() + pos) : nullptr,
+            has_images ? &prepared_images : nullptr
         );
 
         if (need_mtp_seed) {
@@ -4162,6 +5049,9 @@ std::vector<int32_t> Dsv41Runtime::generate(
                                     prompt_ids.begin() + pos,
                                     prompt_ids.begin() + pos + chunk_m);
         pos += chunk_m;
+        if (pos / kRadixBlockTokens > impl_->exported_radix_blocks) {
+            impl_->export_new_radix_blocks();
+        }
         const int64_t tc1_ns = mono_ns();
         if (on_progress) {
             Dsv41ProgressUpdate upd{};
@@ -4174,16 +5064,16 @@ std::vector<int32_t> Dsv41Runtime::generate(
             upd.begin_ns = tc0_ns;
             upd.end_ns = tc1_ns;
             if (!on_progress(upd)) {
+                sync_cached_salts_to(pos);
                 impl_->export_new_radix_blocks();
-                impl_->save_rewind_snapshot();
                 return {};
             }
         }
     }
 
-    // Export newly completed 128-token Radix blocks + save post-prefill RewindBank snapshot!
+    sync_cached_salts_to(P);
+    // Export newly completed 128-token CSA2 blocks (0 B SWA written to NVMe)!
     impl_->export_new_radix_blocks();
-    impl_->save_rewind_snapshot();
 
     // Sample first generated token `cur_anchor` (for position P) from prefill logits!
     std::vector<int32_t> generated;
@@ -4248,18 +5138,85 @@ std::vector<int32_t> Dsv41Runtime::generate(
         return think_guard.observe_think_token(tok);
     };
 
+    struct AsyncPostProcScope {
+        Impl* im = nullptr;
+        AsyncPostProcScope(Impl* p, const TokenStreamCallback& cb) : im(p) {
+            std::lock_guard<std::mutex> lk(im->pp_mtx);
+            im->pp_queue.clear();
+            im->pp_active_cb = cb ? &cb : nullptr;
+            im->pp_aborted = false;
+            im->pp_stop_gen_len = 0;
+        }
+        void enqueue_batch(const Impl::PostProcItem* items, size_t count) {
+            if (!im || !im->pp_active_cb || count == 0) return;
+            {
+                std::lock_guard<std::mutex> lk(im->pp_mtx);
+                if (im->pp_aborted) return;
+                for (size_t i = 0; i < count; ++i) {
+                    im->pp_queue.push_back(items[i]);
+                }
+            }
+            im->pp_cv.notify_one();
+        }
+        void enqueue_one(int32_t tok_id, size_t gen_len_after) {
+            const Impl::PostProcItem it{tok_id, gen_len_after};
+            enqueue_batch(&it, 1);
+        }
+        bool wait_idle(size_t& out_stop_len) {
+            if (!im || !im->pp_active_cb) return true;
+            std::unique_lock<std::mutex> lk(im->pp_mtx);
+            im->pp_done_cv.wait(lk, [&]() { return im->pp_queue.empty() && !im->pp_busy; });
+            if (im->pp_aborted) {
+                out_stop_len = im->pp_stop_gen_len;
+                return false;
+            }
+            return true;
+        }
+        void detach_and_drain() {
+            if (!im) return;
+            std::unique_lock<std::mutex> lk(im->pp_mtx);
+            im->pp_done_cv.wait(lk, [&]() { return im->pp_queue.empty() && !im->pp_busy; });
+            im->pp_active_cb = nullptr;
+        }
+        ~AsyncPostProcScope() { detach_and_drain(); }
+    } async_pp(impl_.get(), on_token);
+
+    auto sync_prev_postproc = [&]() -> bool {
+        size_t stop_len = 0;
+        if (!async_pp.wait_idle(stop_len)) {
+            if (stop_len < generated.size()) {
+                generated.resize(stop_len);
+            }
+            out_stats.completion_tokens = static_cast<int>(generated.size());
+            if (static_cast<size_t>(P) + generated.size() != impl_->cached_tokens.size()) {
+                impl_->cached_tokens.clear();
+                impl_->cached_block_salts.clear();
+                impl_->pending_enc_state.reset();
+                impl_->engram_anchor_pos = -1;
+                impl_->engram_anchor_tok = -1;
+                impl_->win_valid_from_20_39 = 0;
+                impl_->mtp_window_seeded = false;
+            }
+            return false;
+        }
+        return true;
+    };
+
     generated.push_back(cur_anchor);
     out_stats.completion_tokens = 1;
     bool keep_going = true;
     if (cur_anchor == Dsv41SpecialTokens::kEos) {
         keep_going = false;
-    } else if (on_token && !on_token(cur_anchor)) {
-        keep_going = false;
     } else {
         (void)observe_tok_with_guard(cur_anchor);
+        impl_->enqueue_anchor_engram_prefetch(cur_anchor, P);
+        async_pp.enqueue_one(cur_anchor, generated.size());
     }
 
     auto execute_force_close_think = [&](const ThinkGuardDecision& gd) -> bool {
+        if (!sync_prev_postproc()) {
+            return false;
+        }
         const int G = static_cast<int>(generated.size());
         const int rew = std::min<int>(static_cast<int>(gd.rewind_tokens), std::max(0, G - 1));
         const int keep_gen = G - rew;
@@ -4294,6 +5251,16 @@ std::vector<int32_t> Dsv41Runtime::generate(
         }
         impl_->win_valid_from_20_39 = std::max(impl_->win_valid_from_20_39, replay_start);
 
+        std::vector<uint8_t> replay_img_mask;
+        if (has_images && replay_start < P) {
+            ensure_images_encoded_from(replay_start);
+            replay_img_mask.assign(static_cast<size_t>(total_m), 0u);
+            for (int p_idx = replay_start; p_idx < std::min(P, target_pos); ++p_idx) {
+                replay_img_mask[static_cast<size_t>(p_idx - replay_start)] =
+                    prompt_image_mask[static_cast<size_t>(p_idx)];
+            }
+        }
+
         const auto trw0 = std::chrono::steady_clock::now();
         impl_->forward_backbone_chunk(
             replay_buf.data(),
@@ -4304,7 +5271,10 @@ std::vector<int32_t> Dsv41Runtime::generate(
             true,          // commit_window_immediately = true
             true,          // capture_dspark_hidden = true
             replay_start,  // chunk_swa_floor = replay_start (zero stale SWA reads)
-            false          // refresh Global KV & r=2 state cleanly from even replay_start
+            false,         // refresh Global KV & r=2 state cleanly from even replay_start
+            {}, 0ULL, 0ULL, nullptr, nullptr,
+            replay_img_mask.empty() ? nullptr : replay_img_mask.data(),
+            has_images ? &prepared_images : nullptr
         );
         const int post_close_pos = target_pos + M_close;
         const int mtp_seed_start = std::max(replay_start, post_close_pos - kWindowSize);
@@ -4323,14 +5293,17 @@ std::vector<int32_t> Dsv41Runtime::generate(
             impl_->cached_tokens.push_back(cid);
             generated.push_back(cid);
         }
+        sync_cached_salts_to(post_close_pos);
 
         const int clean_full_blks = replay_start / kRadixBlockTokens;
         if (impl_->exported_radix_blocks > clean_full_blks) {
             impl_->exported_radix_blocks = 0;
-            impl_->exported_radix_key = RadixKey128{};
+            impl_->exported_radix_key = impl_->root_radix_key();
             for (int b = 0; b < clean_full_blks; ++b) {
                 impl_->exported_radix_key = step_radix_hash(
-                    impl_->exported_radix_key, impl_->cached_tokens.data() + b * kRadixBlockTokens);
+                    impl_->exported_radix_key,
+                    impl_->cached_tokens.data() + b * kRadixBlockTokens,
+                    impl_->get_cached_blk_salt(b));
                 impl_->exported_radix_blocks = b + 1;
             }
         }
@@ -4363,17 +5336,19 @@ std::vector<int32_t> Dsv41Runtime::generate(
 
         generated.push_back(cur_anchor);
         out_stats.completion_tokens = static_cast<int>(generated.size());
-        if (cur_anchor == Dsv41SpecialTokens::kEos || (on_token && !on_token(cur_anchor))) {
+        if (cur_anchor == Dsv41SpecialTokens::kEos) {
             return false;
         }
+        impl_->enqueue_anchor_engram_prefetch(cur_anchor, static_cast<int>(impl_->cached_tokens.size()));
+        async_pp.enqueue_one(cur_anchor, generated.size());
         return true;
     };
 
-    // 3. Decode Loop: 3-Stage DSpark Speculative Decoding (M <= 6 Chain / Entropy-Adaptive M = 8 <-> M = 16 Causal Tree)
+    // 3. Decode Loop: 3-Stage DSpark Speculative Decoding (M <= 6 Chain / Single-Pass ConfidenceHead Dynamic M = 8 / DeepSelect M = 16 Causal Tree)
     std::uniform_real_distribution<float> uni01(0.0f, 1.0f);
     std::uniform_real_distribution<double> uni01_f64(0.0, 1.0);
     std::vector<float> residual_probs(kVocabSize);
-    Dsv41AdaptiveTreeWidthController tree_ctrl(impl_->tree_width_mode);
+    Dsv41AdaptiveTreeWidthController tree_ctrl(impl_->tree_width_mode, impl_->tree16_max_context);
 
     while (keep_going && static_cast<int>(generated.size()) < params.max_new_tokens) {
         const int cur_pos = static_cast<int>(impl_->cached_tokens.size());
@@ -4384,12 +5359,17 @@ std::vector<int32_t> Dsv41Runtime::generate(
 
         if (!run_spec) {
             // Single-token M=1 step
+            if (!sync_prev_postproc()) break;
             const auto tb0 = std::chrono::steady_clock::now();
             impl_->forward_backbone_chunk(&cur_anchor, cur_pos, 1, false, 1, true, true);
             impl_->update_mtp_window_from_target_hidden(cur_pos, 1, 0);
             const auto tb1 = std::chrono::steady_clock::now();
             out_stats.dec_backbone_ms += std::chrono::duration<double, std::milli>(tb1 - tb0).count();
             impl_->cached_tokens.push_back(cur_anchor);
+            if (static_cast<int>(impl_->cached_tokens.size()) / kRadixBlockTokens > impl_->exported_radix_blocks) {
+                sync_cached_salts_to(static_cast<int>(impl_->cached_tokens.size()));
+                impl_->export_new_radix_blocks();
+            }
 
             float* l0 = impl_->host_full_logits.data();
             Impl::apply_rep_penalty_inplace(l0, impl_->cached_tokens, params.repetition_penalty);
@@ -4399,9 +5379,11 @@ std::vector<int32_t> Dsv41Runtime::generate(
             generated.push_back(next_tok);
             out_stats.completion_tokens = static_cast<int>(generated.size());
             cur_anchor = next_tok;
-            if (next_tok == Dsv41SpecialTokens::kEos || (on_token && !on_token(next_tok))) {
+            if (next_tok == Dsv41SpecialTokens::kEos) {
                 break;
             }
+            impl_->enqueue_anchor_engram_prefetch(cur_anchor, static_cast<int>(impl_->cached_tokens.size()));
+            async_pp.enqueue_one(next_tok, generated.size());
             const auto gd = observe_tok_with_guard(next_tok);
             if (gd.action == ThinkGuardAction::kForceCloseThink) {
                 if (!execute_force_close_think(gd)) {
@@ -4411,34 +5393,46 @@ std::vector<int32_t> Dsv41Runtime::generate(
             continue;
         }
 
-        // A. Draft B (1..5) linear chain OR high-entropy M = 8 / M = 16 causal tree using 3-stage DSpark on 3x MI50!
-        const int desired_tree = tree_ctrl.select_width(think_guard.in_think());
+        // A. Draft B (1..5) linear chain OR single-pass ConfidenceHead Dynamic M = 8 / DeepSelect M = 16 causal tree using 3-stage DSpark on 3x MI50!
+        const int desired_tree = tree_ctrl.select_width(think_guard.in_think(), cur_pos);
         const int target_tree_nodes = (rem_budget < 4) ? 0 : ((desired_tree == 16 && rem_budget >= 6) ? 16 : 8);
         int used_tree_nodes = 0;
         std::array<int32_t, kMaxTreeNodes> tree_verify_tokens{};
+        Dsv41DeepSelectPlan16 t16_plan{};
+        Dsv41DeepSelectPlan8  t8_plan{};
         const auto td0 = std::chrono::steady_clock::now();
         std::array<int32_t, kDSparkBlockSize> drafts{};
         int B = impl_->forward_dspark_draft(
             cur_anchor, cur_pos, params.temperature, params.top_p, params.repetition_penalty, rng, drafts,
-            target_tree_nodes, rem_budget, &used_tree_nodes, &tree_verify_tokens);
+            target_tree_nodes, rem_budget, &used_tree_nodes, &tree_verify_tokens, &t16_plan, &t8_plan);
         const auto td1 = std::chrono::steady_clock::now();
         out_stats.dec_dspark_ms += std::chrono::duration<double, std::milli>(td1 - td0).count();
 
         if (used_tree_nodes == 8 || used_tree_nodes == 16) {
-            const bool is_t16 = (used_tree_nodes == 16);
-            const int max_tree_depth = is_t16 ? 5 : 3;
-            out_stats.dspark_steps += 1;
-            out_stats.dspark_tree_steps += 1;
-            if (is_t16) out_stats.dspark_tree16_steps += 1;
-            out_stats.dspark_drafted += uint64_t(max_tree_depth);
+            const bool is_t16  = (used_tree_nodes == 16);
+            const bool is_dyn8 = (!is_t16 && !impl_->tree_static_m8);
+            const int max_tree_depth = is_t16
+                ? std::clamp(t16_plan.max_depth, 1, 5)
+                : (is_dyn8 ? std::clamp(t8_plan.max_depth, 1, 5) : 3);
 
-            const int32_t*  tree_parents = is_t16 ? kTree16Parents.data() : kTree8Parents.data();
-            const uint32_t* tree_depths  = is_t16 ? kTree16Depths.data()  : kTree8Depths.data();
-            const TreeAncMask256 anc_mask = is_t16 ? kTree16AncMask256 : kTree8AncMask256;
-            const uint64_t depth_nib = is_t16 ? kTree16DepthNibbles64  : kTree8DepthNibbles64;
-            const uint64_t par_nib   = is_t16 ? kTree16ParentNibbles64 : kTree8ParentNibbles64;
+            const int32_t*  tree_parents = is_t16
+                ? t16_plan.parents.data()
+                : (is_dyn8 ? t8_plan.parents.data() : kTree8Parents.data());
+            const uint32_t* tree_depths  = is_t16
+                ? t16_plan.depths.data()
+                : (is_dyn8 ? t8_plan.depths.data() : kTree8Depths.data());
+            const TreeAncMask256 anc_mask = is_t16
+                ? t16_plan.anc_mask256
+                : (is_dyn8 ? widen_tree8_anc_mask64(t8_plan.anc_mask64) : kTree8AncMask256);
+            const uint64_t depth_nib = is_t16
+                ? t16_plan.depth_nibbles64
+                : (is_dyn8 ? uint64_t(t8_plan.depth_nibbles32) : kTree8DepthNibbles64);
+            const uint64_t par_nib   = is_t16
+                ? t16_plan.parent_nibbles64
+                : (is_dyn8 ? uint64_t(t8_plan.parent_nibbles32) : kTree8ParentNibbles64);
 
-            // B_tree. Verify all M = 8 or M = 16 causal-tree nodes in ONE backbone pass across 3x MI50 + 2x P150A!
+            // B_tree. Verify all M = 8 or M = 16 causal-tree nodes in ONE backbone pass across 3x MI50 + 2x P150A
+            //         while postproc_worker_thread finishes step N-1 UTF-8/DSML/SSE on CPU!
             const auto tb0 = std::chrono::steady_clock::now();
             impl_->forward_backbone_chunk(
                 tree_verify_tokens.data(),
@@ -4459,24 +5453,34 @@ std::vector<int32_t> Dsv41Runtime::generate(
             const auto tb1 = std::chrono::steady_clock::now();
             out_stats.dec_backbone_ms += std::chrono::duration<double, std::milli>(tb1 - tb0).count();
 
-            // C_tree. Lossless Kolmogorov Dirac causal-tree verification (TV < 1e-15, strictly ancestor-only rep penalty!)
-            for (int u = 0; u < used_tree_nodes; ++u) {
-                int32_t anc_toks[6]{};
-                int p = u;
-                while (p >= 0) {
-                    anc_toks[tree_depths[size_t(p)]] = tree_verify_tokens[size_t(p)];
-                    p = tree_parents[size_t(p)];
+            if (!sync_prev_postproc()) break;
+
+            out_stats.dspark_steps += 1;
+            out_stats.dspark_tree_steps += 1;
+            if (is_t16) out_stats.dspark_tree16_steps += 1;
+            else if (is_dyn8) out_stats.dspark_tree_dyn8_steps += 1;
+            out_stats.dspark_drafted += uint64_t(max_tree_depth);
+
+            // C_tree. Lazy visited-path Kolmogorov Dirac causal-tree verification (TV < 1e-15, ~75% less host softmax!)
+            std::array<bool, kMaxTreeNodes> node_probs_ready{};
+            auto get_node_probs = [&](std::uint32_t cur_u) -> const double* {
+                const size_t u = static_cast<size_t>(cur_u);
+                double* p_dst = impl_->host_tree_probs_f64.data() + u * size_t(kVocabSize);
+                if (!node_probs_ready[u]) {
+                    int32_t anc_toks[16]{};
+                    int p = static_cast<int>(u);
+                    while (p >= 0) {
+                        anc_toks[tree_depths[size_t(p)]] = tree_verify_tokens[size_t(p)];
+                        p = tree_parents[size_t(p)];
+                    }
+                    const size_t anc_len = size_t(tree_depths[u] + 1u);
+                    float* u_logits = impl_->host_full_logits.data() + u * size_t(kVocabSize);
+                    Impl::apply_rep_penalty_span(u_logits, impl_->cached_tokens, anc_toks, anc_len, params.repetition_penalty);
+                    Impl::build_probs_f64_fast(u_logits, params.temperature, params.top_p, p_dst);
+                    node_probs_ready[u] = true;
                 }
-                const size_t anc_len = size_t(tree_depths[size_t(u)] + 1u);
-                float* u_logits = impl_->host_full_logits.data() + size_t(u) * size_t(kVocabSize);
-                Impl::apply_rep_penalty_span(u_logits, impl_->cached_tokens, anc_toks, anc_len, params.repetition_penalty);
-                Impl::build_probs_f64_fast(
-                    u_logits,
-                    params.temperature,
-                    params.top_p,
-                    impl_->host_tree_probs_f64.data() + size_t(u) * size_t(kVocabSize)
-                );
-            }
+                return p_dst;
+            };
 
             std::array<double, kMaxTreeNodes> u_draws{};
             for (int d = 0; d <= max_tree_depth; ++d) {
@@ -4490,19 +5494,20 @@ std::vector<int32_t> Dsv41Runtime::generate(
                 Dsv41SpecTree16 topo16{};
                 (void)build_spec_tree16_topology(
                     uint32_t(kTree16NumNodes), uint32_t(cur_pos),
-                    kTree16Parents.data(), tree_verify_tokens.data(), &topo16);
-                const Dsv41Tree16VerifyResult vr16 = verify_deterministic_tree16_u01(
-                    topo16, impl_->host_tree_probs_f64.data(), size_t(kVocabSize), u_draws.data());
+                    tree_parents, tree_verify_tokens.data(), &topo16, t16_plan.valid_node_mask);
+                const Dsv41Tree16VerifyResult vr16 = verify_deterministic_tree16_u01_lazy(
+                    topo16, size_t(kVocabSize), u_draws.data(), get_node_probs);
                 vr_num_emitted = vr16.num_emitted;
                 vr_emitted_tokens = vr16.emitted_tokens;
                 vr_accepted_nodes = vr16.accepted_nodes;
             } else {
                 Dsv41SpecTree8 topo8{};
+                const uint8_t t8_valid = is_dyn8 ? t8_plan.valid_node_mask : uint8_t(0xFFu);
                 (void)build_spec_tree_topology(
                     uint32_t(kTree8NumNodes), uint32_t(cur_pos),
-                    kTree8Parents.data(), tree_verify_tokens.data(), &topo8);
-                const Dsv41TreeVerifyResult vr8 = verify_deterministic_tree_u01(
-                    topo8, impl_->host_tree_probs_f64.data(), size_t(kVocabSize), u_draws.data());
+                    tree_parents, tree_verify_tokens.data(), &topo8, t8_valid);
+                const Dsv41TreeVerifyResult vr8 = verify_deterministic_tree_u01_lazy(
+                    topo8, size_t(kVocabSize), u_draws.data(), get_node_probs);
                 vr_num_emitted = vr8.num_emitted;
                 for (size_t q = 0; q < vr8.emitted_tokens.size(); ++q) {
                     vr_emitted_tokens[q] = vr8.emitted_tokens[q];
@@ -4515,6 +5520,8 @@ std::vector<int32_t> Dsv41Runtime::generate(
             bool force_closed_in_burst = false;
             ThinkGuardDecision burst_guard_dec{};
             const int n_draft_acc = std::max(0, int(vr_num_emitted) - 1);
+            std::array<Impl::PostProcItem, 16> step_pp_items{};
+            size_t step_pp_cnt = 0;
 
             for (int d = 0; d < n_draft_acc; ++d) {
                 const int32_t d_tok = vr_emitted_tokens[size_t(d)];
@@ -4522,11 +5529,13 @@ std::vector<int32_t> Dsv41Runtime::generate(
                 out_stats.dspark_accepted += 1;
                 out_stats.dspark_tree_accepted += 1;
                 if (is_t16) out_stats.dspark_tree16_accepted += 1;
+                else if (is_dyn8) out_stats.dspark_tree_dyn8_accepted += 1;
                 generated.push_back(d_tok);
-                if (d_tok == Dsv41SpecialTokens::kEos || (on_token && !on_token(d_tok))) {
+                if (d_tok == Dsv41SpecialTokens::kEos) {
                     hit_stop = true;
                     break;
                 }
+                step_pp_items[step_pp_cnt++] = Impl::PostProcItem{d_tok, generated.size()};
                 const auto gd = observe_tok_with_guard(d_tok);
                 if (gd.action == ThinkGuardAction::kForceCloseThink) {
                     force_closed_in_burst = true;
@@ -4536,6 +5545,7 @@ std::vector<int32_t> Dsv41Runtime::generate(
             }
 
             if (force_closed_in_burst) {
+                async_pp.enqueue_batch(step_pp_items.data(), step_pp_cnt);
                 if (!execute_force_close_think(burst_guard_dec)) {
                     break;
                 }
@@ -4547,7 +5557,7 @@ std::vector<int32_t> Dsv41Runtime::generate(
             const auto tc0 = std::chrono::steady_clock::now();
             out_stats.dec_sample_ms += std::chrono::duration<double, std::milli>(tc0 - tb1).count();
             const int accepted_A = 1 + k_acc;
-            int32_t accepted_prefix_toks[6]{};
+            int32_t accepted_prefix_toks[16]{};
             accepted_prefix_toks[0] = cur_anchor;
             for (int d = 0; d < k_acc; ++d) {
                 accepted_prefix_toks[1 + d] = vr_emitted_tokens[size_t(d)];
@@ -4561,8 +5571,13 @@ std::vector<int32_t> Dsv41Runtime::generate(
             for (int s = 0; s < accepted_A; ++s) {
                 impl_->cached_tokens.push_back(accepted_prefix_toks[s]);
             }
+            if (static_cast<int>(impl_->cached_tokens.size()) / kRadixBlockTokens > impl_->exported_radix_blocks) {
+                sync_cached_salts_to(static_cast<int>(impl_->cached_tokens.size()));
+                impl_->export_new_radix_blocks();
+            }
 
             if (hit_stop) {
+                async_pp.enqueue_batch(step_pp_items.data(), step_pp_cnt);
                 out_stats.completion_tokens = static_cast<int>(generated.size());
                 break;
             }
@@ -4572,9 +5587,13 @@ std::vector<int32_t> Dsv41Runtime::generate(
                 generated.push_back(bonus_or_resampled);
                 out_stats.completion_tokens = static_cast<int>(generated.size());
                 cur_anchor = bonus_or_resampled;
-                if (bonus_or_resampled == Dsv41SpecialTokens::kEos || (on_token && !on_token(bonus_or_resampled))) {
+                if (bonus_or_resampled == Dsv41SpecialTokens::kEos) {
+                    async_pp.enqueue_batch(step_pp_items.data(), step_pp_cnt);
                     break;
                 }
+                step_pp_items[step_pp_cnt++] = Impl::PostProcItem{bonus_or_resampled, generated.size()};
+                impl_->enqueue_anchor_engram_prefetch(cur_anchor, static_cast<int>(impl_->cached_tokens.size()));
+                async_pp.enqueue_batch(step_pp_items.data(), step_pp_cnt);
                 const auto gd = observe_tok_with_guard(bonus_or_resampled);
                 if (gd.action == ThinkGuardAction::kForceCloseThink) {
                     if (!execute_force_close_think(gd)) {
@@ -4583,6 +5602,7 @@ std::vector<int32_t> Dsv41Runtime::generate(
                 }
                 tree_ctrl.observe_step(accepted_A, think_guard.in_think());
             } else {
+                async_pp.enqueue_batch(step_pp_items.data(), step_pp_cnt);
                 out_stats.completion_tokens = static_cast<int>(generated.size());
                 break;
             }
@@ -4596,10 +5616,8 @@ std::vector<int32_t> Dsv41Runtime::generate(
         for (int i = 0; i < B; ++i) verify_tokens[1 + i] = drafts[i];
         const int M_ver = 1 + B;
 
-        out_stats.dspark_steps += 1;
-        out_stats.dspark_drafted += uint64_t(B);
-
-        // B. Verify all M_ver (2..6) tokens in ONE backbone pass across 3x MI50 + 2x P150A!
+        // B. Verify all M_ver (2..6) tokens in ONE backbone pass across 3x MI50 + 2x P150A
+        //    while postproc_worker_thread finishes step N-1 UTF-8/DSML/SSE on CPU!
         const auto tb0 = std::chrono::steady_clock::now();
         impl_->forward_backbone_chunk(
             verify_tokens.data(),
@@ -4613,12 +5631,19 @@ std::vector<int32_t> Dsv41Runtime::generate(
         const auto tb1 = std::chrono::steady_clock::now();
         out_stats.dec_backbone_ms += std::chrono::duration<double, std::milli>(tb1 - tb0).count();
 
+        if (!sync_prev_postproc()) break;
+
+        out_stats.dspark_steps += 1;
+        out_stats.dspark_drafted += uint64_t(B);
+
         // C. Lossless Speculative Rejection Sampling (exact for both greedy temp=0 and stochastic temp+top_p!)
         int k_acc = 0;
         int32_t bonus_or_resampled = -1;
         bool hit_stop = false;
         bool force_closed_in_burst = false;
         ThinkGuardDecision burst_guard_dec{};
+        std::array<Impl::PostProcItem, 8> step_pp_items{};
+        size_t step_pp_cnt = 0;
 
         for (int k = 0; k < B; ++k) {
             float* t_logits = impl_->host_full_logits.data() + size_t(k) * kVocabSize;
@@ -4631,10 +5656,11 @@ std::vector<int32_t> Dsv41Runtime::generate(
                     ++k_acc;
                     out_stats.dspark_accepted += 1;
                     generated.push_back(d_tok);
-                    if (d_tok == Dsv41SpecialTokens::kEos || (on_token && !on_token(d_tok))) {
+                    if (d_tok == Dsv41SpecialTokens::kEos) {
                         hit_stop = true;
                         break;
                     }
+                    step_pp_items[step_pp_cnt++] = Impl::PostProcItem{d_tok, generated.size()};
                     const auto gd = observe_tok_with_guard(d_tok);
                     if (gd.action == ThinkGuardAction::kForceCloseThink) {
                         force_closed_in_burst = true;
@@ -4655,10 +5681,11 @@ std::vector<int32_t> Dsv41Runtime::generate(
                     ++k_acc;
                     out_stats.dspark_accepted += 1;
                     generated.push_back(d_tok);
-                    if (d_tok == Dsv41SpecialTokens::kEos || (on_token && !on_token(d_tok))) {
+                    if (d_tok == Dsv41SpecialTokens::kEos) {
                         hit_stop = true;
                         break;
                     }
+                    step_pp_items[step_pp_cnt++] = Impl::PostProcItem{d_tok, generated.size()};
                     const auto gd = observe_tok_with_guard(d_tok);
                     if (gd.action == ThinkGuardAction::kForceCloseThink) {
                         force_closed_in_burst = true;
@@ -4722,6 +5749,7 @@ std::vector<int32_t> Dsv41Runtime::generate(
         }
 
         if (force_closed_in_burst) {
+            async_pp.enqueue_batch(step_pp_items.data(), step_pp_cnt);
             if (!execute_force_close_think(burst_guard_dec)) {
                 break;
             }
@@ -4749,8 +5777,13 @@ std::vector<int32_t> Dsv41Runtime::generate(
         for (int s = 0; s < accepted_A; ++s) {
             impl_->cached_tokens.push_back(verify_tokens[s]);
         }
+        if (static_cast<int>(impl_->cached_tokens.size()) / kRadixBlockTokens > impl_->exported_radix_blocks) {
+            sync_cached_salts_to(static_cast<int>(impl_->cached_tokens.size()));
+            impl_->export_new_radix_blocks();
+        }
 
         if (hit_stop) {
+            async_pp.enqueue_batch(step_pp_items.data(), step_pp_cnt);
             out_stats.completion_tokens = static_cast<int>(generated.size());
             break;
         }
@@ -4759,9 +5792,13 @@ std::vector<int32_t> Dsv41Runtime::generate(
             generated.push_back(bonus_or_resampled);
             out_stats.completion_tokens = static_cast<int>(generated.size());
             cur_anchor = bonus_or_resampled;
-            if (bonus_or_resampled == Dsv41SpecialTokens::kEos || (on_token && !on_token(bonus_or_resampled))) {
+            if (bonus_or_resampled == Dsv41SpecialTokens::kEos) {
+                async_pp.enqueue_batch(step_pp_items.data(), step_pp_cnt);
                 break;
             }
+            step_pp_items[step_pp_cnt++] = Impl::PostProcItem{bonus_or_resampled, generated.size()};
+            impl_->enqueue_anchor_engram_prefetch(cur_anchor, static_cast<int>(impl_->cached_tokens.size()));
+            async_pp.enqueue_batch(step_pp_items.data(), step_pp_cnt);
             const auto gd = observe_tok_with_guard(bonus_or_resampled);
             if (gd.action == ThinkGuardAction::kForceCloseThink) {
                 if (!execute_force_close_think(gd)) {
@@ -4770,14 +5807,20 @@ std::vector<int32_t> Dsv41Runtime::generate(
             }
             tree_ctrl.observe_step(accepted_A, think_guard.in_think());
         } else {
+            async_pp.enqueue_batch(step_pp_items.data(), step_pp_cnt);
             out_stats.completion_tokens = static_cast<int>(generated.size());
             break;
         }
     }
 
-    // Export newly completed 128-token Radix blocks + save post-decode RewindBank snapshot!
-    impl_->export_new_radix_blocks();
-    impl_->save_rewind_snapshot();
+    (void)sync_prev_postproc();
+    async_pp.detach_and_drain();
+
+    // Export newly completed 128-token CSA2 blocks (0 B SWA written to NVMe)!
+    if (!impl_->cached_tokens.empty()) {
+        sync_cached_salts_to(static_cast<int>(impl_->cached_tokens.size()));
+        impl_->export_new_radix_blocks();
+    }
 
     // Strip trailing <｜end▁of▁sentence｜> from returned token IDs (while keeping completion_tokens accurate)
     if (!generated.empty() && generated.back() == Dsv41SpecialTokens::kEos) {
