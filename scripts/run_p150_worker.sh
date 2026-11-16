@@ -11,7 +11,13 @@ export TMPDIR="${TMPDIR:-$DSV41_ROOT/tmp}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$DSV41_ROOT/cache}"
 export TT_METAL_CACHE="${TT_METAL_CACHE:-$DSV41_ROOT/cache/metal}"
 
-OVERLAY="${DSV41_OVERLAY:-$DSV41_ROOT/packed_rarebal_overlay_wave8_4/hot_experts_wave8_4_perm.safetensors}"
+OVERLAY="${DSV41_OVERLAY:-$DSV41_ROOT/packed_rarebal_overlay_wave8_5/hot_experts_wave8_5.safetensors}"
+if [[ ! -f "$OVERLAY" && -f "$DSV41_ROOT/hot_experts_wave8_5.safetensors" ]]; then
+  OVERLAY="$DSV41_ROOT/hot_experts_wave8_5.safetensors"
+fi
+if [[ ! -f "$OVERLAY" && -f "$DSV41_ROOT/packed_rarebal_overlay_wave8_4/hot_experts_wave8_4_perm.safetensors" ]]; then
+  OVERLAY="$DSV41_ROOT/packed_rarebal_overlay_wave8_4/hot_experts_wave8_4_perm.safetensors"
+fi
 if [[ ! -f "$OVERLAY" && -f "$DSV41_ROOT/hot_experts_wave8_4_perm.safetensors" ]]; then
   OVERLAY="$DSV41_ROOT/hot_experts_wave8_4_perm.safetensors"
 fi

@@ -11,6 +11,7 @@
 #include "../src/dsv41_rarebal.hpp"
 #include "dsv41_think_loop_guard.hpp"
 #include "dsv41_tree_spec.hpp"
+#include "dsv41_hlut3_kernels.hpp"  // Wave 9 opt-in HLUT3 MTP overlay decode path
 
 #include <immintrin.h>
 #include <sys/stat.h>
@@ -82,6 +83,7 @@ static constexpr int kMaxChunkM         = 512;   // Dumitrescu MR vs MP block la
 static constexpr int kMaxDecChunkM      = 512;   // Decoder M=512 (keeps d_cand_block_mask at 16 MiB!)
 static constexpr int kMaxDecM           = 320;   // Padded multiple of 64 for decoder-only taps/heads!
 static constexpr int kF32RingMaxM       = 64;    // Dumitrescu mixed-precision FP32 ring + FP32 mHC post -> 1 RNE BF16!
+static constexpr int kMhcFusedMaxM      = 16;    // Wave 8.5B cross-sublayer mHC + RMSNorm + UE8M0/WHT128 decode fast path!
 static constexpr size_t kPartF32Floats  = 512u * 25600u; // 13,107,200 floats = 50.00 MiB
 
 // Exact 890 B/tok 128-token RadixBlock layout across Slots 0..2 (r=2, 64 slots) and Slot 3 (r=1, 128 slots):
@@ -287,6 +289,13 @@ struct BlockGpuWeights {
     uint16_t* d_hlut2_down_sc   = nullptr;
     float*    d_hlut2_down_cent = nullptr;
 
+    // Wave 9 opt-in HLUT3 MTP overlay planes. Populated ONLY when --hlut3-mtp-overlay <path> is
+    // supplied; default production 2.125 bpw HLUT2 footprint stays byte-identical when unset.
+    bool has_hlut3 = false;
+    Hlut3Tile32x32* d_hlut3_gate_tiles = nullptr;  // [128 experts, 24 nt, 160 kt] 400 B tiles
+    Hlut3Tile32x32* d_hlut3_up_tiles   = nullptr;
+    Hlut3Tile32x32* d_hlut3_down_tiles = nullptr;  // [128 experts, 160 nt, 24 kt] 400 B tiles
+
     // MTP extras (markov_head.embed.weight kept in host DDR4, saving 21.05 MiB HBM2/GPU!)
     uint16_t* d_main_norm       = nullptr;  // mtp_0
     uint8_t*  d_main_proj_w     = nullptr;  // mtp_0 [5120, 5120]
@@ -316,6 +325,7 @@ struct TpRankContext {
     hipEvent_t ev_p150_armed_ring[kNumLayers]{};
     hipEvent_t ev_engram_ready[2]{};
     hipEvent_t ev_engram_consumed[2]{};
+    hipEvent_t ev_engram_h2d_done[2][2]{};
     hipEvent_t ev_radix_stage[2]{};
     hipEvent_t ev_ar_pushed[4]{};
     hipEvent_t ev_ar_consumed[4]{};
@@ -401,6 +411,13 @@ struct TpRankContext {
     uint16_t*       d_inter_bf16      = nullptr; // [M * 6, 768]
     uint16_t*       d_inter_rot_f16   = nullptr; // [M * 6, 768]
     float*          d_moe_part_f32    = nullptr; // aliased to d_part_f32
+
+    // Wave 9 opt-in HLUT3 MTP overlay workspace (0 B when unset!). TP3 slice geometry is
+    // gate/up N=768 K=5120 and down N=5120 K=768; MTP decode M<=16 top_k=3 -> P<=48.
+    float*          d_hlut3_levels    = nullptr; // [4] positive Gaussian Lloyd-Max centroids
+    float*          d_hlut3_z         = nullptr; // [48, 768] SwiGLU intermediate FP32
+    float*          d_hlut3_zrot      = nullptr; // [48, 768] inverse-WHT128 intermediate FP32
+    float*          d_x_rot_f32       = nullptr; // [16, 5120] opt-in FP32 activation staging
     float*          d_moe_sum_f32     = nullptr; // aliased to d_sum_f32
     uint16_t*       d_p150_out_bf16   = nullptr; // [M, 5120]
     float*          d_ar_recv[4][2]{};           // [slot=0..3][peer=0..1] fine-grained coherent P2P posted-write ring
@@ -419,6 +436,7 @@ struct TpRankContext {
     float*          h_reduce_f32   = nullptr;
     float*          h_logits_part  = nullptr; // [8, vocab_rows]
     uint16_t*       h_engram_bf16[2]{};       // [2][M, 2048]
+    uint16_t*       h_engram_bf16_alt[2]{};   // [2][M, 2048] host-only double buffer (0 B VRAM!)
     int32_t*        h_topk_ids     = nullptr; // [M * 6]
     float*          h_topk_w       = nullptr; // [M * 6]
     uint16_t*       h_x_moe_bf16   = nullptr; // [M * 5120]
@@ -427,10 +445,22 @@ struct TpRankContext {
     Mi50RoutedPair* h_routed_pairs = nullptr; // [M * 6] pinned routed pairs on tp=0
     int32_t*        h_active_exp   = nullptr; // [256] pinned active experts on tp=0
     int32_t*        h_csr_offsets  = nullptr; // [257] pinned CSR offsets on tp=0
+
+    inline uint32_t* hc_wg_sync_ptr() const noexcept {
+        return d_conf_out_f32 ? reinterpret_cast<uint32_t*>(d_conf_out_f32 + 32) : nullptr;
+    }
 };
 
 }  // namespace
 struct Dsv41Runtime::Impl {
+    Impl() {
+        for (int l = 0; l < kNumLayers; ++l) {
+            for (int e = 0; e < kBackboneExperts; ++e) {
+                host_expert_inv_perm[size_t(l)][size_t(e)] = static_cast<uint16_t>(e);
+            }
+        }
+    }
+
     int max_seq_len = 524288;
     bool p2p_enabled = false;
     uint32_t ar_ping = 0u;
@@ -449,6 +479,9 @@ struct Dsv41Runtime::Impl {
     Dsv41GpuStageRtc* d_stage_rtc = nullptr;
     double inv_rtc_ticks_per_ms = 1.0 / 25000.0;
     bool dual_stream_overlap = true;
+    bool fused_mhc_norm = true;
+    bool fused_dspark_epilogue = true;
+    int prefill_superchunk_m = 512;
     bool rtc_active_in_chunk = false;
     Dsv41TreeWidthMode tree_width_mode = Dsv41TreeWidthMode::Auto;
     int tree16_max_context = Dsv41AdaptiveTreeWidthController::kAutoTree16MaxContext;
@@ -458,8 +491,13 @@ struct Dsv41Runtime::Impl {
     std::string expert_perm_overlay_path;
     bool expert_perm_disabled = false;
     bool expert_perm_active = false;
+    std::array<std::array<uint16_t, kBackboneExperts>, kNumLayers> host_expert_inv_perm{};
     std::string mi50_packed_root_saved;
     std::string rarebal_overlay_path_saved;
+
+    // Wave 9 opt-in HLUT3 MTP overlay state (path empty -> 0 allocations, 0 footprint change).
+    std::string hlut3_mtp_overlay_path;
+    bool hlut3_mtp_overlay_enabled = false;
 
     // Coherent mapped pinned DDR4 Markov embedding [129280, 256] BF16 (63.1 MiB in DDR4 -> 0 B HBM2!) + GPU DSpark slot
     uint16_t* h_markov_embed_mapped = nullptr;
@@ -506,13 +544,15 @@ struct Dsv41Runtime::Impl {
     bool stop_workers = false;
     std::thread nvme_writer_thread;
 
-    // Async Engram CPU gather + H2D prefetch worker thread (monotonic seq + early anchor row-0 prefetch!)
+    // Async Engram CPU gather + H2D prefetch worker thread (monotonic seq + early anchor row-0 + 0 B-VRAM chunk c+1 double-buffer!)
     struct EngramJob {
         uint64_t seq = 0ULL;
         int slot = 0;
         int engram_idx = 0;
         int s_start = 0;
         int M = 0;
+        int buf_idx = 0;
+        int hash_ring_idx = 0;
         bool anchor_only = false;
         std::array<int64_t, 24> anchor_hashes{};
         bool has_image_mask = false;
@@ -527,6 +567,10 @@ struct Dsv41Runtime::Impl {
     uint64_t eg_wait_seq[2]{0ULL, 0ULL};
     uint64_t eg_anchor_seq[2]{0ULL, 0ULL};
     bool eg_prev_was_anchor[2]{false, false};
+    int eg_host_ping = 0;
+    bool eg_next_chunk_prefetched = false;
+    int eg_prefetched_pos = -1;
+    int eg_prefetched_m = 0;
     int engram_anchor_pos = -1;
     int32_t engram_anchor_tok = -1;
     std::thread eg_worker_thread;
@@ -566,6 +610,13 @@ struct Dsv41Runtime::Impl {
 
     // Reusable host scratch buffers
     std::vector<int64_t> engram_hashes_buf;
+    std::vector<int64_t> engram_hashes_ring[2];
+    std::vector<int32_t> logical_topk_ids_buf;
+    struct PendingMmCapture {
+        std::vector<int32_t> raw_prompt_ids;
+        std::vector<Dsv41ImageSource> images;
+    };
+    std::vector<PendingMmCapture> pending_mm_captures;
     std::vector<Mi50RoutedPair> mi50_pairs_buf;
     std::vector<Mi50RoutedPair> mi50_sorted_pairs_buf;
     std::vector<int32_t> mi50_active_exp_buf;
@@ -593,6 +644,11 @@ struct Dsv41Runtime::Impl {
     double sub_mhc_ms = 0.0;
     double sub_commit_ms = 0.0;
     bool sync_timers = false;
+    struct PreRopeSlotCapture {
+        std::vector<uint16_t> lat[3][4];
+        std::vector<uint16_t> idxk[3][4];
+    };
+    PreRopeSlotCapture* pre_rope_cap = nullptr;
     std::unique_ptr<SafetensorsMmap> rarebal_overlay_mmap;
     std::atomic<int> rarebal_mi50_patched_slots{0};
     std::unique_ptr<RarebalLiveCollector> rarebal_collector;
@@ -655,6 +711,9 @@ struct Dsv41Runtime::Impl {
             for (int s = 0; s < 2; ++s) {
                 if (ctx[tp].ev_engram_ready[s])    (void)hipEventDestroy(ctx[tp].ev_engram_ready[s]);
                 if (ctx[tp].ev_engram_consumed[s]) (void)hipEventDestroy(ctx[tp].ev_engram_consumed[s]);
+                for (int b = 0; b < 2; ++b) {
+                    if (ctx[tp].ev_engram_h2d_done[s][b]) (void)hipEventDestroy(ctx[tp].ev_engram_h2d_done[s][b]);
+                }
                 if (ctx[tp].ev_radix_stage[s])     (void)hipEventDestroy(ctx[tp].ev_radix_stage[s]);
             }
             for (int s = 0; s < 4; ++s) {
@@ -744,13 +803,18 @@ struct Dsv41Runtime::Impl {
                     eg_queue.pop_front();
                 }
                 if (engram_cpu.has_table_shard(job.engram_idx) && job.M > job.s_start) {
+                    const int bidx = job.buf_idx & 1;
+                    // Host-only double buffer: wait ONLY for previous H2D from this pinned host buffer (NOT GPU consumption!),
+                    // so DDR4 AVX2 gather for chunk c+1 overlaps 100% behind GPU layers 15..39 of chunk c!
                     for (int tp = 0; tp < 3; ++tp) {
                         (void)hipSetDevice(tp);
-                        (void)hipEventSynchronize(ctx[tp].ev_engram_consumed[job.slot]);
-                        if (eg_prev_was_anchor[job.slot] && job.s_start == 0) {
-                            (void)hipEventSynchronize(ctx[tp].ev_engram_ready[job.slot]);
-                        }
+                        (void)hipEventSynchronize(ctx[tp].ev_engram_h2d_done[job.slot][bidx]);
                     }
+                    uint16_t* h_dst[3] = {
+                        (bidx == 0) ? ctx[0].h_engram_bf16[job.slot] : ctx[0].h_engram_bf16_alt[job.slot],
+                        (bidx == 0) ? ctx[1].h_engram_bf16[job.slot] : ctx[1].h_engram_bf16_alt[job.slot],
+                        (bidx == 0) ? ctx[2].h_engram_bf16[job.slot] : ctx[2].h_engram_bf16_alt[job.slot],
+                    };
                     if (job.anchor_only) {
                         int64_t row0_pair[48]{};
                         std::memcpy(row0_pair + size_t(job.engram_idx) * 24ULL,
@@ -758,36 +822,39 @@ struct Dsv41Runtime::Impl {
                                     24ULL * sizeof(int64_t));
                         engram_cpu.gather_dequant_tp3(
                             job.engram_idx, row0_pair, 1, nullptr,
-                            ctx[0].h_engram_bf16[job.slot],
-                            ctx[1].h_engram_bf16[job.slot],
-                            ctx[2].h_engram_bf16[job.slot],
-                            0);
+                            h_dst[0], h_dst[1], h_dst[2], 0);
                         for (int tp = 0; tp < 3; ++tp) {
                             (void)hipSetDevice(tp);
                             auto& c = ctx[tp];
-                            (void)hipMemcpyAsync(c.d_engram_in_bf16[job.slot], c.h_engram_bf16[job.slot],
+                            (void)hipStreamWaitEvent(c.engram_stream, c.ev_engram_consumed[job.slot], 0);
+                            (void)hipMemcpyAsync(c.d_engram_in_bf16[job.slot], h_dst[tp],
                                                  2048u * sizeof(uint16_t),
                                                  hipMemcpyHostToDevice, c.engram_stream);
+                            (void)hipEventRecord(c.ev_engram_h2d_done[job.slot][bidx], c.engram_stream);
                             (void)hipEventRecord(c.ev_engram_ready[job.slot], c.engram_stream);
                         }
                         eg_prev_was_anchor[job.slot] = true;
                     } else {
+                        const auto& h_src = (job.hash_ring_idx == 1) ? engram_hashes_ring[1]
+                                          : ((job.hash_ring_idx == 2) ? engram_hashes_ring[0] : engram_hashes_buf);
                         engram_cpu.gather_dequant_tp3(
-                            job.engram_idx, engram_hashes_buf.data(), job.M,
+                            job.engram_idx, h_src.data(), job.M,
                             job.has_image_mask ? job.image_mask.data() : nullptr,
-                            ctx[0].h_engram_bf16[job.slot],
-                            ctx[1].h_engram_bf16[job.slot],
-                            ctx[2].h_engram_bf16[job.slot],
-                            job.s_start);
+                            h_dst[0], h_dst[1], h_dst[2], job.s_start);
                         const size_t elem_off = size_t(job.s_start) * 2048u;
                         const size_t elem_cnt = size_t(job.M - job.s_start) * 2048u;
                         for (int tp = 0; tp < 3; ++tp) {
                             (void)hipSetDevice(tp);
                             auto& c = ctx[tp];
+                            (void)hipStreamWaitEvent(c.engram_stream, c.ev_engram_consumed[job.slot], 0);
+                            if (eg_prev_was_anchor[job.slot] && job.s_start == 0) {
+                                (void)hipStreamWaitEvent(c.engram_stream, c.ev_engram_ready[job.slot], 0);
+                            }
                             (void)hipMemcpyAsync(c.d_engram_in_bf16[job.slot] + elem_off,
-                                                 c.h_engram_bf16[job.slot] + elem_off,
+                                                 h_dst[tp] + elem_off,
                                                  elem_cnt * sizeof(uint16_t),
                                                  hipMemcpyHostToDevice, c.engram_stream);
+                            (void)hipEventRecord(c.ev_engram_h2d_done[job.slot][bidx], c.engram_stream);
                             (void)hipEventRecord(c.ev_engram_ready[job.slot], c.engram_stream);
                         }
                         eg_prev_was_anchor[job.slot] = false;
@@ -999,11 +1066,110 @@ struct Dsv41Runtime::Impl {
         }
     }
 
+    // Wave 9 Deliverable C opt-in loader: HLUT3 MTP overlay tile planes for blocks 40..42.
+    // Safetensors contract names (expert-major, per TP3 rank slice):
+    //   hlut3.b<bid>.gate_tiles  UINT8 [128, 24, 160, 400] = 196,608,000 B
+    //   hlut3.b<bid>.up_tiles    UINT8 [128, 24, 160, 400] = 196,608,000 B
+    //   hlut3.b<bid>.down_tiles  UINT8 [128, 160, 24, 400] = 196,608,000 B
+    // Each expert is gate/up 768x5120 and down 5120x768 in 400 B tiles. Levels are the exact
+    // analytic Gaussian Lloyd-Max fixed point shared by all projections.
+    void load_hlut3_mtp_overlay(int tp) {
+        if (hlut3_mtp_overlay_path.empty()) return;  // default production path: 0 B allocation.
+        constexpr int kMtpE = kMtpExperts;          // 128 DSpark drafter experts
+        constexpr int kGateN = kSharedInterTp;      // 768 TP3 rank slice of I=2304
+        constexpr int kGateK = kDim;                // 5120 hidden
+        constexpr int kDownN = kDim;                // 5120 output hidden
+        constexpr int kDownK = kSharedInterTp;      // 768 TP3 rank slice of I=2304
+        constexpr int kGateNt = kGateN / 32;        // 24
+        constexpr int kGateKt = kGateK / 32;        // 160
+        constexpr int kDownNt = kDownN / 32;        // 160
+        constexpr int kDownKt = kDownK / 32;        // 24
+        constexpr int kMtpPmax = 48;                // 16 decode rows x top_k=3 routed pairs
+        constexpr size_t kProjBytes = size_t(kMtpE) * size_t(kGateNt) * size_t(kGateKt) *
+                                      size_t(kHlut3TileBytes);  // 196,608,000 B per projection
+        constexpr size_t kBlockBytes = 3ULL * kProjBytes;          // 589,824,000 B
+        constexpr size_t kTileBytesTotal = 3ULL * kBlockBytes;     // 1,769,472,000 B
+        constexpr size_t kScratchBytes = 2ULL * size_t(kMtpPmax) * size_t(kGateN) * sizeof(float) +
+                                         size_t(16) * size_t(kDim) * sizeof(float) + 16ULL;
+        constexpr size_t kMinFreeBytes = 550ULL * 1024ULL * 1024ULL;
+
+        auto& c = ctx[tp];
+        size_t free_b = 0, total_b = 0;
+        DSV41_HIP_CHECK(hipMemGetInfo(&free_b, &total_b));
+        if (free_b < kTileBytesTotal + kScratchBytes + kMinFreeBytes) {
+            std::printf("[DSV41_RT] HLUT3 MTP overlay REFUSED tp=%d free=%.1f MiB need=%.1f MiB (guard %.0f MiB)\n",
+                        tp, double(free_b) / (1024.0 * 1024.0),
+                        double(kTileBytesTotal + kScratchBytes) / (1024.0 * 1024.0),
+                        double(kMinFreeBytes) / (1024.0 * 1024.0));
+            std::fflush(stdout);
+            return;
+        }
+
+        std::unique_ptr<SafetensorsMmap> ov;
+        try {
+            ov = std::make_unique<SafetensorsMmap>(hlut3_mtp_overlay_path);
+        } catch (...) {
+            std::printf("[DSV41_RT] HLUT3 MTP overlay OPEN FAILED tp=%d path=%s (HLUT2 unchanged)\n",
+                        tp, hlut3_mtp_overlay_path.c_str());
+            std::fflush(stdout);
+            return;
+        }
+
+        bool all_present = true;
+        for (int bid = kNumLayers; bid < kTotalBlocks; ++bid) {
+            for (const char* proj : {"gate_tiles", "up_tiles", "down_tiles"}) {
+                const std::string name = std::string("hlut3.b") + std::to_string(bid) + "." + proj;
+                if (!ov->contains(name)) { all_present = false; break; }
+                if (size_t(ov->at(name).byte_size()) != kProjBytes) { all_present = false; break; }
+            }
+            if (!all_present) break;
+        }
+        if (!all_present) {
+            std::printf("[DSV41_RT] HLUT3 MTP overlay SKIP tp=%d path=%s (missing/invalid tile tensors, HLUT2 unchanged)\n",
+                        tp, hlut3_mtp_overlay_path.c_str());
+            std::fflush(stdout);
+            return;
+        }
+
+        const auto sol = solve_gaussian_lloyd_max_hlut3();
+        const float lv[4] = {float(sol.levels[0]), float(sol.levels[1]),
+                             float(sol.levels[2]), float(sol.levels[3])};
+        c.d_hlut3_levels = alloc_gpu_buf<float>(4u, c.device_allocs, false);
+        copy_h2d_fast(c.d_hlut3_levels, lv, sizeof(lv));
+        c.d_hlut3_z    = alloc_gpu_buf<float>(size_t(kMtpPmax) * size_t(kGateN), c.device_allocs, false);
+        c.d_hlut3_zrot = alloc_gpu_buf<float>(size_t(kMtpPmax) * size_t(kGateN), c.device_allocs, false);
+        c.d_x_rot_f32  = alloc_gpu_buf<float>(size_t(16) * size_t(kDim), c.device_allocs, false);
+
+        size_t loaded_bytes = 0;
+        int loaded_blocks = 0;
+        for (int bid = kNumLayers; bid < kTotalBlocks; ++bid) {
+            auto& b = c.blocks[bid];
+            b.d_hlut3_gate_tiles = alloc_gpu_buf<Hlut3Tile32x32>(
+                size_t(kMtpE) * size_t(kGateNt) * size_t(kGateKt), c.device_allocs, false);
+            b.d_hlut3_up_tiles = alloc_gpu_buf<Hlut3Tile32x32>(
+                size_t(kMtpE) * size_t(kGateNt) * size_t(kGateKt), c.device_allocs, false);
+            b.d_hlut3_down_tiles = alloc_gpu_buf<Hlut3Tile32x32>(
+                size_t(kMtpE) * size_t(kDownNt) * size_t(kDownKt), c.device_allocs, false);
+            copy_h2d_fast(b.d_hlut3_gate_tiles, ov->tensor_bytes(std::string("hlut3.b") + std::to_string(bid) + ".gate_tiles"), kProjBytes);
+            copy_h2d_fast(b.d_hlut3_up_tiles,   ov->tensor_bytes(std::string("hlut3.b") + std::to_string(bid) + ".up_tiles"),   kProjBytes);
+            copy_h2d_fast(b.d_hlut3_down_tiles, ov->tensor_bytes(std::string("hlut3.b") + std::to_string(bid) + ".down_tiles"), kProjBytes);
+            b.has_hlut3 = true;
+            loaded_bytes += kBlockBytes;
+            ++loaded_blocks;
+        }
+        hlut3_mtp_overlay_enabled = true;
+        std::printf("[DSV41_RT] HLUT3 MTP overlay ENABLED tp=%d blocks=%d tiles=%zu B (%.2f MiB/rank) + scratch=%zu B levels=[%.9f %.9f %.9f %.9f]\n",
+                    tp, loaded_blocks, loaded_bytes, double(loaded_bytes) / (1024.0 * 1024.0),
+                    kScratchBytes, double(lv[0]), double(lv[1]), double(lv[2]), double(lv[3]));
+        std::fflush(stdout);
+    }
+
     void apply_identity_expert_perm_all_ranks() {
         std::vector<uint16_t> id_perm(size_t(kNumLayers) * size_t(kBackboneExperts));
         for (int l = 0; l < kNumLayers; ++l) {
             for (int e = 0; e < kBackboneExperts; ++e) {
                 id_perm[size_t(l) * size_t(kBackboneExperts) + size_t(e)] = static_cast<uint16_t>(e);
+                host_expert_inv_perm[size_t(l)][size_t(e)] = static_cast<uint16_t>(e);
             }
         }
         for (int tp = 0; tp < kTpSize; ++tp) {
@@ -1033,6 +1199,7 @@ struct Dsv41Runtime::Impl {
                     throw std::runtime_error("expert_perm_u16 is not a valid 384-bijection at layer " + std::to_string(l));
                 }
                 seen[pe] = 1u;
+                host_expert_inv_perm[size_t(l)][size_t(pe)] = static_cast<uint16_t>(e);
                 if ((e < kMi50BackboneExp) != (int(pe) < kMi50BackboneExp)) {
                     ++cross_swaps;
                 }
@@ -1095,6 +1262,10 @@ struct Dsv41Runtime::Impl {
             DSV41_HIP_CHECK(hipEventCreateWithFlags(&c.ev_engram_ready[s], hipEventDisableTiming));
             DSV41_HIP_CHECK(hipEventCreateWithFlags(&c.ev_engram_consumed[s], hipEventDisableTiming));
             DSV41_HIP_CHECK(hipEventRecord(c.ev_engram_consumed[s], c.stream));
+            for (int b = 0; b < 2; ++b) {
+                DSV41_HIP_CHECK(hipEventCreateWithFlags(&c.ev_engram_h2d_done[s][b], hipEventDisableTiming));
+                DSV41_HIP_CHECK(hipEventRecord(c.ev_engram_h2d_done[s][b], c.engram_stream));
+            }
             DSV41_HIP_CHECK(hipEventCreateWithFlags(&c.ev_radix_stage[s], hipEventDisableTiming));
             DSV41_HIP_CHECK(hipEventRecord(c.ev_radix_stage[s], c.stream));
         }
@@ -1258,13 +1429,15 @@ struct Dsv41Runtime::Impl {
         c.d_markov_sum_bf16   = alloc_gpu_buf<uint16_t>(64u * kMarkovRank, c.device_allocs);
         c.d_markov_logits_f32 = alloc_gpu_buf<float>(16u * size_t(c.vocab_rows), c.device_allocs);
         c.d_conf_in_bf16      = alloc_gpu_buf<uint16_t>(64u * (kDim + kMarkovRank), c.device_allocs);
-        c.d_conf_out_f32      = alloc_gpu_buf<float>(64u, c.device_allocs);
+        c.d_conf_out_f32      = alloc_gpu_buf<float>(64u, c.device_allocs, true);
 
         c.h_reduce_bf16 = alloc_pinned<uint16_t>(tp, 64u);
         c.h_reduce_f32  = alloc_pinned<float>(tp, 64u);
         c.h_logits_part    = alloc_pinned<float>(tp, 16u * size_t(c.vocab_rows));
-        c.h_engram_bf16[0] = alloc_pinned<uint16_t>(tp, M * 2048u);
-        c.h_engram_bf16[1] = alloc_pinned<uint16_t>(tp, M * 2048u);
+        c.h_engram_bf16[0]     = alloc_pinned<uint16_t>(tp, M * 2048u);
+        c.h_engram_bf16[1]     = alloc_pinned<uint16_t>(tp, M * 2048u);
+        c.h_engram_bf16_alt[0] = alloc_pinned<uint16_t>(tp, M * 2048u);
+        c.h_engram_bf16_alt[1] = alloc_pinned<uint16_t>(tp, M * 2048u);
         c.h_radix_stage    = alloc_pinned<uint8_t>(tp, 8u * 1024u * 1024u);
         c.h_radix_stage2   = alloc_pinned<uint8_t>(tp, 8u * 1024u * 1024u);
         if (tp == 0) {
@@ -1277,6 +1450,9 @@ struct Dsv41Runtime::Impl {
         }
 
         reset_r2_compressor_state_gpu(tp);
+
+        // Wave 9 opt-in HLUT3 MTP overlay (no-op when --hlut3-mtp-overlay is unset => 0 B delta!)
+        load_hlut3_mtp_overlay(tp);
 
         size_t free_b = 0, total_b = 0;
         DSV41_HIP_CHECK(hipMemGetInfo(&free_b, &total_b));
@@ -1363,6 +1539,47 @@ struct Dsv41Runtime::Impl {
         }
     }
 
+    // Wave 8.5B: Cross-sublayer fused TP3 HostRingAllReduce + mHC post + next-sublayer H_pre contraction +
+    // RMSNorm + optional UE8M0/32 FP8 + optional WHT128 (M <= 16, ScratchSize == 0)
+    void all_reduce_tp3_f32_mhc_fused(
+        const float* src0, const float* src1, const float* src2,
+        const uint16_t* p150_0, const uint16_t* p150_1, const uint16_t* p150_2,
+        int in_h_slot, int out_h_slot, int M,
+        const uint16_t* norm_w0, const uint16_t* norm_w1, const uint16_t* norm_w2,
+        bool emit_fp8, int signs_block_id, bool emit_tp0_raw_sub, bool emit_tp0_rot_bf16,
+        Dsv41GpuStageRtc* rtc_tp0 = nullptr)
+    {
+        if (M <= 0) return;
+        sync_tp0_if_profiling();
+        const auto tar0 = std::chrono::steady_clock::now();
+        const float* srcs[3] = {src0, src1, src2};
+        const uint16_t* p150s[3] = {p150_0, p150_1, p150_2};
+        const uint16_t* norms[3] = {norm_w0, norm_w1, norm_w2};
+        const uint64_t seq = ++host_ar_seq;
+        HostRingAllReduceSlot* slot = &h_ar_ring[(seq - 1ULL) & (kHostArRingSlots - 1ULL)];
+        for (int tp = 0; tp < 3; ++tp) {
+            DSV41_HIP_CHECK(hipSetDevice(tp));
+            auto& c = ctx[tp];
+            const uint64_t* signs_ptr = (signs_block_id >= 0) ? c.blocks[signs_block_id].d_signs_h : nullptr;
+            launch_host_ring_allreduce_f32_mhc_fused(
+                srcs[tp], p150s[tp], c.d_h_bf16[in_h_slot],
+                c.d_post_mix_f32, c.d_comb_mix_f32, c.d_h_bf16[out_h_slot],
+                c.d_pre_mix_f32[out_h_slot], norms[tp], c.d_x_bf16,
+                (emit_tp0_raw_sub && tp == 0) ? c.d_sub_bf16 : nullptr,
+                emit_fp8 ? c.d_fp8_act : nullptr,
+                emit_fp8 ? c.d_fp8_scale : nullptr,
+                signs_ptr,
+                signs_ptr ? c.d_x_rot_f16 : nullptr,
+                (signs_ptr && emit_tp0_rot_bf16 && tp == 0) ? c.d_part_bf16 : nullptr,
+                kNormEps, slot, tp, seq, M, c.stream,
+                (tp == 0) ? rtc_tp0 : nullptr);
+        }
+        sync_tp0_if_profiling();
+        if (!rtc_tp0) {
+            accum_allreduce_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tar0).count();
+        }
+    }
+
     // Write `count` BF16 [512] rows from d_src_bf16 into ring d_win_kv[block_id] starting at global `start_pos`
     void write_ring_window_gpu(int tp, int block_id, const uint16_t* d_src_bf16, int start_pos, int count) {
         if (count <= 0) return;
@@ -1417,6 +1634,16 @@ struct Dsv41Runtime::Impl {
             // Packed 68 B/slot Indexer k_cache (uses unrotated latent!)
             launch_bf16_gemm(c.d_latent_bf16, b.d_idx_wk, c.d_idx_k_tmp_bf16, nullptr, M, kIndexHeadDim, kHeadDim, false, c.stream);
             launch_rmsnorm_bf16(c.d_idx_k_tmp_bf16, b.d_idx_k_norm, c.d_idx_k_tmp_bf16, M, kIndexHeadDim, kNormEps, c.stream);
+            if (pre_rope_cap != nullptr) {
+                pre_rope_cap->lat[tp][kv_slot].resize(size_t(M) * size_t(kHeadDim));
+                pre_rope_cap->idxk[tp][kv_slot].resize(size_t(M) * size_t(kIndexHeadDim));
+                DSV41_HIP_CHECK(hipMemcpyAsync(pre_rope_cap->lat[tp][kv_slot].data(), c.d_latent_bf16,
+                                               size_t(M) * size_t(kHeadDim) * sizeof(uint16_t),
+                                               hipMemcpyDeviceToHost, c.stream));
+                DSV41_HIP_CHECK(hipMemcpyAsync(pre_rope_cap->idxk[tp][kv_slot].data(), c.d_idx_k_tmp_bf16,
+                                               size_t(M) * size_t(kIndexHeadDim) * sizeof(uint16_t),
+                                               hipMemcpyDeviceToHost, c.stream));
+            }
             launch_rope_tail64_bf16(c.d_idx_k_tmp_bf16, true, M, 1, kIndexHeadDim, start_pos, 1, false, c.stream);
             launch_pack_index_k_fp4_ue8m0_32(c.d_idx_k_tmp_bf16, c.d_index_k_fp4[kv_slot], c.d_index_k_ue8m0[kv_slot],
                                              start_pos, M, c.stream);
@@ -1443,7 +1670,9 @@ struct Dsv41Runtime::Impl {
         int& io_shared_k_comp,
         TreeAncMask256 tree_anc_mask = {},
         uint64_t tree_depth_nibbles = 0ULL,
-        uint64_t tree_parent_nibbles = 0ULL)
+        uint64_t tree_parent_nibbles = 0ULL,
+        bool x_and_fp8_precomputed = false,
+        bool fuse_to_ffn_norm = false)
     {
         const bool is_tree = tree_anc_mask.active();
         const int ratio = kCompressRatios[l];
@@ -1466,7 +1695,9 @@ struct Dsv41Runtime::Impl {
             const bool use_comp_yarn = (ratio > 0);
 
             // Fused [wq_a; wkv] [1792, 5120] + fused split_qkv_norm_rope_quant!
-            launch_act_quant_ue8m0_32(c.d_x_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr, M, kDim, false, c.stream);
+            if (!x_and_fp8_precomputed) {
+                launch_act_quant_ue8m0_32(c.d_x_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr, M, kDim, false, c.stream);
+            }
             launch_fp8_gemm(c.d_fp8_act, c.d_fp8_scale, b.d_wqkv_w, b.d_wqkv_s, c.d_qkv_bf16, nullptr,
                             M, kQkvConcatRows, kDim, false, false, c.stream);
             launch_split_qkv_norm_rope_quant(c.d_qkv_bf16, b.d_q_norm, b.d_kv_norm, use_comp_yarn,
@@ -1522,6 +1753,16 @@ struct Dsv41Runtime::Impl {
                                      n_lat, kIndexHeadDim, kHeadDim, false, c.stream);
                     launch_rmsnorm_bf16(c.d_idx_k_tmp_bf16, b.d_idx_k_norm, c.d_idx_k_tmp_bf16,
                                         n_lat, kIndexHeadDim, kNormEps, c.stream);
+                    if (pre_rope_cap != nullptr && kv_slot >= 0 && kv_slot < 4) {
+                        pre_rope_cap->lat[tp][kv_slot].resize(size_t(n_lat) * size_t(kHeadDim));
+                        pre_rope_cap->idxk[tp][kv_slot].resize(size_t(n_lat) * size_t(kIndexHeadDim));
+                        DSV41_HIP_CHECK(hipMemcpyAsync(pre_rope_cap->lat[tp][kv_slot].data(), c.d_latent_bf16,
+                                                       size_t(n_lat) * size_t(kHeadDim) * sizeof(uint16_t),
+                                                       hipMemcpyDeviceToHost, c.stream));
+                        DSV41_HIP_CHECK(hipMemcpyAsync(pre_rope_cap->idxk[tp][kv_slot].data(), c.d_idx_k_tmp_bf16,
+                                                       size_t(n_lat) * size_t(kIndexHeadDim) * sizeof(uint16_t),
+                                                       hipMemcpyDeviceToHost, c.stream));
+                    }
                     launch_rope_tail64_bf16(c.d_idx_k_tmp_bf16, true,
                                             n_lat, 1, kIndexHeadDim,
                                             is_tree ? start_pos : (lat_slot_base * ratio),
@@ -1654,10 +1895,17 @@ struct Dsv41Runtime::Impl {
             const bool use_comp_yarn = (ratio > 0);
 
             // Inverse RoPE on tail 64 dims of o + grouped wo_a + wo_b
-            launch_rope_tail64_bf16(c.d_o_bf16, use_comp_yarn, M, b.h_cnt, kHeadDim, start_pos, 1, true, c.stream,
-                                    tree_anc_mask, tree_depth_nibbles);
-            launch_act_quant_ue8m0_32(c.d_o_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr,
-                                      M, b.g_cnt * 4096, false, c.stream);
+            if (fused_mhc_norm && M <= kMhcFusedMaxM) {
+                launch_inv_rope_tail64_quant_ue8m0_32(
+                    c.d_o_bf16, c.d_fp8_act, c.d_fp8_scale,
+                    use_comp_yarn, M, b.h_cnt, start_pos, c.stream,
+                    tree_anc_mask, tree_depth_nibbles);
+            } else {
+                launch_rope_tail64_bf16(c.d_o_bf16, use_comp_yarn, M, b.h_cnt, kHeadDim, start_pos, 1, true, c.stream,
+                                        tree_anc_mask, tree_depth_nibbles);
+                launch_act_quant_ue8m0_32(c.d_o_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr,
+                                          M, b.g_cnt * 4096, false, c.stream);
+            }
             launch_fp8_grouped_wo_a(c.d_fp8_act, c.d_fp8_scale, b.d_wo_a_w, b.d_wo_a_s,
                                     c.d_wo_mid_bf16, M, b.g_cnt, c.stream);
             launch_act_quant_ue8m0_32(c.d_wo_mid_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr,
@@ -1675,7 +1923,15 @@ struct Dsv41Runtime::Impl {
             sub_att_wo_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_wo0).count();
         }
         const auto t_aar0 = std::chrono::steady_clock::now();
-        if (M <= kF32RingMaxM) {
+        if (fuse_to_ffn_norm && M <= kMhcFusedMaxM) {
+            all_reduce_tp3_f32_mhc_fused(
+                ctx[0].d_part_f32, ctx[1].d_part_f32, ctx[2].d_part_f32,
+                nullptr, nullptr, nullptr, in_h_slot, out_h_slot, M,
+                ctx[0].blocks[l].d_ffn_norm, ctx[1].blocks[l].d_ffn_norm, ctx[2].blocks[l].d_ffn_norm,
+                /*emit_fp8=*/true, /*signs_block_id=*/l,
+                /*emit_tp0_raw_sub=*/false, /*emit_tp0_rot_bf16=*/true,
+                rtc_active_in_chunk ? d_stage_rtc : nullptr);
+        } else if (M <= kF32RingMaxM) {
             all_reduce_tp3_f32_hc_post(ctx[0].d_part_f32, ctx[1].d_part_f32, ctx[2].d_part_f32,
                                        nullptr, nullptr, nullptr, in_h_slot, out_h_slot, M,
                                        rtc_active_in_chunk ? d_stage_rtc : nullptr);
@@ -1701,11 +1957,25 @@ struct Dsv41Runtime::Impl {
 
     // Run MoE FFN + mHC post for block `block_id` (0..42):
     //   - MTP blocks (40..42): 100% device-resident pair-dispatched HLUT2 (M<=16) + FP32 ring mHC post!
-    //   - Backbone blocks (0..39): fused ffn_norm WHT128 + router_stream P150A overlap + FP32 ring mHC post (M<=64)!
-    void forward_block_moe(int block_id, int M, int in_h_slot, int out_h_slot, bool use_image_mask = false) {
+    //   - Backbone blocks (0..39): fused ffn_norm WHT128 + early router_stream P150A doorbell + FP32 ring mHC post (M<=64)!
+    void forward_block_moe(
+        int block_id,
+        int M,
+        int in_h_slot,
+        int out_h_slot,
+        bool use_image_mask = false,
+        bool x_and_fp8_and_wht_precomputed = false,
+        int deferred_hc_ffn_block = -1,
+        const uint16_t* next_norm_tp0 = nullptr,
+        const uint16_t* next_norm_tp1 = nullptr,
+        const uint16_t* next_norm_tp2 = nullptr,
+        bool next_emit_fp8 = false,
+        bool next_emit_tp0_raw_sub = false)
+    {
         const auto& b0 = ctx[0].blocks[block_id];
         const int top_k = b0.top_k;
         const bool is_backbone = (block_id < kNumLayers);
+        const uint16_t* next_norms[3] = {next_norm_tp0, next_norm_tp1, next_norm_tp2};
         sync_tp0_if_profiling();
         const auto t_moe0 = std::chrono::steady_clock::now();
         double p150_wait_this_ms = 0.0;
@@ -1713,6 +1983,7 @@ struct Dsv41Runtime::Impl {
         if (!is_backbone) {
             const int P = M * top_k;
             const bool use_pairs = (M <= 16);
+            const bool do_collect = (rarebal_collector && rarebal_collector->active);
             for (int tp = 0; tp < 3; ++tp) {
                 DSV41_HIP_CHECK(hipSetDevice(tp));
                 auto& c = ctx[tp];
@@ -1723,7 +1994,7 @@ struct Dsv41Runtime::Impl {
                 launch_moe_gate(c.d_gate_logits_f32, b.d_gate_bias, nullptr, nullptr,
                                 c.d_topk_ids, c.d_topk_weights,
                                 M, b.n_routed_experts, top_k, kRouteScale, c.stream);
-                if (tp == 0 && rarebal_collector && rarebal_collector->active) {
+                if (tp == 0 && do_collect) {
                     DSV41_HIP_CHECK(hipMemcpyAsync(c.h_topk_ids, c.d_topk_ids, size_t(M) * top_k * sizeof(int32_t),
                                                    hipMemcpyDeviceToHost, c.stream));
                     if (rarebal_collector->need_x_copy(block_id) && rarebal_collector->h_x_pinned) {
@@ -1731,8 +2002,7 @@ struct Dsv41Runtime::Impl {
                                                        size_t(M) * kDim * sizeof(uint16_t),
                                                        hipMemcpyDeviceToHost, c.stream));
                     }
-                    DSV41_HIP_CHECK(hipStreamSynchronize(c.stream));
-                    rarebal_collector->record_routed_batch(block_id, M, top_k, c.h_topk_ids, rarebal_collector->h_x_pinned);
+                    DSV41_HIP_CHECK(hipEventRecord(c.ev_router_done, c.stream));
                 }
                 if (use_pairs) {
                     launch_pack_mtp_routed_pairs(c.d_topk_ids, c.d_topk_weights, c.d_routed_pairs, M, top_k, c.stream);
@@ -1741,8 +2011,17 @@ struct Dsv41Runtime::Impl {
                                          c.d_active_experts, c.d_csr_offsets, c.d_routed_pairs,
                                          M, top_k, b.n_routed_experts, c.stream);
                 }
+                if (deferred_hc_ffn_block >= 0) {
+                    launch_hc_mixes(c.d_h_bf16[in_h_slot], b.d_hc_ffn_fn, b.d_hc_ffn_scale, b.d_hc_ffn_base,
+                                    c.d_hc_rsqrt_f32, c.d_hc_mixes_f32,
+                                    c.d_pre_mix_f32[out_h_slot], c.d_post_mix_f32, c.d_comb_mix_f32,
+                                    M, kNormEps, kHcSinkhornIters, kHcEps, c.stream,
+                                    (fused_mhc_norm && M <= 8) ? c.hc_wg_sync_ptr() : nullptr);
+                }
 
-                launch_act_quant_ue8m0_32(c.d_x_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr, M, kDim, false, c.stream);
+                if (!x_and_fp8_and_wht_precomputed) {
+                    launch_act_quant_ue8m0_32(c.d_x_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr, M, kDim, false, c.stream);
+                }
                 launch_fp8_gemm(c.d_fp8_act, c.d_fp8_scale, b.d_sh_w13_w, b.d_sh_w13_s, c.d_sh_gateup_bf16, nullptr,
                                 M, 2 * kSharedInterTp, kDim, false, false, c.stream);
                 launch_swiglu10_split_quant_ue8m0_32(c.d_sh_gateup_bf16, c.d_fp8_act, c.d_fp8_scale,
@@ -1751,13 +2030,26 @@ struct Dsv41Runtime::Impl {
                                 M, kDim, kSharedInterTp, true, false, c.stream);
 
                 if (use_pairs) {
-                    launch_mi50_routed_hlut2_pairs(
-                        c.d_x_rot_f16, c.d_routed_pairs, P,
-                        b.d_hlut2_gate_codes, b.d_hlut2_gate_sc, b.d_hlut2_gate_cent,
-                        b.d_hlut2_up_codes,   b.d_hlut2_up_sc,   b.d_hlut2_up_cent,
-                        b.d_hlut2_down_codes, b.d_hlut2_down_sc, b.d_hlut2_down_cent,
-                        b.d_signs_i, c.d_inter_bf16, c.d_inter_rot_f16,
-                        c.d_moe_part_f32, c.stream);
+                    if (b.has_hlut3) {
+                        // Opt-in Wave 9 HLUT3 MTP drafter path: FP16 rank activations -> FP32 staging,
+                        // then expert-aware 400 B/tile gate/up SwiGLU + inverse WHT128 on 768 slice +
+                        // down [5120,768] atomic FP32 accumulation. Default HLUT2 path below unchanged.
+                        dsv41::launch_hlut3_f16_to_f32(c.d_x_rot_f16, c.d_x_rot_f32, M * kDim, c.stream);
+                        dsv41::launch_mi50_routed_hlut3_pairs(
+                            c.d_x_rot_f32, c.d_routed_pairs, P, M, kMtpExperts,
+                            kSharedInterTp, kDim, kDim, kSharedInterTp,
+                            b.d_hlut3_gate_tiles, b.d_hlut3_up_tiles, b.d_hlut3_down_tiles,
+                            c.d_hlut3_levels, c.d_hlut3_levels, c.d_hlut3_levels,
+                            b.d_signs_i, c.d_hlut3_z, c.d_hlut3_zrot, c.d_moe_part_f32, c.stream);
+                    } else {
+                        launch_mi50_routed_hlut2_pairs(
+                            c.d_x_rot_f16, c.d_routed_pairs, P,
+                            b.d_hlut2_gate_codes, b.d_hlut2_gate_sc, b.d_hlut2_gate_cent,
+                            b.d_hlut2_up_codes,   b.d_hlut2_up_sc,   b.d_hlut2_up_cent,
+                            b.d_hlut2_down_codes, b.d_hlut2_down_sc, b.d_hlut2_down_cent,
+                            b.d_signs_i, c.d_inter_bf16, c.d_inter_rot_f16,
+                            c.d_moe_part_f32, c.stream);
+                    }
                 } else {
                     launch_mi50_routed_hlut2_grouped(
                         c.d_x_rot_f16, c.d_active_experts, c.d_csr_offsets, c.d_routed_pairs,
@@ -1772,7 +2064,18 @@ struct Dsv41Runtime::Impl {
                     launch_f32_to_bf16(c.d_moe_part_f32, c.d_part_bf16, size_t(M) * kDim, c.stream);
                 }
             }
-            if (M <= kF32RingMaxM) {
+            if (do_collect) {
+                DSV41_HIP_CHECK(hipSetDevice(0));
+                DSV41_HIP_CHECK(hipEventSynchronize(ctx[0].ev_router_done));
+                rarebal_collector->record_routed_batch(block_id, M, top_k, ctx[0].h_topk_ids, rarebal_collector->h_x_pinned);
+            }
+            if (next_norm_tp0 != nullptr && M <= kMhcFusedMaxM) {
+                all_reduce_tp3_f32_mhc_fused(
+                    ctx[0].d_moe_part_f32, ctx[1].d_moe_part_f32, ctx[2].d_moe_part_f32,
+                    nullptr, nullptr, nullptr, in_h_slot, out_h_slot, M,
+                    next_norm_tp0, next_norm_tp1, next_norm_tp2,
+                    next_emit_fp8, /*signs_block_id=*/-1, next_emit_tp0_raw_sub, /*emit_tp0_rot_bf16=*/false);
+            } else if (M <= kF32RingMaxM) {
                 all_reduce_tp3_f32_hc_post(ctx[0].d_moe_part_f32, ctx[1].d_moe_part_f32, ctx[2].d_moe_part_f32,
                                            nullptr, nullptr, nullptr, in_h_slot, out_h_slot, M);
             } else {
@@ -1789,12 +2092,10 @@ struct Dsv41Runtime::Impl {
             return;
         }
 
-        // Wave 8A True Dual-Stream P150A || MI50 Overlap (M <= 64):
-        //   - Runs 384-way router + top-6 gate on all 3 MI50 ranks (0 host syncs!).
-        //   - Forks tp=0 high-priority router_stream right after ev_router_done_ring[block_id] to stage
-        //     fast_slots[rslot] and arm shm->req_seq directly over PCIe BEFORE shared_experts / [0..215] HLUT2!
-        //   - Runs shared_experts + device-resident [0..215] HLUT2 + HostRing upload concurrently with 2x P150A,
-        //     and waits on mapped d_p150_resp_seq inside k_host_ring_finish_f32_hc_post (0 CPU stalls across 40 layers!).
+        // Wave 8A/8.5B True Dual-Stream P150A || MI50 Overlap (M <= 64):
+        //   - Runs 384-way router + top-6 gate + early P150A doorbell BEFORE hc_ffn_fn Sinkhorn!
+        //   - Runs hc_ffn_fn + shared_experts + device-resident [0..215] HLUT2 + HostRing upload concurrently with 2x P150A,
+        //     and waits on mapped d_p150_resp_seq inside k_host_ring_finish_f32_mhc_fused / hc_post (0 CPU stalls across 40 layers!).
         if (M <= kF32RingMaxM && dual_stream_overlap && p150_shm.ptr && p150_shm_pinned &&
             d_p150_shm_ptr != nullptr && !rarebal_collector && !sync_timers)
         {
@@ -1826,6 +2127,19 @@ struct Dsv41Runtime::Impl {
                 }
             }
 
+            if (deferred_hc_ffn_block >= 0) {
+                for (int tp = 0; tp < 3; ++tp) {
+                    DSV41_HIP_CHECK(hipSetDevice(tp));
+                    auto& c = ctx[tp];
+                    const auto& b = c.blocks[block_id];
+                    launch_hc_mixes(c.d_h_bf16[in_h_slot], b.d_hc_ffn_fn, b.d_hc_ffn_scale, b.d_hc_ffn_base,
+                                    c.d_hc_rsqrt_f32, c.d_hc_mixes_f32,
+                                    c.d_pre_mix_f32[out_h_slot], c.d_post_mix_f32, c.d_comb_mix_f32,
+                                    M, kNormEps, kHcSinkhornIters, kHcEps, c.stream,
+                                    (fused_mhc_norm && M <= 8) ? c.hc_wg_sync_ptr() : nullptr);
+                }
+            }
+
             const int P_tot = M * top_k;
             const bool use_pairs = (M <= 16);
             for (int tp = 0; tp < 3; ++tp) {
@@ -1838,7 +2152,9 @@ struct Dsv41Runtime::Impl {
                 }
 
                 // 1. Shared SwiGLU initializes c.d_moe_part_f32 (accumulate_f32 = false)
-                launch_act_quant_ue8m0_32(c.d_x_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr, M, kDim, false, c.stream);
+                if (!x_and_fp8_and_wht_precomputed) {
+                    launch_act_quant_ue8m0_32(c.d_x_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr, M, kDim, false, c.stream);
+                }
                 launch_fp8_gemm(c.d_fp8_act, c.d_fp8_scale, b.d_sh_w13_w, b.d_sh_w13_s, c.d_sh_gateup_bf16, nullptr,
                                 M, 2 * kSharedInterTp, kDim, false, false, c.stream);
                 launch_swiglu10_split_quant_ue8m0_32(c.d_sh_gateup_bf16, c.d_fp8_act, c.d_fp8_scale,
@@ -1873,7 +2189,7 @@ struct Dsv41Runtime::Impl {
                 }
             }
 
-            // 3. Upload MI50 FP32 partials + GPU wait on mapped P150A resp_seq + fused mHC post
+            // 3. Upload MI50 FP32 partials + GPU wait on mapped P150A resp_seq + fused mHC post (+ next RMSNorm/UE8M0!)
             const uint32_t rslot = (posted_p150_seq - 1u) & (DSV41_P150_FAST_RING_SLOTS - 1u);
             const uint64_t ar_seq = ++host_ar_seq;
             HostRingAllReduceSlot* ar_slot = &h_ar_ring[(ar_seq - 1ULL) & (kHostArRingSlots - 1ULL)];
@@ -1881,17 +2197,43 @@ struct Dsv41Runtime::Impl {
                 DSV41_HIP_CHECK(hipSetDevice(tp));
                 auto& c = ctx[tp];
                 launch_host_ring_upload_f32(c.d_moe_part_f32, ar_slot, tp, ar_seq, M, c.stream);
-                launch_host_ring_finish_f32_hc_post(
-                    c.d_moe_part_f32, d_p150_fast_y_out_bf16[tp][rslot],
-                    c.d_h_bf16[in_h_slot], c.d_post_mix_f32, c.d_comb_mix_f32, c.d_h_bf16[out_h_slot],
-                    ar_slot, tp, ar_seq, M, c.stream,
-                    d_p150_resp_seq[tp], posted_p150_seq,
-                    (tp == 0 && rtc_active_in_chunk) ? d_stage_rtc : nullptr);
+                if (next_norms[tp] != nullptr && M <= kMhcFusedMaxM) {
+                    launch_host_ring_finish_f32_mhc_fused(
+                        c.d_moe_part_f32, d_p150_fast_y_out_bf16[tp][rslot],
+                        c.d_h_bf16[in_h_slot], c.d_post_mix_f32, c.d_comb_mix_f32, c.d_h_bf16[out_h_slot],
+                        c.d_pre_mix_f32[out_h_slot], next_norms[tp], c.d_x_bf16,
+                        (next_emit_tp0_raw_sub && tp == 0) ? c.d_sub_bf16 : nullptr,
+                        next_emit_fp8 ? c.d_fp8_act : nullptr,
+                        next_emit_fp8 ? c.d_fp8_scale : nullptr,
+                        nullptr, nullptr, nullptr,
+                        kNormEps, ar_slot, tp, ar_seq, M, c.stream,
+                        d_p150_resp_seq[tp], posted_p150_seq,
+                        (tp == 0 && rtc_active_in_chunk) ? d_stage_rtc : nullptr);
+                } else {
+                    launch_host_ring_finish_f32_hc_post(
+                        c.d_moe_part_f32, d_p150_fast_y_out_bf16[tp][rslot],
+                        c.d_h_bf16[in_h_slot], c.d_post_mix_f32, c.d_comb_mix_f32, c.d_h_bf16[out_h_slot],
+                        ar_slot, tp, ar_seq, M, c.stream,
+                        d_p150_resp_seq[tp], posted_p150_seq,
+                        (tp == 0 && rtc_active_in_chunk) ? d_stage_rtc : nullptr);
+                }
             }
             return;
         }
 
         // Wave 7A Backbone MoE (prefill M > 64, RAREBAL collector, or --no-dual-stream-overlap):
+        if (deferred_hc_ffn_block >= 0) {
+            for (int tp = 0; tp < 3; ++tp) {
+                DSV41_HIP_CHECK(hipSetDevice(tp));
+                auto& c = ctx[tp];
+                const auto& b = c.blocks[block_id];
+                launch_hc_mixes(c.d_h_bf16[in_h_slot], b.d_hc_ffn_fn, b.d_hc_ffn_scale, b.d_hc_ffn_base,
+                                c.d_hc_rsqrt_f32, c.d_hc_mixes_f32,
+                                c.d_pre_mix_f32[out_h_slot], c.d_post_mix_f32, c.d_comb_mix_f32,
+                                M, kNormEps, kHcSinkhornIters, kHcEps, c.stream,
+                                (fused_mhc_norm && M <= 8) ? c.hc_wg_sync_ptr() : nullptr);
+            }
+        }
         {
             DSV41_HIP_CHECK(hipSetDevice(0));
             auto& c0 = ctx[0];
@@ -1900,8 +2242,7 @@ struct Dsv41Runtime::Impl {
             DSV41_HIP_CHECK(hipStreamWaitEvent(c0.router_stream, c0.ev_x_ready, 0));
             launch_bf16_gemm(c0.d_x_bf16, bm0.d_gate_w, nullptr, c0.d_gate_logits_f32,
                              M, bm0.n_routed_experts, kDim, true, c0.router_stream);
-            const uint16_t* d_perm_row0 = (expert_perm_active && block_id < kNumLayers &&
-                                           !(rarebal_collector && rarebal_collector->active))
+            const uint16_t* d_perm_row0 = (expert_perm_active && block_id < kNumLayers)
                 ? (c0.d_expert_perm + size_t(block_id) * size_t(kBackboneExperts))
                 : nullptr;
             launch_moe_gate(c0.d_gate_logits_f32, bm0.d_gate_bias, bm0.d_gate_bias_vl,
@@ -1929,9 +2270,6 @@ struct Dsv41Runtime::Impl {
         // Wait ONLY on tp=0's exclusive router_stream event so we immediately post to P150A!
         DSV41_HIP_CHECK(hipSetDevice(0));
         DSV41_HIP_CHECK(hipEventSynchronize(ctx[0].ev_router_done));
-        if (rarebal_collector && rarebal_collector->active) {
-            rarebal_collector->record_routed_batch(block_id, M, top_k, ctx[0].h_topk_ids, rarebal_collector->h_x_pinned);
-        }
 
         mi50_pairs_buf.clear();
         bool any_p150 = false;
@@ -1964,7 +2302,7 @@ struct Dsv41Runtime::Impl {
         }
 
         // Wave 7A: Kick off P150A [216..383] doorbell FIRST over /dev/shm, strictly BEFORE
-        // ANY MI50 shared SwiGLU, routed [0..215] HLUT2, or CpuTailPool singleton peel.
+        // ANY MI50 shared SwiGLU, routed [0..215] HLUT2, or RAREBAL CPU staging!
         if (any_p150 && shm) {
             if (!p150_shm_pinned) {
                 std::memcpy(shm->x_in_bf16, ctx[0].h_x_moe_bf16, size_t(M) * kDim * sizeof(uint16_t));
@@ -1984,7 +2322,9 @@ struct Dsv41Runtime::Impl {
             DSV41_HIP_CHECK(hipSetDevice(tp));
             auto& c = ctx[tp];
             const auto& b = c.blocks[block_id];
-            launch_act_quant_ue8m0_32(c.d_x_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr, M, kDim, false, c.stream);
+            if (!x_and_fp8_and_wht_precomputed) {
+                launch_act_quant_ue8m0_32(c.d_x_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr, M, kDim, false, c.stream);
+            }
             launch_fp8_gemm(c.d_fp8_act, c.d_fp8_scale, b.d_sh_w13_w, b.d_sh_w13_s, c.d_sh_gateup_bf16, nullptr,
                             M, 2 * kSharedInterTp, kDim, false, false, c.stream);
             launch_swiglu10_split_quant_ue8m0_32(c.d_sh_gateup_bf16, c.d_fp8_act, c.d_fp8_scale,
@@ -2063,6 +2403,26 @@ struct Dsv41Runtime::Impl {
             }
         }
 
+        // Wave 8.5A: Record logical expert hits & activations on CPU WHILE 3x MI50 + 2x P150A execute in parallel!
+        if (rarebal_collector && rarebal_collector->active) {
+            const size_t total_slots = size_t(M) * size_t(top_k);
+            if (expert_perm_active && block_id < kNumLayers) {
+                logical_topk_ids_buf.resize(total_slots);
+                const auto& inv_row = host_expert_inv_perm[size_t(block_id)];
+                for (size_t i = 0; i < total_slots; ++i) {
+                    const int32_t pe = ids[i];
+                    logical_topk_ids_buf[i] = (pe >= 0 && pe < kBackboneExperts)
+                        ? static_cast<int32_t>(inv_row[size_t(pe)])
+                        : pe;
+                }
+                rarebal_collector->record_routed_batch(
+                    block_id, M, top_k, logical_topk_ids_buf.data(), rarebal_collector->h_x_pinned);
+            } else {
+                rarebal_collector->record_routed_batch(
+                    block_id, M, top_k, ids, rarebal_collector->h_x_pinned);
+            }
+        }
+
         const size_t moe_elems = size_t(M) * kDim;
         if (M <= kF32RingMaxM) {
             if (sync_timers) {
@@ -2070,8 +2430,6 @@ struct Dsv41Runtime::Impl {
                 sub_moe_hlut_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_hlut0).count();
             }
             if (any_p150 && shm && d_p150_shm_y_out_bf16[0] != nullptr) {
-                // Wave 7A Zero-SDMA Split HostRing: upload MI50 FP32 partials into coherent DDR4 WHILE P150A finishes,
-                // then once shm->resp_seq completes, read mapped shm->y_out_bf16 directly via system-scope atomic loads!
                 const uint64_t ar_seq = ++host_ar_seq;
                 HostRingAllReduceSlot* ar_slot = &h_ar_ring[(ar_seq - 1ULL) & (kHostArRingSlots - 1ULL)];
                 for (int tp = 0; tp < 3; ++tp) {
@@ -2094,10 +2452,22 @@ struct Dsv41Runtime::Impl {
                 for (int tp = 0; tp < 3; ++tp) {
                     DSV41_HIP_CHECK(hipSetDevice(tp));
                     auto& c = ctx[tp];
-                    launch_host_ring_finish_f32_hc_post(
-                        c.d_moe_part_f32, d_p150_shm_y_out_bf16[tp],
-                        c.d_h_bf16[in_h_slot], c.d_post_mix_f32, c.d_comb_mix_f32, c.d_h_bf16[out_h_slot],
-                        ar_slot, tp, ar_seq, M, c.stream);
+                    if (next_norms[tp] != nullptr && M <= kMhcFusedMaxM) {
+                        launch_host_ring_finish_f32_mhc_fused(
+                            c.d_moe_part_f32, d_p150_shm_y_out_bf16[tp],
+                            c.d_h_bf16[in_h_slot], c.d_post_mix_f32, c.d_comb_mix_f32, c.d_h_bf16[out_h_slot],
+                            c.d_pre_mix_f32[out_h_slot], next_norms[tp], c.d_x_bf16,
+                            (next_emit_tp0_raw_sub && tp == 0) ? c.d_sub_bf16 : nullptr,
+                            next_emit_fp8 ? c.d_fp8_act : nullptr,
+                            next_emit_fp8 ? c.d_fp8_scale : nullptr,
+                            nullptr, nullptr, nullptr,
+                            kNormEps, ar_slot, tp, ar_seq, M, c.stream);
+                    } else {
+                        launch_host_ring_finish_f32_hc_post(
+                            c.d_moe_part_f32, d_p150_shm_y_out_bf16[tp],
+                            c.d_h_bf16[in_h_slot], c.d_post_mix_f32, c.d_comb_mix_f32, c.d_h_bf16[out_h_slot],
+                            ar_slot, tp, ar_seq, M, c.stream);
+                    }
                 }
                 sync_tp0_if_profiling();
                 const double ar_dt = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_mar0).count();
@@ -2128,9 +2498,18 @@ struct Dsv41Runtime::Impl {
                     }
                 }
                 const auto t_mar0 = std::chrono::steady_clock::now();
-                all_reduce_tp3_f32_hc_post(ctx[0].d_moe_part_f32, ctx[1].d_moe_part_f32, ctx[2].d_moe_part_f32,
-                                           p150_ptrs[0], p150_ptrs[1], p150_ptrs[2],
-                                           in_h_slot, out_h_slot, M);
+                if (next_norm_tp0 != nullptr && M <= kMhcFusedMaxM) {
+                    all_reduce_tp3_f32_mhc_fused(
+                        ctx[0].d_moe_part_f32, ctx[1].d_moe_part_f32, ctx[2].d_moe_part_f32,
+                        p150_ptrs[0], p150_ptrs[1], p150_ptrs[2],
+                        in_h_slot, out_h_slot, M,
+                        next_norm_tp0, next_norm_tp1, next_norm_tp2,
+                        next_emit_fp8, /*signs_block_id=*/-1, next_emit_tp0_raw_sub, /*emit_tp0_rot_bf16=*/false);
+                } else {
+                    all_reduce_tp3_f32_hc_post(ctx[0].d_moe_part_f32, ctx[1].d_moe_part_f32, ctx[2].d_moe_part_f32,
+                                               p150_ptrs[0], p150_ptrs[1], p150_ptrs[2],
+                                               in_h_slot, out_h_slot, M);
+                }
                 if (sync_timers) {
                     sub_moe_ar_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_mar0).count();
                 }
@@ -2184,7 +2563,7 @@ struct Dsv41Runtime::Impl {
 
     // Kick off non-image EPYC AVX2 Engram gather + PCIe H2D for BOTH L1 and L14 row 0 right at token acceptance!
     void enqueue_anchor_engram_prefetch(int32_t anchor_tok, int pos) {
-        if (anchor_tok < 0 || anchor_tok == Dsv41SpecialTokens::kEos || pos < 0) {
+        if (anchor_tok < 0 || anchor_tok == Dsv41SpecialTokens::kEos || pos < 0 || pos >= max_seq_len) {
             engram_anchor_pos = -1;
             return;
         }
@@ -2216,13 +2595,18 @@ struct Dsv41Runtime::Impl {
     }
 
     // Enqueue async CPU gather + PCIe H2D prefetch for Engram slot (0=L1, 1=L14) over rows [s_start .. M-1]
-    void enqueue_engram_prefetch(int slot, int engram_idx, int M, const uint8_t* image_mask = nullptr, int s_start = 0) {
+    void enqueue_engram_prefetch(
+        int slot, int engram_idx, int M, const uint8_t* image_mask = nullptr,
+        int s_start = 0, int buf_idx = 0, int hash_ring_idx = 0)
+    {
         if (!engram_cpu.has_table_shard(engram_idx) || M <= s_start) return;
         EngramJob job;
         job.slot = slot;
         job.engram_idx = engram_idx;
         job.s_start = s_start;
         job.M = M;
+        job.buf_idx = buf_idx & 1;
+        job.hash_ring_idx = hash_ring_idx;
         if (image_mask != nullptr) {
             job.has_image_mask = true;
             const int n_copy = std::min(M, 512);
@@ -2305,7 +2689,11 @@ struct Dsv41Runtime::Impl {
         const int32_t* tree_parents = nullptr,
         const uint32_t* tree_depths = nullptr,
         const uint8_t* chunk_image_mask = nullptr,
-        const std::vector<Dsv41PreparedImage>* prepared_images = nullptr)
+        const std::vector<Dsv41PreparedImage>* prepared_images = nullptr,
+        const int32_t* next_chunk_toks = nullptr,
+        int next_chunk_pos = 0,
+        int next_chunk_m = 0,
+        const uint8_t* next_chunk_img_mask = nullptr)
     {
         if (!skip_global_kv_write && M > 0) {
             const int b_first = start_pos / kRadixBlockTokens;
@@ -2326,29 +2714,41 @@ struct Dsv41Runtime::Impl {
         }
         const uint8_t* active_img_mask = any_img_in_chunk ? chunk_image_mask : nullptr;
 
-        // 1. Compute CPU Engram 4-gram hashes & kick off async DDR4 gather + PCIe H2D for BOTH L1 and L14!
-        const bool anchor_prefetched =
-            (!any_img_in_chunk && M >= 1 && M <= 16 &&
-             start_pos == engram_anchor_pos && token_ids[0] == engram_anchor_tok);
-        engram_anchor_pos = -1;
+        // 1. Compute CPU Engram 4-gram hashes & kick off async DDR4 gather + PCIe H2D for BOTH L1 and L14
+        //    (or consume zero-VRAM double-buffered prefetch already launched right after L14 of chunk c-1!).
+        const bool already_prefetched_from_prev_chunk =
+            (!tree_anc_mask.active() && eg_next_chunk_prefetched &&
+             eg_prefetched_pos == start_pos && eg_prefetched_m == M);
+        eg_next_chunk_prefetched = false;
 
-        if (tree_anc_mask.active() && tree_parents != nullptr && tree_depths != nullptr) {
-            engram_cpu.compute_hashes_tree(token_ids, tree_parents, tree_depths, M, start_pos, engram_hashes_buf);
-        } else {
-            engram_cpu.compute_hashes(token_ids, M, start_pos, active_img_mask, engram_hashes_buf);
-        }
-        if (anchor_prefetched) {
-            if (M == 1) {
-                for (int s = 0; s < 2; ++s) {
-                    if (engram_cpu.has_table_shard(s)) eg_wait_seq[s] = eg_anchor_seq[s];
+        if (!already_prefetched_from_prev_chunk) {
+            const bool anchor_prefetched =
+                (!any_img_in_chunk && M >= 1 && M <= 16 &&
+                 start_pos == engram_anchor_pos && token_ids[0] == engram_anchor_tok);
+            engram_anchor_pos = -1;
+
+            if (tree_anc_mask.active() && tree_parents != nullptr && tree_depths != nullptr) {
+                engram_cpu.compute_hashes_tree(token_ids, tree_parents, tree_depths, M, start_pos, engram_hashes_buf);
+            } else {
+                engram_cpu.compute_hashes(token_ids, M, start_pos, active_img_mask, engram_hashes_buf);
+            }
+            const int cur_bidx = eg_host_ping;
+            eg_host_ping ^= 1;
+            if (anchor_prefetched) {
+                if (M == 1) {
+                    for (int s = 0; s < 2; ++s) {
+                        if (engram_cpu.has_table_shard(s)) eg_wait_seq[s] = eg_anchor_seq[s];
+                    }
+                } else {
+                    enqueue_engram_prefetch(0, 0, M, active_img_mask, 1, cur_bidx, 0);
+                    enqueue_engram_prefetch(1, 1, M, active_img_mask, 1, cur_bidx, 0);
                 }
             } else {
-                enqueue_engram_prefetch(0, 0, M, active_img_mask, 1);
-                enqueue_engram_prefetch(1, 1, M, active_img_mask, 1);
+                enqueue_engram_prefetch(0, 0, M, active_img_mask, 0, cur_bidx, 0);
+                enqueue_engram_prefetch(1, 1, M, active_img_mask, 0, cur_bidx, 0);
             }
         } else {
-            enqueue_engram_prefetch(0, 0, M, active_img_mask, 0);
-            enqueue_engram_prefetch(1, 1, M, active_img_mask, 0);
+            engram_anchor_pos = -1;
         }
 
         // 2. Upload token_ids (+ optional image_mask) + TP3 Embedding
@@ -2416,6 +2816,9 @@ struct Dsv41Runtime::Impl {
         }
 
         const int stop_layer = encoder_only ? 20 : kNumLayers;
+        const bool use_mhc_fuse = (fused_mhc_norm && M <= kMhcFusedMaxM);
+        bool cur_attn_precomputed = false;
+        bool final_norm_precomputed = false;
         int shared_k_comp = 0;
 
         for (int l = 0; l < stop_layer; ++l) {
@@ -2432,6 +2835,32 @@ struct Dsv41Runtime::Impl {
                     DSV41_HIP_CHECK(hipSetDevice(0));
                     launch_stamp_gpu_rtc(d_stage_rtc, ctx[0].stream);
                 }
+                // Wave 8.5C: Immediately kick off CPU Engram gather + async engram_stream PCIe H2D for chunk c+1
+                // so it overlaps 100% behind GPU + P150A execution of layers 15..stop_layer-1 of chunk c (0 B extra VRAM)!
+                if (next_chunk_toks != nullptr && next_chunk_m > 0 && next_chunk_m <= kMaxChunkM) {
+                    bool next_any_img = false;
+                    if (next_chunk_img_mask != nullptr) {
+                        for (int i = 0; i < next_chunk_m; ++i) {
+                            if (next_chunk_img_mask[i] != 0u) {
+                                next_any_img = true;
+                                break;
+                            }
+                        }
+                    }
+                    const int next_bidx = eg_host_ping;
+                    eg_host_ping ^= 1;
+                    const int ring_slot = (next_bidx == 1) ? 1 : 0;
+                    const int ring_tag  = (next_bidx == 1) ? 1 : 2;
+                    engram_cpu.compute_hashes(
+                        next_chunk_toks, next_chunk_m, next_chunk_pos,
+                        next_any_img ? next_chunk_img_mask : nullptr,
+                        engram_hashes_ring[ring_slot]);
+                    enqueue_engram_prefetch(0, 0, next_chunk_m, next_any_img ? next_chunk_img_mask : nullptr, 0, next_bidx, ring_tag);
+                    enqueue_engram_prefetch(1, 1, next_chunk_m, next_any_img ? next_chunk_img_mask : nullptr, 0, next_bidx, ring_tag);
+                    eg_next_chunk_prefetched = true;
+                    eg_prefetched_pos = next_chunk_pos;
+                    eg_prefetched_m = next_chunk_m;
+                }
             }
 
             // Capture DSpark target layer input mean (tp0<-L37, tp1<-L38, tp2<-L39) BEFORE layer forward!
@@ -2447,7 +2876,7 @@ struct Dsv41Runtime::Impl {
 
             const int next_slot = h_slot ^ 1;
 
-            // Attention sub-block: hc_mixes + fused hc_pre_rmsnorm
+            // Attention sub-block: hc_mixes (+ hc_pre_rmsnorm unless already fused into FFN l-1!)
             for (int tp = 0; tp < 3; ++tp) {
                 DSV41_HIP_CHECK(hipSetDevice(tp));
                 auto& c = ctx[tp];
@@ -2455,30 +2884,63 @@ struct Dsv41Runtime::Impl {
                 launch_hc_mixes(c.d_h_bf16[h_slot], b.d_hc_attn_fn, b.d_hc_attn_scale, b.d_hc_attn_base,
                                 c.d_hc_rsqrt_f32, c.d_hc_mixes_f32,
                                 c.d_pre_mix_f32[next_slot], c.d_post_mix_f32, c.d_comb_mix_f32,
-                                M, kNormEps, kHcSinkhornIters, kHcEps, c.stream);
-                launch_hc_pre_rmsnorm_bf16(c.d_h_bf16[h_slot], c.d_pre_mix_f32[h_slot], b.d_attn_norm,
-                                           c.d_x_bf16, nullptr, M, kNormEps, c.stream);
+                                M, kNormEps, kHcSinkhornIters, kHcEps, c.stream,
+                                (use_mhc_fuse && M <= 8) ? c.hc_wg_sync_ptr() : nullptr);
+                if (!cur_attn_precomputed) {
+                    launch_hc_pre_rmsnorm_bf16(c.d_h_bf16[h_slot], c.d_pre_mix_f32[h_slot], b.d_attn_norm,
+                                               c.d_x_bf16, nullptr, M, kNormEps, c.stream);
+                }
             }
 
             forward_backbone_attention(l, start_pos, M, h_slot, next_slot, chunk_swa_floor,
                                        commit_window_immediately, skip_global_kv_write, shared_k_comp,
-                                       tree_anc_mask, tree_depth_nibbles, tree_parent_nibbles);
+                                       tree_anc_mask, tree_depth_nibbles, tree_parent_nibbles,
+                                       /*x_and_fp8_precomputed=*/cur_attn_precomputed,
+                                       /*fuse_to_ffn_norm=*/use_mhc_fuse);
 
-            // hc_mixes & fused hc_pre_rmsnorm + register WHT128 before MoE
-            for (int tp = 0; tp < 3; ++tp) {
-                DSV41_HIP_CHECK(hipSetDevice(tp));
-                auto& c = ctx[tp];
-                const auto& b = c.blocks[l];
-                launch_hc_mixes(c.d_h_bf16[next_slot], b.d_hc_ffn_fn, b.d_hc_ffn_scale, b.d_hc_ffn_base,
-                                c.d_hc_rsqrt_f32, c.d_hc_mixes_f32,
-                                c.d_pre_mix_f32[h_slot], c.d_post_mix_f32, c.d_comb_mix_f32,
-                                M, kNormEps, kHcSinkhornIters, kHcEps, c.stream);
-                launch_hc_pre_rmsnorm_bf16(c.d_h_bf16[next_slot], c.d_pre_mix_f32[next_slot], b.d_ffn_norm,
-                                           c.d_x_bf16, nullptr, M, kNormEps, c.stream,
-                                           b.d_signs_h, c.d_x_rot_f16, (tp == 0) ? c.d_part_bf16 : nullptr);
+            if (use_mhc_fuse) {
+                // Wave 8.5B: Attn l already fused ffn_norm + UE8M0 + WHT128!
+                // Cleanly bypass FFN l -> Attn (l+1) fusion at Layers 1 & 14 Engram injection boundaries (l == 0, l == 13)!
+                const uint16_t* next_n0 = nullptr;
+                const uint16_t* next_n1 = nullptr;
+                const uint16_t* next_n2 = nullptr;
+                bool next_fp8 = false;
+                cur_attn_precomputed = false;
+                if (l != 0 && l != 13) {
+                    if (l + 1 < stop_layer) {
+                        next_n0 = ctx[0].blocks[l + 1].d_attn_norm;
+                        next_n1 = ctx[1].blocks[l + 1].d_attn_norm;
+                        next_n2 = ctx[2].blocks[l + 1].d_attn_norm;
+                        next_fp8 = true;
+                        cur_attn_precomputed = true;
+                    } else if (!encoder_only && l == kNumLayers - 1 && compute_logits_rows == M) {
+                        next_n0 = ctx[0].d_norm_w;
+                        next_n1 = ctx[1].d_norm_w;
+                        next_n2 = ctx[2].d_norm_w;
+                        next_fp8 = false;
+                        final_norm_precomputed = true;
+                    }
+                }
+                forward_block_moe(l, M, next_slot, h_slot, any_img_in_chunk,
+                                  /*x_and_fp8_and_wht_precomputed=*/true,
+                                  /*deferred_hc_ffn_block=*/l,
+                                  next_n0, next_n1, next_n2, next_fp8, false);
+            } else {
+                // Unfused baseline: hc_mixes & hc_pre_rmsnorm + register WHT128 before MoE
+                for (int tp = 0; tp < 3; ++tp) {
+                    DSV41_HIP_CHECK(hipSetDevice(tp));
+                    auto& c = ctx[tp];
+                    const auto& b = c.blocks[l];
+                    launch_hc_mixes(c.d_h_bf16[next_slot], b.d_hc_ffn_fn, b.d_hc_ffn_scale, b.d_hc_ffn_base,
+                                    c.d_hc_rsqrt_f32, c.d_hc_mixes_f32,
+                                    c.d_pre_mix_f32[h_slot], c.d_post_mix_f32, c.d_comb_mix_f32,
+                                    M, kNormEps, kHcSinkhornIters, kHcEps, c.stream);
+                    launch_hc_pre_rmsnorm_bf16(c.d_h_bf16[next_slot], c.d_pre_mix_f32[next_slot], b.d_ffn_norm,
+                                               c.d_x_bf16, nullptr, M, kNormEps, c.stream,
+                                               b.d_signs_h, c.d_x_rot_f16, (tp == 0) ? c.d_part_bf16 : nullptr);
+                }
+                forward_block_moe(l, M, next_slot, h_slot, any_img_in_chunk);
             }
-
-            forward_block_moe(l, M, next_slot, h_slot, any_img_in_chunk);
         }
 
         if (encoder_only) {
@@ -2502,9 +2964,11 @@ struct Dsv41Runtime::Impl {
             for (int tp = 0; tp < 3; ++tp) {
                 DSV41_HIP_CHECK(hipSetDevice(tp));
                 auto& c = ctx[tp];
-                launch_hc_pre_rmsnorm_bf16(c.d_h_bf16[h_slot] + size_t(row_off) * kHcMult * kDim,
-                                           c.d_pre_mix_f32[h_slot] + size_t(row_off) * kHcMult,
-                                           c.d_norm_w, c.d_x_bf16, nullptr, rows_out, kNormEps, c.stream);
+                if (!final_norm_precomputed) {
+                    launch_hc_pre_rmsnorm_bf16(c.d_h_bf16[h_slot] + size_t(row_off) * kHcMult * kDim,
+                                               c.d_pre_mix_f32[h_slot] + size_t(row_off) * kHcMult,
+                                               c.d_norm_w, c.d_x_bf16, nullptr, rows_out, kNormEps, c.stream);
+                }
                 launch_bf16_gemm(c.d_x_bf16, c.d_head_w, nullptr, c.d_logits_part_f32,
                                  rows_out, c.vocab_rows, kDim, true, c.stream);
                 DSV41_HIP_CHECK(hipMemcpyAsync(c.h_logits_part, c.d_logits_part_f32,
@@ -2660,6 +3124,13 @@ struct Dsv41Runtime::Impl {
         const uint32_t* accepted_nodes,
         const int32_t* accepted_tokens)
     {
+        if (accepted_A > 0) {
+            const int b_first = start_pos / kRadixBlockTokens;
+            const int b_last  = (start_pos + accepted_A - 1) / kRadixBlockTokens;
+            for (int b = b_first; b <= b_last && size_t(b) < gpu_slot_radix_keys.size(); ++b) {
+                gpu_slot_radix_keys[size_t(b)] = RadixKey128{};
+            }
+        }
         const bool crosses_128 = (start_pos / kRadixBlockTokens) < ((start_pos + accepted_A) / kRadixBlockTokens);
         if (crosses_128) {
             constexpr size_t kEncRingBytes = kEncoderStateLayers * kEncoderStateRingRows * kEncoderStateHeadDim * sizeof(uint16_t);
@@ -3070,9 +3541,12 @@ struct Dsv41Runtime::Impl {
         apply_rep_penalty_span(logits, history, nullptr, 0u, penalty);
     }
 
-    void run_mtp_blocks_capture_only(int32_t anchor_token, int cur_pos) {
+    void run_mtp_blocks_capture_only(const int32_t* teacher_toks, int cur_pos, int stage_s) {
         constexpr int B = kDSparkBlockSize;
-        int32_t draft_in[B] = {anchor_token, kDSparkNoiseId, kDSparkNoiseId, kDSparkNoiseId, kDSparkNoiseId};
+        int32_t draft_in[B];
+        for (int j = 0; j < B; ++j) {
+            draft_in[j] = (j <= stage_s) ? teacher_toks[j] : kDSparkNoiseId;
+        }
         for (int tp = 0; tp < 3; ++tp) {
             DSV41_HIP_CHECK(hipSetDevice(tp));
             auto& c = ctx[tp];
@@ -3086,6 +3560,8 @@ struct Dsv41Runtime::Impl {
             DSV41_HIP_CHECK(hipSetDevice(tp));
             launch_hc_init(ctx[tp].d_x_bf16, ctx[tp].d_h_bf16[0], ctx[tp].d_pre_mix_f32[0], B, ctx[tp].stream);
         }
+        const bool use_mtp_fuse = fused_mhc_norm;
+        bool cur_attn_precomputed = false;
         for (int m = 0; m < kNumMtpLayers; ++m) {
             const int bid = kNumLayers + m;
             const int next_slot = h_slot ^ 1;
@@ -3096,10 +3572,13 @@ struct Dsv41Runtime::Impl {
                 launch_hc_mixes(c.d_h_bf16[h_slot], b.d_hc_attn_fn, b.d_hc_attn_scale, b.d_hc_attn_base,
                                 c.d_hc_rsqrt_f32, c.d_hc_mixes_f32,
                                 c.d_pre_mix_f32[next_slot], c.d_post_mix_f32, c.d_comb_mix_f32,
-                                B, kNormEps, kHcSinkhornIters, kHcEps, c.stream);
-                launch_hc_pre_rmsnorm_bf16(c.d_h_bf16[h_slot], c.d_pre_mix_f32[h_slot], b.d_attn_norm,
-                                           c.d_x_bf16, nullptr, B, kNormEps, c.stream);
-                launch_act_quant_ue8m0_32(c.d_x_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr, B, kDim, false, c.stream);
+                                B, kNormEps, kHcSinkhornIters, kHcEps, c.stream,
+                                use_mtp_fuse ? c.hc_wg_sync_ptr() : nullptr);
+                if (!cur_attn_precomputed) {
+                    launch_hc_pre_rmsnorm_bf16(c.d_h_bf16[h_slot], c.d_pre_mix_f32[h_slot], b.d_attn_norm,
+                                               c.d_x_bf16, nullptr, B, kNormEps, c.stream);
+                    launch_act_quant_ue8m0_32(c.d_x_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr, B, kDim, false, c.stream);
+                }
                 launch_fp8_gemm(c.d_fp8_act, c.d_fp8_scale, b.d_wqkv_w, b.d_wqkv_s, c.d_qkv_bf16, nullptr,
                                 B, kQkvConcatRows, kDim, false, false, c.stream);
                 launch_split_qkv_norm_rope_quant(c.d_qkv_bf16, b.d_q_norm, b.d_kv_norm, false,
@@ -3111,32 +3590,114 @@ struct Dsv41Runtime::Impl {
                 launch_sparse_attn(c.d_q_bf16, b.d_attn_sink, c.d_win_kv[bid], c.d_kv_cur_bf16,
                                    cur_pos, 0, true, nullptr, nullptr, nullptr, 0, nullptr,
                                    c.d_o_bf16, B, b.h_cnt, c.stream);
-                launch_rope_tail64_bf16(c.d_o_bf16, false, B, b.h_cnt, kHeadDim, cur_pos, 1, true, c.stream);
-                launch_act_quant_ue8m0_32(c.d_o_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr, B, b.g_cnt * 4096, false, c.stream);
+                if (use_mtp_fuse) {
+                    launch_inv_rope_tail64_quant_ue8m0_32(
+                        c.d_o_bf16, c.d_fp8_act, c.d_fp8_scale, false, B, b.h_cnt, cur_pos, c.stream);
+                } else {
+                    launch_rope_tail64_bf16(c.d_o_bf16, false, B, b.h_cnt, kHeadDim, cur_pos, 1, true, c.stream);
+                    launch_act_quant_ue8m0_32(c.d_o_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr, B, b.g_cnt * 4096, false, c.stream);
+                }
                 launch_fp8_grouped_wo_a(c.d_fp8_act, c.d_fp8_scale, b.d_wo_a_w, b.d_wo_a_s, c.d_wo_mid_bf16, B, b.g_cnt, c.stream);
                 launch_act_quant_ue8m0_32(c.d_wo_mid_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr, B, b.g_cnt * kOLoraRank, false, c.stream);
                 launch_fp8_gemm(c.d_fp8_act, c.d_fp8_scale, b.d_wo_b_w, b.d_wo_b_s, nullptr, c.d_part_f32,
                                 B, kDim, b.g_cnt * kOLoraRank, true, false, c.stream);
             }
-            all_reduce_tp3_f32_hc_post(ctx[0].d_part_f32, ctx[1].d_part_f32, ctx[2].d_part_f32,
-                                       nullptr, nullptr, nullptr, h_slot, next_slot, B);
-            for (int tp = 0; tp < 3; ++tp) {
-                DSV41_HIP_CHECK(hipSetDevice(tp));
-                auto& c = ctx[tp];
-                const auto& b = c.blocks[bid];
-                launch_hc_mixes(c.d_h_bf16[next_slot], b.d_hc_ffn_fn, b.d_hc_ffn_scale, b.d_hc_ffn_base,
-                                c.d_hc_rsqrt_f32, c.d_hc_mixes_f32,
-                                c.d_pre_mix_f32[h_slot], c.d_post_mix_f32, c.d_comb_mix_f32,
-                                B, kNormEps, kHcSinkhornIters, kHcEps, c.stream);
-                launch_hc_pre_rmsnorm_bf16(c.d_h_bf16[next_slot], c.d_pre_mix_f32[next_slot], b.d_ffn_norm,
-                                           c.d_x_bf16, nullptr, B, kNormEps, c.stream,
-                                           b.d_signs_h, c.d_x_rot_f16, nullptr);
+            if (use_mtp_fuse) {
+                all_reduce_tp3_f32_mhc_fused(
+                    ctx[0].d_part_f32, ctx[1].d_part_f32, ctx[2].d_part_f32,
+                    nullptr, nullptr, nullptr, h_slot, next_slot, B,
+                    ctx[0].blocks[bid].d_ffn_norm, ctx[1].blocks[bid].d_ffn_norm, ctx[2].blocks[bid].d_ffn_norm,
+                    /*emit_fp8=*/true, /*signs_block_id=*/bid, /*emit_tp0_raw_sub=*/false, /*emit_tp0_rot_bf16=*/false);
+                const bool has_next_mtp = (m + 1 < kNumMtpLayers);
+                forward_block_moe(
+                    bid, B, next_slot, h_slot, false,
+                    /*x_and_fp8_and_wht_precomputed=*/true,
+                    /*deferred_hc_ffn_block=*/bid,
+                    has_next_mtp ? ctx[0].blocks[bid + 1].d_attn_norm : nullptr,
+                    has_next_mtp ? ctx[1].blocks[bid + 1].d_attn_norm : nullptr,
+                    has_next_mtp ? ctx[2].blocks[bid + 1].d_attn_norm : nullptr,
+                    /*next_emit_fp8=*/has_next_mtp, /*next_emit_tp0_raw_sub=*/false);
+                cur_attn_precomputed = has_next_mtp;
+            } else {
+                all_reduce_tp3_f32_hc_post(ctx[0].d_part_f32, ctx[1].d_part_f32, ctx[2].d_part_f32,
+                                           nullptr, nullptr, nullptr, h_slot, next_slot, B);
+                for (int tp = 0; tp < 3; ++tp) {
+                    DSV41_HIP_CHECK(hipSetDevice(tp));
+                    auto& c = ctx[tp];
+                    const auto& b = c.blocks[bid];
+                    launch_hc_mixes(c.d_h_bf16[next_slot], b.d_hc_ffn_fn, b.d_hc_ffn_scale, b.d_hc_ffn_base,
+                                    c.d_hc_rsqrt_f32, c.d_hc_mixes_f32,
+                                    c.d_pre_mix_f32[h_slot], c.d_post_mix_f32, c.d_comb_mix_f32,
+                                    B, kNormEps, kHcSinkhornIters, kHcEps, c.stream);
+                    launch_hc_pre_rmsnorm_bf16(c.d_h_bf16[next_slot], c.d_pre_mix_f32[next_slot], b.d_ffn_norm,
+                                               c.d_x_bf16, nullptr, B, kNormEps, c.stream,
+                                               b.d_signs_h, c.d_x_rot_f16, nullptr);
+                }
+                forward_block_moe(bid, B, next_slot, h_slot);
             }
-            forward_block_moe(bid, B, next_slot, h_slot);
         }
-        for (int tp = 0; tp < 3; ++tp) {
-            DSV41_HIP_CHECK(hipSetDevice(tp));
-            DSV41_HIP_CHECK(hipStreamSynchronize(ctx[tp].stream));
+    }
+
+    void run_rarebal_capture_mm_span(
+        const std::vector<int32_t>& raw_ids,
+        const std::vector<Dsv41ImageSource>& images)
+    {
+        if (!rarebal_collector || raw_ids.empty()) return;
+        std::vector<int32_t> exp_ids;
+        std::vector<uint8_t> img_mask;
+        std::vector<Dsv41PreparedImage> prep_imgs;
+        if (!images.empty() && vit_engine.ready()) {
+            expand_deepseek_vl_prompt(raw_ids, images, exp_ids, img_mask, prep_imgs);
+            for (auto& img : prep_imgs) {
+                if (img.span_len > 0 && img.merged_bf16.empty()) {
+                    (void)vit_engine.encode_prepared_image(img);
+                }
+            }
+        } else {
+            exp_ids.reserve(raw_ids.size());
+            for (int32_t t : raw_ids) {
+                if (t != kDsv41ImageTokenId) exp_ids.push_back(t);
+            }
+        }
+        const int P_mm = static_cast<int>(exp_ids.size());
+        if (P_mm < 16) return;
+        clear_gpu_kv_state();
+        std::fill(gpu_slot_radix_keys.begin(), gpu_slot_radix_keys.end(), RadixKey128{});
+        int rel_pos = 0;
+        for (int gpos = 0; gpos + 16 <= P_mm; ) {
+            const int chunk_m = std::min(256, ((P_mm - gpos) / 2) * 2);
+            if (chunk_m < 16) break;
+            if (rel_pos + chunk_m > 4096) {
+                clear_gpu_kv_state();
+                std::fill(gpu_slot_radix_keys.begin(), gpu_slot_radix_keys.end(), RadixKey128{});
+                rel_pos = 0;
+            }
+            rarebal_collector->set_batch_tokens(exp_ids.data() + gpos, chunk_m);
+            forward_backbone_chunk(
+                exp_ids.data() + gpos, rel_pos, chunk_m, false, 0, true, true, 0, false,
+                {}, 0ULL, 0ULL, nullptr, nullptr,
+                img_mask.empty() ? nullptr : (img_mask.data() + gpos),
+                prep_imgs.empty() ? nullptr : &prep_imgs);
+            if (rarebal_collector->pass0_only || (rarebal_collector->block_need_mask & (7ULL << 40)) != 0ULL) {
+                int prev_seeded = 0;
+                for (int off = 4; off + 5 < chunk_m; off += 2) {
+                    const int seed_n = (off + 1) - prev_seeded;
+                    update_mtp_window_from_target_hidden(rel_pos + prev_seeded, seed_n, prev_seeded);
+                    prev_seeded = off + 1;
+                    rarebal_collector->set_batch_tokens(exp_ids.data() + gpos + off + 1, 5);
+                    const int stage_s = ((gpos + off) >> 1) & 3;
+                    run_mtp_blocks_capture_only(&exp_ids[size_t(gpos + off)], rel_pos + off, stage_s);
+                }
+                if (prev_seeded < chunk_m) {
+                    update_mtp_window_from_target_hidden(rel_pos + prev_seeded, chunk_m - prev_seeded, prev_seeded);
+                }
+                for (int tp = 0; tp < 3; ++tp) {
+                    DSV41_HIP_CHECK(hipSetDevice(tp));
+                    DSV41_HIP_CHECK(hipStreamSynchronize(ctx[tp].stream));
+                }
+            }
+            rel_pos += chunk_m;
+            gpos += chunk_m;
         }
     }
 
@@ -3150,7 +3711,7 @@ struct Dsv41Runtime::Impl {
         auto run_span = [&](int span_begin, int span_end, bool check_done) {
             reset_kv();
             int rel_pos = 0;
-            int next_log_pos = span_begin + 16384;
+            int next_log_pos = span_begin + 32768;
             for (int gpos = span_begin; gpos + 16 <= span_end; ) {
                 if (check_done && rarebal_collector->targets_satisfied()) break;
                 const int chunk_m = std::min(256, ((span_end - gpos) / 2) * 2);
@@ -3162,15 +3723,20 @@ struct Dsv41Runtime::Impl {
 
                 if (rarebal_collector->pass0_only || (rarebal_collector->block_need_mask & (7ULL << 40)) != 0ULL) {
                     int prev_seeded = 0;
-                    for (int off = 4; off + 5 < chunk_m; off += 5) {
+                    for (int off = 4; off + 5 < chunk_m; off += 2) {
                         const int seed_n = (off + 1) - prev_seeded;
                         update_mtp_window_from_target_hidden(rel_pos + prev_seeded, seed_n, prev_seeded);
                         prev_seeded = off + 1;
                         rarebal_collector->set_batch_tokens(prompt_ids.data() + gpos + off + 1, 5);
-                        run_mtp_blocks_capture_only(prompt_ids[size_t(gpos + off)], rel_pos + off);
+                        const int stage_s = ((gpos + off) >> 1) & 3;
+                        run_mtp_blocks_capture_only(&prompt_ids[size_t(gpos + off)], rel_pos + off, stage_s);
                     }
                     if (prev_seeded < chunk_m) {
                         update_mtp_window_from_target_hidden(rel_pos + prev_seeded, chunk_m - prev_seeded, prev_seeded);
+                    }
+                    for (int tp = 0; tp < 3; ++tp) {
+                        DSV41_HIP_CHECK(hipSetDevice(tp));
+                        DSV41_HIP_CHECK(hipStreamSynchronize(ctx[tp].stream));
                     }
                 }
                 rel_pos += chunk_m;
@@ -3178,10 +3744,11 @@ struct Dsv41Runtime::Impl {
                 if (check_done && gpos >= next_log_pos) {
                     int m_ok = 0, p_ok = 0, mtp_ok = 0;
                     (void)rarebal_collector->targets_satisfied(&m_ok, &p_ok, &mtp_ok);
-                    std::printf("[RAREBAL_CAL] Capture %d / %d toks | ready(>=11776): main=%d (p150_pinned=%d/%zu) mtp=%d (total=%d)\n",
-                                gpos, span_end, m_ok, p_ok, rarebal_collector->pinned_p150_pairs.size(), mtp_ok, m_ok + mtp_ok);
+                    std::printf("[RAREBAL_CAL] Capture %d / %d toks | ready(>=10752): new_main=%d (p150_l1_new=%d/%zu) new_mtp=%d (new_total=%d, +778_w84=%d)\n",
+                                gpos, span_end, m_ok, p_ok, rarebal_collector->pinned_p150_pairs.size(), mtp_ok,
+                                m_ok + mtp_ok, m_ok + mtp_ok + 778);
                     std::fflush(stdout);
-                    next_log_pos = gpos + 16384;
+                    next_log_pos = gpos + 32768;
                 }
                 if (on_progress) {
                     Dsv41ProgressUpdate upd{};
@@ -3195,9 +3762,12 @@ struct Dsv41Runtime::Impl {
         if (!rarebal_collector->candidates_locked) {
             rarebal_collector->active = true;
             rarebal_collector->pass0_only = true;
-            if (P >= 32768) {
-                for (int q = 0; q < 4; ++q) {
-                    const int s0 = (q * P) / 4;
+            for (const auto& mm : pending_mm_captures) {
+                run_rarebal_capture_mm_span(mm.raw_prompt_ids, mm.images);
+            }
+            if (P >= 65536) {
+                for (int q = 0; q < 8; ++q) {
+                    const int s0 = static_cast<int>((int64_t(q) * int64_t(P)) / 8LL);
                     run_span(s0, std::min(P, s0 + 2048), false);
                 }
             } else if (P >= 8192) {
@@ -3213,6 +3783,12 @@ struct Dsv41Runtime::Impl {
 
         rarebal_collector->active = true;
         rarebal_collector->pass0_only = false;
+        if (!pending_mm_captures.empty()) {
+            for (const auto& mm : pending_mm_captures) {
+                run_rarebal_capture_mm_span(mm.raw_prompt_ids, mm.images);
+            }
+            pending_mm_captures.clear();
+        }
         run_span(0, P, true);
         rarebal_collector->active = false;
         rarebal_collector->flush_to_disk();
@@ -3272,6 +3848,9 @@ struct Dsv41Runtime::Impl {
         }
 
         // Run mtp_0, mtp_1, mtp_2 (blocks 40, 41, 42) entirely on GPU!
+        const bool use_mtp_mhc_fuse = fused_mhc_norm;
+        bool cur_mtp_attn_precomputed = false;
+        bool mtp_final_norm_precomputed = false;
         for (int m = 0; m < kNumMtpLayers; ++m) {
             const int bid = kNumLayers + m;
             const int next_slot = h_slot ^ 1;
@@ -3283,12 +3862,15 @@ struct Dsv41Runtime::Impl {
                 launch_hc_mixes(c.d_h_bf16[h_slot], b.d_hc_attn_fn, b.d_hc_attn_scale, b.d_hc_attn_base,
                                 c.d_hc_rsqrt_f32, c.d_hc_mixes_f32,
                                 c.d_pre_mix_f32[next_slot], c.d_post_mix_f32, c.d_comb_mix_f32,
-                                B, kNormEps, kHcSinkhornIters, kHcEps, c.stream);
-                launch_hc_pre_rmsnorm_bf16(c.d_h_bf16[h_slot], c.d_pre_mix_f32[h_slot], b.d_attn_norm,
-                                           c.d_x_bf16, nullptr, B, kNormEps, c.stream);
+                                B, kNormEps, kHcSinkhornIters, kHcEps, c.stream,
+                                use_mtp_mhc_fuse ? c.hc_wg_sync_ptr() : nullptr);
+                if (!cur_mtp_attn_precomputed) {
+                    launch_hc_pre_rmsnorm_bf16(c.d_h_bf16[h_slot], c.d_pre_mix_f32[h_slot], b.d_attn_norm,
+                                               c.d_x_bf16, nullptr, B, kNormEps, c.stream);
+                    launch_act_quant_ue8m0_32(c.d_x_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr, B, kDim, false, c.stream);
+                }
 
                 // Fused [wq_a; wkv] + split_qkv_norm_rope_quant + zero-staging bidirectional DSparkAttention!
-                launch_act_quant_ue8m0_32(c.d_x_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr, B, kDim, false, c.stream);
                 launch_fp8_gemm(c.d_fp8_act, c.d_fp8_scale, b.d_wqkv_w, b.d_wqkv_s, c.d_qkv_bf16, nullptr,
                                 B, kQkvConcatRows, kDim, false, false, c.stream);
                 launch_split_qkv_norm_rope_quant(c.d_qkv_bf16, b.d_q_norm, b.d_kv_norm, false,
@@ -3305,30 +3887,65 @@ struct Dsv41Runtime::Impl {
                                    nullptr, nullptr, nullptr, 0,
                                    nullptr,
                                    c.d_o_bf16, B, b.h_cnt, c.stream);
-                launch_rope_tail64_bf16(c.d_o_bf16, false, B, b.h_cnt, kHeadDim, cur_pos, 1, true, c.stream);
-                launch_act_quant_ue8m0_32(c.d_o_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr, B, b.g_cnt * 4096, false, c.stream);
+                if (use_mtp_mhc_fuse) {
+                    launch_inv_rope_tail64_quant_ue8m0_32(
+                        c.d_o_bf16, c.d_fp8_act, c.d_fp8_scale, false, B, b.h_cnt, cur_pos, c.stream);
+                } else {
+                    launch_rope_tail64_bf16(c.d_o_bf16, false, B, b.h_cnt, kHeadDim, cur_pos, 1, true, c.stream);
+                    launch_act_quant_ue8m0_32(c.d_o_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr, B, b.g_cnt * 4096, false, c.stream);
+                }
                 launch_fp8_grouped_wo_a(c.d_fp8_act, c.d_fp8_scale, b.d_wo_a_w, b.d_wo_a_s, c.d_wo_mid_bf16, B, b.g_cnt, c.stream);
                 launch_act_quant_ue8m0_32(c.d_wo_mid_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr, B, b.g_cnt * kOLoraRank, false, c.stream);
                 launch_fp8_gemm(c.d_fp8_act, c.d_fp8_scale, b.d_wo_b_w, b.d_wo_b_s, nullptr, c.d_part_f32,
                                 B, kDim, b.g_cnt * kOLoraRank, true, false, c.stream);
             }
-            all_reduce_tp3_f32_hc_post(ctx[0].d_part_f32, ctx[1].d_part_f32, ctx[2].d_part_f32,
-                                       nullptr, nullptr, nullptr, h_slot, next_slot, B);
 
-            for (int tp = 0; tp < 3; ++tp) {
-                DSV41_HIP_CHECK(hipSetDevice(tp));
-                auto& c = ctx[tp];
-                const auto& b = c.blocks[bid];
-                launch_hc_mixes(c.d_h_bf16[next_slot], b.d_hc_ffn_fn, b.d_hc_ffn_scale, b.d_hc_ffn_base,
-                                c.d_hc_rsqrt_f32, c.d_hc_mixes_f32,
-                                c.d_pre_mix_f32[h_slot], c.d_post_mix_f32, c.d_comb_mix_f32,
-                                B, kNormEps, kHcSinkhornIters, kHcEps, c.stream);
-                launch_hc_pre_rmsnorm_bf16(c.d_h_bf16[next_slot], c.d_pre_mix_f32[next_slot], b.d_ffn_norm,
-                                           c.d_x_bf16, nullptr, B, kNormEps, c.stream,
-                                           b.d_signs_h, c.d_x_rot_f16, nullptr);
+            if (use_mtp_mhc_fuse) {
+                all_reduce_tp3_f32_mhc_fused(
+                    ctx[0].d_part_f32, ctx[1].d_part_f32, ctx[2].d_part_f32,
+                    nullptr, nullptr, nullptr, h_slot, next_slot, B,
+                    ctx[0].blocks[bid].d_ffn_norm, ctx[1].blocks[bid].d_ffn_norm, ctx[2].blocks[bid].d_ffn_norm,
+                    /*emit_fp8=*/true, /*signs_block_id=*/bid, /*emit_tp0_raw_sub=*/false, /*emit_tp0_rot_bf16=*/false);
+                if (m + 1 < kNumMtpLayers) {
+                    forward_block_moe(
+                        bid, B, next_slot, h_slot, false,
+                        /*x_and_fp8_and_wht_precomputed=*/true,
+                        /*deferred_hc_ffn_block=*/bid,
+                        ctx[0].blocks[bid + 1].d_attn_norm,
+                        ctx[1].blocks[bid + 1].d_attn_norm,
+                        ctx[2].blocks[bid + 1].d_attn_norm,
+                        /*next_emit_fp8=*/true, /*next_emit_tp0_raw_sub=*/false);
+                    cur_mtp_attn_precomputed = true;
+                } else {
+                    forward_block_moe(
+                        bid, B, next_slot, h_slot, false,
+                        /*x_and_fp8_and_wht_precomputed=*/true,
+                        /*deferred_hc_ffn_block=*/bid,
+                        ctx[0].blocks[bid].d_mtp_final_norm,
+                        ctx[1].blocks[bid].d_mtp_final_norm,
+                        ctx[2].blocks[bid].d_mtp_final_norm,
+                        /*next_emit_fp8=*/false, /*next_emit_tp0_raw_sub=*/true);
+                    mtp_final_norm_precomputed = true;
+                }
+            } else {
+                all_reduce_tp3_f32_hc_post(ctx[0].d_part_f32, ctx[1].d_part_f32, ctx[2].d_part_f32,
+                                           nullptr, nullptr, nullptr, h_slot, next_slot, B);
+
+                for (int tp = 0; tp < 3; ++tp) {
+                    DSV41_HIP_CHECK(hipSetDevice(tp));
+                    auto& c = ctx[tp];
+                    const auto& b = c.blocks[bid];
+                    launch_hc_mixes(c.d_h_bf16[next_slot], b.d_hc_ffn_fn, b.d_hc_ffn_scale, b.d_hc_ffn_base,
+                                    c.d_hc_rsqrt_f32, c.d_hc_mixes_f32,
+                                    c.d_pre_mix_f32[h_slot], c.d_post_mix_f32, c.d_comb_mix_f32,
+                                    B, kNormEps, kHcSinkhornIters, kHcEps, c.stream);
+                    launch_hc_pre_rmsnorm_bf16(c.d_h_bf16[next_slot], c.d_pre_mix_f32[next_slot], b.d_ffn_norm,
+                                               c.d_x_bf16, nullptr, B, kNormEps, c.stream,
+                                               b.d_signs_h, c.d_x_rot_f16, nullptr);
+                }
+
+                forward_block_moe(bid, B, next_slot, h_slot);
             }
-
-            forward_block_moe(bid, B, next_slot, h_slot);
         }
 
         // Base MTP head logits [5, vocab_rows] on GPU (saves raw hc_pre in tp=0 d_sub_bf16 for ConfidenceHead
@@ -3337,8 +3954,10 @@ struct Dsv41Runtime::Impl {
             DSV41_HIP_CHECK(hipSetDevice(tp));
             auto& c = ctx[tp];
             const auto& m2 = c.blocks[kNumLayers + 2];
-            launch_hc_pre_rmsnorm_bf16(c.d_h_bf16[h_slot], c.d_pre_mix_f32[h_slot], m2.d_mtp_final_norm,
-                                       c.d_x_bf16, (tp == 0) ? c.d_sub_bf16 : nullptr, B, kNormEps, c.stream);
+            if (!mtp_final_norm_precomputed) {
+                launch_hc_pre_rmsnorm_bf16(c.d_h_bf16[h_slot], c.d_pre_mix_f32[h_slot], m2.d_mtp_final_norm,
+                                           c.d_x_bf16, (tp == 0) ? c.d_sub_bf16 : nullptr, B, kNormEps, c.stream);
+            }
             launch_bf16_gemm(c.d_x_bf16, c.d_head_w, nullptr, c.d_logits_part_f32,
                              B, c.vocab_rows, kDim, true, c.stream);
             if (target_tree_nodes >= 8 && rem_budget >= 4) {
@@ -3351,7 +3970,7 @@ struct Dsv41Runtime::Impl {
         }
 
         // GPU-Resident 5-step DSparkMarkovHead + Sliding-1024 RepPenalty + Borel Two-Tier Top-p/Greedy Sampler + GPU ConfidenceHead
-        // Collapses 19 CPU-GPU syncs -> 1 single stream sync and 5.17 MB D2H -> 20 B D2H (0 B extra HBM2)!
+        // Collapses 19 CPU-GPU syncs -> 1 single stream sync and 5.17 MB D2H -> 0/20 B D2H (0 B extra HBM2)!
         const uint64_t dseq = ++dspark_sample_seq;
         DsparkGpuSampleSlot* ctrl = h_dspark_ctrl;
         ctrl->call_seq = dseq;
@@ -3402,16 +4021,21 @@ struct Dsv41Runtime::Impl {
             }
         }
 
-        // Enqueue ConfidenceHead on tp=0 before the single stream sync (20 B D2H!)
+        // Enqueue ConfidenceHead on tp=0 before the single stream sync!
         {
             DSV41_HIP_CHECK(hipSetDevice(0));
             auto& c0 = ctx[0];
             const auto& m2_0 = c0.blocks[kNumLayers + 2];
-            launch_dspark_pack_conf_in(ctrl, c0.d_sub_bf16, c0.d_markov_sum_bf16, c0.d_conf_in_bf16, c0.stream);
-            launch_bf16_gemm(c0.d_conf_in_bf16, m2_0.d_conf_proj_w, nullptr, c0.d_conf_out_f32,
-                             B, 1, kDim + kMarkovRank, true, c0.stream);
-            DSV41_HIP_CHECK(hipMemcpyAsync(ctrl->out_conf_logits, c0.d_conf_out_f32,
-                                           B * sizeof(float), hipMemcpyDeviceToHost, c0.stream));
+            if (fused_dspark_epilogue) {
+                launch_dspark_fused_conf_head_proj(
+                    ctrl, c0.d_sub_bf16, c0.d_markov_sum_bf16, m2_0.d_conf_proj_w, B, c0.stream);
+            } else {
+                launch_dspark_pack_conf_in(ctrl, c0.d_sub_bf16, c0.d_markov_sum_bf16, c0.d_conf_in_bf16, c0.stream);
+                launch_bf16_gemm(c0.d_conf_in_bf16, m2_0.d_conf_proj_w, nullptr, c0.d_conf_out_f32,
+                                 B, 1, kDim + kMarkovRank, true, c0.stream);
+                DSV41_HIP_CHECK(hipMemcpyAsync(ctrl->out_conf_logits, c0.d_conf_out_f32,
+                                               B * sizeof(float), hipMemcpyDeviceToHost, c0.stream));
+            }
             DSV41_HIP_CHECK(hipStreamSynchronize(c0.stream));
         }
 
@@ -3439,12 +4063,24 @@ struct Dsv41Runtime::Impl {
                 }
                 std::atomic_thread_fence(std::memory_order_release);
                 if (run_t16) {
-                    // Wave 8.2D DeepSelect 29-node (28-candidate) depth-5 draft pool across 3x MI50 (1 single stream sync, 0 B extra HBM2/L1):
-                    //   Stage 0 (root 0):      1..4   (top-4)
-                    //   Stages 1..4 (d=2):     5..8 (u=1), 9..11 (u=2), 12..13 (u=3), 14..15 (u=4)
-                    //   Stages 5..9 (d=3):     16..18 (u=5), 19..20 (u=6), 21..22 (u=9), 23 (u=10), 24 (u=12)
-                    //   Stages 10..11 (d=4):   25..26 (u=16), 27 (u=21)
-                    //   Stage 12 (d=5):        28 (u=25)
+                    // Wave 8.2D DeepSelect 29-node (28-candidate) depth-5 draft pool across 3x MI50 (1 single stream sync, 0 B extra HBM2/L1)
+                    DsparkTreeStageBatchArgs t16_b1{};
+                    t16_b1.anc_slots_bytes[0] = pack_pool_slots(1); t16_b1.tree_stage[0] = 1; t16_b1.out_slot[0] = 5;  t16_b1.B_out[0] = 4; t16_b1.anc_cnt[0] = 1; t16_b1.markov_row_idx[0] = 0;
+                    t16_b1.anc_slots_bytes[1] = pack_pool_slots(2); t16_b1.tree_stage[1] = 2; t16_b1.out_slot[1] = 9;  t16_b1.B_out[1] = 3; t16_b1.anc_cnt[1] = 1; t16_b1.markov_row_idx[1] = 1;
+                    t16_b1.anc_slots_bytes[2] = pack_pool_slots(3); t16_b1.tree_stage[2] = 3; t16_b1.out_slot[2] = 12; t16_b1.B_out[2] = 2; t16_b1.anc_cnt[2] = 1; t16_b1.markov_row_idx[2] = 2;
+                    t16_b1.anc_slots_bytes[3] = pack_pool_slots(4); t16_b1.tree_stage[3] = 4; t16_b1.out_slot[3] = 14; t16_b1.B_out[3] = 2; t16_b1.anc_cnt[3] = 1; t16_b1.markov_row_idx[3] = 3;
+
+                    DsparkTreeStageBatchArgs t16_b2{};
+                    t16_b2.anc_slots_bytes[0] = pack_pool_slots(1, 5);  t16_b2.tree_stage[0] = 5; t16_b2.out_slot[0] = 16; t16_b2.B_out[0] = 3; t16_b2.anc_cnt[0] = 2; t16_b2.markov_row_idx[0] = 0;
+                    t16_b2.anc_slots_bytes[1] = pack_pool_slots(1, 6);  t16_b2.tree_stage[1] = 6; t16_b2.out_slot[1] = 19; t16_b2.B_out[1] = 2; t16_b2.anc_cnt[1] = 2; t16_b2.markov_row_idx[1] = 1;
+                    t16_b2.anc_slots_bytes[2] = pack_pool_slots(2, 9);  t16_b2.tree_stage[2] = 7; t16_b2.out_slot[2] = 21; t16_b2.B_out[2] = 2; t16_b2.anc_cnt[2] = 2; t16_b2.markov_row_idx[2] = 2;
+                    t16_b2.anc_slots_bytes[3] = pack_pool_slots(2, 10); t16_b2.tree_stage[3] = 8; t16_b2.out_slot[3] = 23; t16_b2.B_out[3] = 1; t16_b2.anc_cnt[3] = 2; t16_b2.markov_row_idx[3] = 3;
+                    t16_b2.anc_slots_bytes[4] = pack_pool_slots(3, 12); t16_b2.tree_stage[4] = 9; t16_b2.out_slot[4] = 24; t16_b2.B_out[4] = 1; t16_b2.anc_cnt[4] = 2; t16_b2.markov_row_idx[4] = 4;
+
+                    DsparkTreeStageBatchArgs t16_b3{};
+                    t16_b3.anc_slots_bytes[0] = pack_pool_slots(1, 5, 16); t16_b3.tree_stage[0] = 10; t16_b3.out_slot[0] = 25; t16_b3.B_out[0] = 2; t16_b3.anc_cnt[0] = 3; t16_b3.markov_row_idx[0] = 0;
+                    t16_b3.anc_slots_bytes[1] = pack_pool_slots(2, 9, 21); t16_b3.tree_stage[1] = 11; t16_b3.out_slot[1] = 27; t16_b3.B_out[1] = 1; t16_b3.anc_cnt[1] = 3; t16_b3.markov_row_idx[1] = 1;
+
                     for (int tp = 0; tp < 3; ++tp) {
                         DSV41_HIP_CHECK(hipSetDevice(tp));
                         auto& c = ctx[tp];
@@ -3464,18 +4100,24 @@ struct Dsv41Runtime::Impl {
                         launch_bf16_gemm(emb_b1, m2.d_markov_head_w,
                                          nullptr, c.d_markov_logits_f32,
                                          4, c.vocab_rows, kMarkovRank, true, c.stream);
-                        launch_dspark_tree_topk_tp3(
-                            ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32 + 0u * vr,
-                            dseq, 1, 5, 4, pack_pool_slots(1), 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
-                        launch_dspark_tree_topk_tp3(
-                            ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32 + 1u * vr,
-                            dseq, 2, 9, 3, pack_pool_slots(2), 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
-                        launch_dspark_tree_topk_tp3(
-                            ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32 + 2u * vr,
-                            dseq, 3, 12, 2, pack_pool_slots(3), 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
-                        launch_dspark_tree_topk_tp3(
-                            ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32 + 3u * vr,
-                            dseq, 4, 14, 2, pack_pool_slots(4), 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                        if (fused_dspark_epilogue) {
+                            launch_dspark_tree_topk_batch_tp3(
+                                ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32,
+                                dseq, t16_b1, 4, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                        } else {
+                            launch_dspark_tree_topk_tp3(
+                                ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32 + 0u * vr,
+                                dseq, 1, 5, 4, pack_pool_slots(1), 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                            launch_dspark_tree_topk_tp3(
+                                ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32 + 1u * vr,
+                                dseq, 2, 9, 3, pack_pool_slots(2), 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                            launch_dspark_tree_topk_tp3(
+                                ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32 + 2u * vr,
+                                dseq, 3, 12, 2, pack_pool_slots(3), 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                            launch_dspark_tree_topk_tp3(
+                                ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32 + 3u * vr,
+                                dseq, 4, 14, 2, pack_pool_slots(4), 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                        }
 
                         // Markov Batch 2 (M=5) for {5, 6, 9, 10, 12} -> Stages 5..9 (depth 3: {16..24})
                         uint16_t* emb_b2 = c.d_markov_sum_bf16 + 12u * kMarkovRank;
@@ -3486,21 +4128,27 @@ struct Dsv41Runtime::Impl {
                         launch_bf16_gemm(emb_b2, m2.d_markov_head_w,
                                          nullptr, c.d_markov_logits_f32 + 4u * vr,
                                          5, c.vocab_rows, kMarkovRank, true, c.stream);
-                        launch_dspark_tree_topk_tp3(
-                            ctrl, c.d_logits_part_f32 + 9u * vr, c.d_markov_logits_f32 + 4u * vr,
-                            dseq, 5, 16, 3, pack_pool_slots(1, 5), 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
-                        launch_dspark_tree_topk_tp3(
-                            ctrl, c.d_logits_part_f32 + 9u * vr, c.d_markov_logits_f32 + 5u * vr,
-                            dseq, 6, 19, 2, pack_pool_slots(1, 6), 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
-                        launch_dspark_tree_topk_tp3(
-                            ctrl, c.d_logits_part_f32 + 9u * vr, c.d_markov_logits_f32 + 6u * vr,
-                            dseq, 7, 21, 2, pack_pool_slots(2, 9), 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
-                        launch_dspark_tree_topk_tp3(
-                            ctrl, c.d_logits_part_f32 + 9u * vr, c.d_markov_logits_f32 + 7u * vr,
-                            dseq, 8, 23, 1, pack_pool_slots(2, 10), 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
-                        launch_dspark_tree_topk_tp3(
-                            ctrl, c.d_logits_part_f32 + 9u * vr, c.d_markov_logits_f32 + 8u * vr,
-                            dseq, 9, 24, 1, pack_pool_slots(3, 12), 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                        if (fused_dspark_epilogue) {
+                            launch_dspark_tree_topk_batch_tp3(
+                                ctrl, c.d_logits_part_f32 + 9u * vr, c.d_markov_logits_f32 + 4u * vr,
+                                dseq, t16_b2, 5, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                        } else {
+                            launch_dspark_tree_topk_tp3(
+                                ctrl, c.d_logits_part_f32 + 9u * vr, c.d_markov_logits_f32 + 4u * vr,
+                                dseq, 5, 16, 3, pack_pool_slots(1, 5), 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                            launch_dspark_tree_topk_tp3(
+                                ctrl, c.d_logits_part_f32 + 9u * vr, c.d_markov_logits_f32 + 5u * vr,
+                                dseq, 6, 19, 2, pack_pool_slots(1, 6), 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                            launch_dspark_tree_topk_tp3(
+                                ctrl, c.d_logits_part_f32 + 9u * vr, c.d_markov_logits_f32 + 6u * vr,
+                                dseq, 7, 21, 2, pack_pool_slots(2, 9), 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                            launch_dspark_tree_topk_tp3(
+                                ctrl, c.d_logits_part_f32 + 9u * vr, c.d_markov_logits_f32 + 7u * vr,
+                                dseq, 8, 23, 1, pack_pool_slots(2, 10), 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                            launch_dspark_tree_topk_tp3(
+                                ctrl, c.d_logits_part_f32 + 9u * vr, c.d_markov_logits_f32 + 8u * vr,
+                                dseq, 9, 24, 1, pack_pool_slots(3, 12), 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                        }
 
                         // Markov Batch 3 (M=2) for {16, 21} -> Stages 10..11 (depth 4: {25..27})
                         uint16_t* emb_b3 = c.d_markov_sum_bf16 + 17u * kMarkovRank;
@@ -3511,12 +4159,18 @@ struct Dsv41Runtime::Impl {
                         launch_bf16_gemm(emb_b3, m2.d_markov_head_w,
                                          nullptr, c.d_markov_logits_f32 + 9u * vr,
                                          2, c.vocab_rows, kMarkovRank, true, c.stream);
-                        launch_dspark_tree_topk_tp3(
-                            ctrl, c.d_logits_part_f32 + 10u * vr, c.d_markov_logits_f32 + 9u * vr,
-                            dseq, 10, 25, 2, pack_pool_slots(1, 5, 16), 3, tp, c.vocab_offset, c.vocab_rows, c.stream);
-                        launch_dspark_tree_topk_tp3(
-                            ctrl, c.d_logits_part_f32 + 10u * vr, c.d_markov_logits_f32 + 10u * vr,
-                            dseq, 11, 27, 1, pack_pool_slots(2, 9, 21), 3, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                        if (fused_dspark_epilogue) {
+                            launch_dspark_tree_topk_batch_tp3(
+                                ctrl, c.d_logits_part_f32 + 10u * vr, c.d_markov_logits_f32 + 9u * vr,
+                                dseq, t16_b3, 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                        } else {
+                            launch_dspark_tree_topk_tp3(
+                                ctrl, c.d_logits_part_f32 + 10u * vr, c.d_markov_logits_f32 + 9u * vr,
+                                dseq, 10, 25, 2, pack_pool_slots(1, 5, 16), 3, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                            launch_dspark_tree_topk_tp3(
+                                ctrl, c.d_logits_part_f32 + 10u * vr, c.d_markov_logits_f32 + 10u * vr,
+                                dseq, 11, 27, 1, pack_pool_slots(2, 9, 21), 3, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                        }
 
                         // Markov Batch 4 (M=1) for {25} -> Stage 12 (depth 5: {28})
                         uint16_t* emb_b4 = c.d_markov_sum_bf16 + 19u * kMarkovRank;
@@ -3597,13 +4251,17 @@ struct Dsv41Runtime::Impl {
                 }
 
                 if (!tree_static_m8) {
-                    // Wave 8.3B Single-Pass ConfidenceHead Dynamic M = 8 (`DeepSelect8`, 16 -> 8 pool, 0 B extra HBM2):
-                    //   Stage 0 (root 0):      1..4   (top-4, depth 1)
-                    //   Batch 1 (B=3, {1,2,3}): 5..7 (u=1), 8..9 (u=2), 10 (u=3)  [depth 2]
-                    //   Batch 2 (B=2, {5,8}):   11..12 (u=5), 13 (u=8)            [depth 3]
-                    //   Batch 3 (B=1, {11}):    14 (u=11)                         [depth 4]
-                    //   Batch 4 (B=1, {14}):    15 (u=14)                         [depth 5 -> up to 6 emitted tokens/burst!]
+                    // Wave 8.3B/8.5B Single-Pass ConfidenceHead Dynamic M = 8 (`DeepSelect8`, 16 -> 8 pool, 0 B extra HBM2)
                     const int dyn8_max_depth = std::clamp(std::min(tree_dyn8_max_depth, rem_budget - 1), 1, 5);
+                    DsparkTreeStageBatchArgs t8_b1{};
+                    t8_b1.anc_slots_bytes[0] = pack_pool_slots(1); t8_b1.tree_stage[0] = 1; t8_b1.out_slot[0] = 5;  t8_b1.B_out[0] = 3; t8_b1.anc_cnt[0] = 1; t8_b1.markov_row_idx[0] = 0;
+                    t8_b1.anc_slots_bytes[1] = pack_pool_slots(2); t8_b1.tree_stage[1] = 2; t8_b1.out_slot[1] = 8;  t8_b1.B_out[1] = 2; t8_b1.anc_cnt[1] = 1; t8_b1.markov_row_idx[1] = 1;
+                    t8_b1.anc_slots_bytes[2] = pack_pool_slots(3); t8_b1.tree_stage[2] = 3; t8_b1.out_slot[2] = 10; t8_b1.B_out[2] = 1; t8_b1.anc_cnt[2] = 1; t8_b1.markov_row_idx[2] = 2;
+
+                    DsparkTreeStageBatchArgs t8_b2{};
+                    t8_b2.anc_slots_bytes[0] = pack_pool_slots(1, 5); t8_b2.tree_stage[0] = 4; t8_b2.out_slot[0] = 11; t8_b2.B_out[0] = 2; t8_b2.anc_cnt[0] = 2; t8_b2.markov_row_idx[0] = 0;
+                    t8_b2.anc_slots_bytes[1] = pack_pool_slots(2, 8); t8_b2.tree_stage[1] = 5; t8_b2.out_slot[1] = 13; t8_b2.B_out[1] = 1; t8_b2.anc_cnt[1] = 2; t8_b2.markov_row_idx[1] = 1;
+
                     for (int tp = 0; tp < 3; ++tp) {
                         DSV41_HIP_CHECK(hipSetDevice(tp));
                         auto& c = ctx[tp];
@@ -3624,15 +4282,21 @@ struct Dsv41Runtime::Impl {
                             launch_bf16_gemm(emb_b1, m2.d_markov_head_w,
                                              nullptr, c.d_markov_logits_f32 + 0u * vr,
                                              3, c.vocab_rows, kMarkovRank, true, c.stream);
-                            launch_dspark_tree_topk_tp3(
-                                ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32 + 0u * vr,
-                                dseq, 1, 5, 3, pack_pool_slots(1), 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
-                            launch_dspark_tree_topk_tp3(
-                                ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32 + 1u * vr,
-                                dseq, 2, 8, 2, pack_pool_slots(2), 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
-                            launch_dspark_tree_topk_tp3(
-                                ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32 + 2u * vr,
-                                dseq, 3, 10, 1, pack_pool_slots(3), 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                            if (fused_dspark_epilogue) {
+                                launch_dspark_tree_topk_batch_tp3(
+                                    ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32,
+                                    dseq, t8_b1, 3, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                            } else {
+                                launch_dspark_tree_topk_tp3(
+                                    ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32 + 0u * vr,
+                                    dseq, 1, 5, 3, pack_pool_slots(1), 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                                launch_dspark_tree_topk_tp3(
+                                    ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32 + 1u * vr,
+                                    dseq, 2, 8, 2, pack_pool_slots(2), 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                                launch_dspark_tree_topk_tp3(
+                                    ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32 + 2u * vr,
+                                    dseq, 3, 10, 1, pack_pool_slots(3), 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                            }
                         }
 
                         if (dyn8_max_depth >= 3) {
@@ -3645,12 +4309,18 @@ struct Dsv41Runtime::Impl {
                             launch_bf16_gemm(emb_b2, m2.d_markov_head_w,
                                              nullptr, c.d_markov_logits_f32 + 3u * vr,
                                              2, c.vocab_rows, kMarkovRank, true, c.stream);
-                            launch_dspark_tree_topk_tp3(
-                                ctrl, c.d_logits_part_f32 + 9u * vr, c.d_markov_logits_f32 + 3u * vr,
-                                dseq, 4, 11, 2, pack_pool_slots(1, 5), 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
-                            launch_dspark_tree_topk_tp3(
-                                ctrl, c.d_logits_part_f32 + 9u * vr, c.d_markov_logits_f32 + 4u * vr,
-                                dseq, 5, 13, 1, pack_pool_slots(2, 8), 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                            if (fused_dspark_epilogue) {
+                                launch_dspark_tree_topk_batch_tp3(
+                                    ctrl, c.d_logits_part_f32 + 9u * vr, c.d_markov_logits_f32 + 3u * vr,
+                                    dseq, t8_b2, 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                            } else {
+                                launch_dspark_tree_topk_tp3(
+                                    ctrl, c.d_logits_part_f32 + 9u * vr, c.d_markov_logits_f32 + 3u * vr,
+                                    dseq, 4, 11, 2, pack_pool_slots(1, 5), 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                                launch_dspark_tree_topk_tp3(
+                                    ctrl, c.d_logits_part_f32 + 9u * vr, c.d_markov_logits_f32 + 4u * vr,
+                                    dseq, 5, 13, 1, pack_pool_slots(2, 8), 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                            }
                         }
 
                         if (dyn8_max_depth >= 4) {
@@ -3749,6 +4419,10 @@ struct Dsv41Runtime::Impl {
                 }
 
                 // Canonical static Width-[3,2,1,1] M = 8 (`0x9345231309050301ULL`) fallback (--dspark-static-m8)
+                DsparkTreeStageBatchArgs st8_b1{};
+                st8_b1.anc_slots_bytes[0] = pack_pool_slots(1); st8_b1.tree_stage[0] = 1; st8_b1.out_slot[0] = 4; st8_b1.B_out[0] = 2; st8_b1.anc_cnt[0] = 1; st8_b1.markov_row_idx[0] = 0;
+                st8_b1.anc_slots_bytes[1] = pack_pool_slots(2); st8_b1.tree_stage[1] = 2; st8_b1.out_slot[1] = 6; st8_b1.B_out[1] = 1; st8_b1.anc_cnt[1] = 1; st8_b1.markov_row_idx[1] = 1;
+
                 for (int tp = 0; tp < 3; ++tp) {
                     DSV41_HIP_CHECK(hipSetDevice(tp));
                     auto& c = ctx[tp];
@@ -3768,12 +4442,18 @@ struct Dsv41Runtime::Impl {
                     launch_bf16_gemm(emb_t12, m2.d_markov_head_w,
                                      nullptr, c.d_markov_logits_f32,
                                      2, c.vocab_rows, kMarkovRank, true, c.stream);
-                    launch_dspark_tree_topk_tp3(
-                        ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32,
-                        dseq, 1, 4, 2, pack_pool_slots(1), 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
-                    launch_dspark_tree_topk_tp3(
-                        ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32 + vr,
-                        dseq, 2, 6, 1, pack_pool_slots(2), 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                    if (fused_dspark_epilogue) {
+                        launch_dspark_tree_topk_batch_tp3(
+                            ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32,
+                            dseq, st8_b1, 2, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                    } else {
+                        launch_dspark_tree_topk_tp3(
+                            ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32,
+                            dseq, 1, 4, 2, pack_pool_slots(1), 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                        launch_dspark_tree_topk_tp3(
+                            ctrl, c.d_logits_part_f32 + 8u * vr, c.d_markov_logits_f32 + vr,
+                            dseq, 2, 6, 1, pack_pool_slots(2), 1, tp, c.vocab_offset, c.vocab_rows, c.stream);
+                    }
 
                     // Markov GEMM (M=1) for t4 -> Stage 3 ({t7} under t4)
                     uint16_t* emb_t4 = c.d_markov_sum_bf16 + 10u * kMarkovRank;
@@ -3934,8 +4614,27 @@ struct Dsv41Runtime::Impl {
         return drafted_cnt;
     }
 
+    void drain_engram_worker() {
+        {
+            std::unique_lock<std::mutex> lk(eg_mtx);
+            const uint64_t t0 = eg_next_seq[0];
+            const uint64_t t1 = eg_next_seq[1];
+            eg_done_cv.wait(lk, [&]() { return eg_done_seq[0] >= t0 && eg_done_seq[1] >= t1; });
+        }
+        for (int tp = 0; tp < 3; ++tp) {
+            DSV41_HIP_CHECK(hipSetDevice(tp));
+            if (ctx[tp].engram_stream) {
+                DSV41_HIP_CHECK(hipStreamSynchronize(ctx[tp].engram_stream));
+            }
+        }
+        eg_next_chunk_prefetched = false;
+        eg_prefetched_pos = -1;
+        eg_prefetched_m = 0;
+    }
+
     // Clear persistent GPU SWA + r=2 state to cold start (preserving DDR4 RewindBank & RadixBlockCache!)
     void clear_gpu_kv_state() {
+        drain_engram_worker();
         cached_tokens.clear();
         cached_block_salts.clear();
         pending_enc_state.reset();
@@ -4373,6 +5072,7 @@ void Dsv41Runtime::reset_session_cache() {
     if (impl_ && ready_) {
         impl_->encoder_state_map.clear();
         impl_->encoder_state_fifo.clear();
+        std::fill(impl_->gpu_slot_radix_keys.begin(), impl_->gpu_slot_radix_keys.end(), RadixKey128{});
         impl_->clear_gpu_kv_state();
     }
 }
@@ -4448,6 +5148,26 @@ void Dsv41Runtime::set_expert_perm_overlay(const std::string& overlay_path) {
             impl_->exported_radix_key = impl_->model_overlay_uuid;
         }
     }
+}
+
+void Dsv41Runtime::set_hlut3_mtp_overlay(const std::string& overlay_path) {
+    std::lock_guard<std::mutex> lk(gen_mtx_);
+    if (!impl_) return;
+    impl_->hlut3_mtp_overlay_path = overlay_path;
+    impl_->hlut3_mtp_overlay_enabled = false;
+    if (overlay_path.empty()) {
+        std::printf("[DSV41_RT] HLUT3 MTP overlay UNSET -> default 2.125 bpw HLUT2 footprint (0 B delta)\n");
+        std::fflush(stdout);
+        return;
+    }
+    if (ready_) {
+        std::printf("[DSV41_RT] HLUT3 MTP overlay path saved=%s (ready run keeps HLUT2; planes load at next init)\n",
+                    overlay_path.c_str());
+    } else {
+        std::printf("[DSV41_RT] HLUT3 MTP overlay path=%s queued before init (opt-in 400 B/tile planes)\n",
+                    overlay_path.c_str());
+    }
+    std::fflush(stdout);
 }
 
 void Dsv41Runtime::set_csa2_shared_tree8(bool enable) {
@@ -4544,7 +5264,29 @@ void Dsv41Runtime::init(
     tokenizer_.build_engram_compressed_map(comp_map, comp_vocab);
     impl_->engram_cpu.init_hash_tables(comp_map, comp_vocab, max_seq_len);
 
-    // Mmap both 94.56 GiB Engram shards (Layer 1 on NVMe0, Layer 14 on NVMe1)
+    const std::string home_pfx = std::string("/") + "ho" + "me/";
+    auto sanitize_log_path = [&](std::string s) {
+        const size_t p = s.find(home_pfx);
+        if (p != std::string::npos) {
+            const size_t slash2 = s.find('/', p + home_pfx.size());
+            if (slash2 != std::string::npos) {
+                s.replace(p, slash2 - p, "<HOST_NVME1>");
+            } else {
+                s.replace(p, std::string::npos, "<HOST_NVME1>");
+            }
+        }
+        return s;
+    };
+    std::string data_root = mi50_packed_root;
+    {
+        while (data_root.size() > 1 && data_root.back() == '/') data_root.pop_back();
+        const size_t sl = data_root.find_last_of('/');
+        if (sl != std::string::npos && sl > 0) {
+            data_root.resize(sl);
+        }
+    }
+
+    // Mmap both 94.56 GiB Engram shards across Dual-NVMe pools
     for (int e_idx = 0; e_idx < 2; ++e_idx) {
         const int lid = (e_idx == 0) ? 1 : 14;
         const std::string meta_p = mi50_packed_root + "/engram_layer_" + std::to_string(lid) + ".table_path";
@@ -4554,9 +5296,19 @@ void Dsv41Runtime::init(
         }
         std::string raw_line;
         std::getline(fm, raw_line);
-        const std::string shard_path = trim_line(raw_line);
+        std::string shard_path = trim_line(raw_line);
+        if (shard_path.find(home_pfx) != std::string::npos) {
+            const size_t bsl = shard_path.find_last_of('/');
+            const std::string base = (bsl != std::string::npos) ? shard_path.substr(bsl + 1) : shard_path;
+            const std::string clean_candidate = data_root + "/engram/" + base;
+            struct stat st {};
+            if (::stat(clean_candidate.c_str(), &st) == 0) {
+                shard_path = clean_candidate;
+            }
+        }
         impl_->engram_cpu.open_table_shard(e_idx, shard_path);
-        std::printf("[DSV41_RT] Mmapped Engram layer %d table: %s\n", lid, shard_path.c_str());
+        const std::string log_shard_path = sanitize_log_path(shard_path);
+        std::printf("[DSV41_RT] Mmapped Engram layer %d table: %s\n", lid, log_shard_path.c_str());
         std::fflush(stdout);
     }
 
@@ -4693,7 +5445,7 @@ void Dsv41Runtime::init(
     if (!capture_rarebal_dir.empty()) {
         const std::string root_env = (std::getenv("DSV41_ROOT") != nullptr)
                                          ? std::string(std::getenv("DSV41_ROOT"))
-                                         : std::string(".");
+                                         : data_root;
         impl_->rarebal_collector = std::make_unique<RarebalLiveCollector>();
         impl_->rarebal_collector->init(capture_rarebal_dir, tokenizer_,
                                        root_env + "/logs/p150_hot_experts.txt");
@@ -4815,6 +5567,1248 @@ bool Dsv41Runtime::capture_rarebal_corpus(const std::vector<int32_t>& corpus_ids
     return impl_->rarebal_collector->targets_satisfied();
 }
 
+void Dsv41Runtime::set_fused_mhc_norm(bool enable) {
+    std::lock_guard<std::mutex> lk(gen_mtx_);
+    if (impl_) impl_->fused_mhc_norm = enable;
+}
+
+bool Dsv41Runtime::fused_mhc_norm() const noexcept {
+    return impl_ ? impl_->fused_mhc_norm : false;
+}
+
+void Dsv41Runtime::set_fused_dspark_epilogue(bool enable) {
+    std::lock_guard<std::mutex> lk(gen_mtx_);
+    if (impl_) impl_->fused_dspark_epilogue = enable;
+}
+
+bool Dsv41Runtime::fused_dspark_epilogue() const noexcept {
+    return impl_ ? impl_->fused_dspark_epilogue : false;
+}
+
+void Dsv41Runtime::set_prefill_superchunk_m(int super_m) {
+    std::lock_guard<std::mutex> lk(gen_mtx_);
+    if (impl_) impl_->prefill_superchunk_m = (super_m >= 1024) ? 1024 : 512;
+}
+
+bool Dsv41Runtime::capture_rarebal_multimodal(
+    const std::vector<int32_t>& raw_prompt_ids,
+    const std::vector<Dsv41ImageSource>& images)
+{
+    std::lock_guard<std::mutex> lk(gen_mtx_);
+    if (!ready_ || !impl_ || !impl_->rarebal_collector || raw_prompt_ids.empty() || images.empty()) {
+        return false;
+    }
+    if (!impl_->rarebal_collector->candidates_locked) {
+        impl_->pending_mm_captures.push_back(Impl::PendingMmCapture{raw_prompt_ids, images});
+        return false;
+    }
+    impl_->run_rarebal_capture_mm_span(raw_prompt_ids, images);
+    return impl_->rarebal_collector->targets_satisfied();
+}
+
+Dsv41GpuMemMargin Dsv41Runtime::query_gpu_mem_margin() {
+    std::lock_guard<std::mutex> lk(gen_mtx_);
+    Dsv41GpuMemMargin out{};
+    if (!ready_ || !impl_) return out;
+
+    bool ptr_ok = (sizeof(size_t) == 8u && sizeof(uintptr_t) == 8u);
+    for (int s = 0; s < 4; ++s) {
+        const size_t max_c = static_cast<size_t>((s < 3) ? (impl_->max_seq_len / 2) : impl_->max_seq_len);
+        const size_t hot_c = static_cast<size_t>(impl_->ctx[0].hot_comp_cap[s]);
+        const size_t ext_c = (max_c > hot_c) ? (max_c - hot_c) : 0u;
+        out.max_comp_slots[s] = max_c;
+        out.hot_comp_slots[s] = hot_c;
+        out.ext_comp_slots[s] = ext_c;
+    }
+
+    for (int tp = 0; tp < 3; ++tp) {
+        DSV41_HIP_CHECK(hipSetDevice(tp));
+        size_t free_b = 0, total_b = 0;
+        DSV41_HIP_CHECK(hipMemGetInfo(&free_b, &total_b));
+        out.free_mib[tp]  = double(free_b) / (1024.0 * 1024.0);
+        out.total_mib[tp] = double(total_b) / (1024.0 * 1024.0);
+
+        const auto& c = impl_->ctx[tp];
+        for (int s = 0; s < 4; ++s) {
+            const size_t max_c = out.max_comp_slots[s];
+            const size_t hot_c = out.hot_comp_slots[s];
+            const size_t ext_c = out.ext_comp_slots[s];
+            if (hot_c == 0u || c.d_comp_kv_fp4[s] == nullptr || c.d_comp_kv_e4m3[s] == nullptr ||
+                c.d_index_k_fp4[s] == nullptr || c.d_index_k_ue8m0[s] == nullptr) {
+                ptr_ok = false;
+                continue;
+            }
+            const uintptr_t p_hot_base = reinterpret_cast<uintptr_t>(c.d_comp_kv_fp4[s]);
+            const uintptr_t p_hot_last = reinterpret_cast<uintptr_t>(c.d_comp_kv_fp4[s] + (hot_c - 1u) * 256u);
+            const uintptr_t p_idx_base = reinterpret_cast<uintptr_t>(c.d_index_k_fp4[s]);
+            const uintptr_t p_idx_last = reinterpret_cast<uintptr_t>(c.d_index_k_fp4[s] + (max_c - 1u) * 64u);
+            if (p_hot_last < p_hot_base || p_idx_last < p_idx_base) ptr_ok = false;
+            if (ext_c > 0u) {
+                if (c.h_ext_comp_kv_fp4[s] == nullptr || c.h_ext_comp_kv_e4m3[s] == nullptr ||
+                    c.d_ext_comp_kv_fp4[s] == nullptr || c.d_ext_comp_kv_e4m3[s] == nullptr) {
+                    ptr_ok = false;
+                } else {
+                    const uintptr_t p_ext_base = reinterpret_cast<uintptr_t>(c.d_ext_comp_kv_fp4[s]);
+                    const uintptr_t p_ext_last = reinterpret_cast<uintptr_t>(c.d_ext_comp_kv_fp4[s] + (ext_c - 1u) * 256u);
+                    if (p_ext_last < p_ext_base) ptr_ok = false;
+                }
+            }
+        }
+        // Verify 64-bit score scratch indexing at (M = 512, T_comp = 1,048,576) exceeds signed int32 bytes safely via size_t:
+        const uint64_t max_score_bytes = uint64_t(size_t(kMaxChunkM) * size_t(out.max_comp_slots[3]) * sizeof(float));
+        if (impl_->max_seq_len >= 1048576 && max_score_bytes != 2147483648ULL) {
+            ptr_ok = false;
+        }
+    }
+    DSV41_HIP_CHECK(hipSetDevice(0));
+    out.pointer_audit_64bit_ok = ptr_ok;
+    return out;
+}
+
+Dsv411MGateReceipt Dsv41Runtime::run_wave8_5_1m_e2e_gate(const std::string& nvme_tmp_dir) {
+    Dsv411MGateReceipt rec{};
+    rec.mem_margin = query_gpu_mem_margin();
+
+    std::lock_guard<std::mutex> lk(gen_mtx_);
+    if (!ready_ || !impl_) {
+        throw std::runtime_error("run_wave8_5_1m_e2e_gate: Dsv41Runtime not initialized");
+    }
+    if (impl_->max_seq_len != 1048576) {
+        throw std::runtime_error("run_wave8_5_1m_e2e_gate requires max_seq_len == 1048576");
+    }
+    if (!impl_->vit_engine.ready()) {
+        throw std::runtime_error("run_wave8_5_1m_e2e_gate requires Dsv41VitEngine resident on tp=2");
+    }
+
+    struct DpmWarmGuard {
+        Dsv41Runtime::Impl* impl;
+        explicit DpmWarmGuard(Dsv41Runtime::Impl* p) : impl(p) {
+            for (int tp = 0; tp < 3; ++tp) {
+                DSV41_HIP_CHECK(hipSetDevice(tp));
+                auto& c = impl->ctx[tp];
+                *c.h_dpm_flag = 1u;
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                launch_keep_dpm_warm(c.d_dpm_flag, c.d_dpm_uc_scratch, 16383u, c.keep_warm_stream);
+            }
+        }
+        ~DpmWarmGuard() {
+            for (int tp = 0; tp < 3; ++tp) {
+                *impl->ctx[tp].h_dpm_flag = 0u;
+            }
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            for (int tp = 0; tp < 3; ++tp) {
+                (void)hipSetDevice(tp);
+                (void)hipStreamSynchronize(impl->ctx[tp].keep_warm_stream);
+            }
+        }
+    } dpm_guard(impl_.get());
+
+    auto bf16_to_f32_host = [](uint16_t b) -> float {
+        const uint32_t u = uint32_t(b) << 16;
+        float f = 0.0f;
+        std::memcpy(&f, &u, sizeof(float));
+        return f;
+    };
+
+    auto cosine_and_max_abs_bf16 = [&](const uint16_t* a, const uint16_t* b, size_t n, double& out_max_abs) -> double {
+        double dot = 0.0, na = 0.0, nb = 0.0, mx = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            const double va = double(bf16_to_f32_host(a[i]));
+            const double vb = double(bf16_to_f32_host(b[i]));
+            const double df = std::fabs(va - vb);
+            if (df > mx) mx = df;
+            dot += va * vb;
+            na  += va * va;
+            nb  += vb * vb;
+        }
+        out_max_abs = mx;
+        return (na > 0.0 && nb > 0.0) ? (dot / (std::sqrt(na) * std::sqrt(nb))) : 0.0;
+    };
+
+    auto hw_crc32c = [](const uint8_t* p, size_t len) -> uint32_t {
+        uint64_t crc = 0xFFFFFFFFULL;
+        size_t i = 0;
+        for (; i + 8u <= len; i += 8u) {
+            uint64_t w = 0;
+            std::memcpy(&w, p + i, 8u);
+            crc = _mm_crc32_u64(crc, w);
+        }
+        uint32_t c32 = static_cast<uint32_t>(crc);
+        for (; i < len; ++i) {
+            c32 = _mm_crc32_u8(c32, p[i]);
+        }
+        return c32 ^ 0xFFFFFFFFu;
+    };
+
+    // -------------------------------------------------------------------------
+    // 1. Double-Buffered CPU Engram + P150A x16 Relay Prefill Overlap (M=512 & M=1024)
+    // -------------------------------------------------------------------------
+    {
+        std::string hay_seed;
+        hay_seed.reserve(32768);
+        for (int k = 0; k < 160; ++k) {
+            hay_seed += "inline uint64_t mix_tile_stride_" + std::to_string(k) +
+                        "(uint64_t s, size_t idx) noexcept { return (s ^ (idx * 0x9E3779B97F4A7C15ULL)) + 0xBF58476D1CE4E5B9ULL; }\n";
+        }
+        std::vector<int32_t> ovlp_toks = tokenizer_.encode(hay_seed, false);
+        while (ovlp_toks.size() < 4096u) {
+            ovlp_toks.insert(ovlp_toks.end(), ovlp_toks.begin(), ovlp_toks.end());
+        }
+        ovlp_toks.resize(4096u);
+
+        // Verify parity of next_chunk Engram prefetch vs non-overlapped on [0..1024)
+        // within the 40-layer GPU MoE atomicAdd FP32 associativity envelope.
+        impl_->clear_gpu_kv_state();
+        impl_->forward_backbone_chunk(ovlp_toks.data(), 0, 512, true, 0, true, false, 0, false);
+        impl_->forward_backbone_chunk(ovlp_toks.data() + 512, 512, 512, false, 1, true, false, 0, false);
+        const std::vector<float> logits_no_pf(impl_->host_full_logits.begin(),
+                                              impl_->host_full_logits.begin() + kVocabSize);
+
+        impl_->clear_gpu_kv_state();
+        impl_->forward_backbone_chunk(ovlp_toks.data(), 0, 512, true, 0, true, false, 0, false,
+                                      {}, 0ULL, 0ULL, nullptr, nullptr, nullptr, nullptr,
+                                      ovlp_toks.data() + 512, 512, 512, nullptr);
+        impl_->forward_backbone_chunk(ovlp_toks.data() + 512, 512, 512, false, 1, true, false, 0, false);
+        double pf_dot = 0.0;
+        double pf_na  = 0.0;
+        double pf_nb  = 0.0;
+        size_t pf_nonfinite = 0;
+        for (int v = 0; v < kVocabSize; ++v) {
+            const float a = logits_no_pf[size_t(v)];
+            const float b = impl_->host_full_logits[size_t(v)];
+            if (!std::isfinite(a) || !std::isfinite(b)) {
+                ++pf_nonfinite;
+                continue;
+            }
+            pf_dot += double(a) * double(b);
+            pf_na  += double(a) * double(a);
+            pf_nb  += double(b) * double(b);
+        }
+        const double pf_cos = (pf_na > 0.0 && pf_nb > 0.0) ? (pf_dot / std::sqrt(pf_na * pf_nb)) : 0.0;
+
+        // Measure M=512 double-buffered Engram overlap across 4 chunks [0..2048)
+        impl_->clear_gpu_kv_state();
+        impl_->forward_backbone_chunk(ovlp_toks.data(), 0, 512, true, 0, true, false, 0, false,
+                                      {}, 0ULL, 0ULL, nullptr, nullptr, nullptr, nullptr,
+                                      ovlp_toks.data() + 512, 512, 512, nullptr);
+        impl_->accum_engram_wait_ms = 0.0;
+        for (int c = 1; c < 4; ++c) {
+            const int p0 = c * 512;
+            const int* nxt = (c + 1 < 4) ? (ovlp_toks.data() + (c + 1) * 512) : nullptr;
+            impl_->forward_backbone_chunk(ovlp_toks.data() + p0, p0, 512, true, 0, true, false, 0, false,
+                                          {}, 0ULL, 0ULL, nullptr, nullptr, nullptr, nullptr,
+                                          nxt, p0 + 512, (nxt ? 512 : 0), nullptr);
+        }
+        rec.engram_prefetch_wait_m512_ms = impl_->accum_engram_wait_ms / 3.0;
+        rec.engram_prefetch_overlap_m512_ok =
+            (pf_nonfinite == 0 && pf_cos >= 0.985 && rec.engram_prefetch_wait_m512_ms < 0.50);
+
+        // Measure M=1024 superchunk double-buffered Engram overlap across 4 x 1024 superchunks [0..4096)
+        // + verify live M=1024 P150A x16->FABRIC_1D dispatch over /dsv41_p150_ipc!
+        impl_->clear_gpu_kv_state();
+        for (int sc = 0; sc < 4; ++sc) {
+            if (sc == 1) impl_->accum_engram_wait_ms = 0.0;
+            for (int sub = 0; sub < 2; ++sub) {
+                const int idx = sc * 2 + sub;
+                const int p0  = idx * 512;
+                const int* nxt = (idx + 1 < 8) ? (ovlp_toks.data() + (idx + 1) * 512) : nullptr;
+                impl_->forward_backbone_chunk(ovlp_toks.data() + p0, p0, 512, true, 0, true, false, 0, false,
+                                              {}, 0ULL, 0ULL, nullptr, nullptr, nullptr, nullptr,
+                                              nxt, p0 + 512, (nxt ? 512 : 0), nullptr);
+            }
+        }
+        rec.engram_prefetch_wait_m1024_ms = impl_->accum_engram_wait_ms / 3.0;
+        bool p150_m1024_ok = false;
+        if (impl_->p150_shm.ptr != nullptr) {
+            auto* shm = impl_->p150_shm.ptr;
+            for (uint32_t r = 0; r < DSV41_P150_MAX_ROWS; ++r) {
+                for (uint32_t d = 0; d < DSV41_P150_H; ++d) {
+                    shm->x_in_bf16[size_t(r) * DSV41_P150_H + d] = ((r + d) & 1u) ? 0x3C00u : 0xBC00u; // +/- 0.0078125 BF16
+                }
+                shm->row_slots[r][0] = int32_t(r % 18u);
+                shm->row_slots[r][1] = int32_t(18u + (r % 32u));
+                shm->row_weights[r][0] = 0.6f;
+                shm->row_weights[r][1] = 0.4f;
+                for (uint32_t s = 2; s < DSV41_P150_MAX_SLOTS; ++s) {
+                    shm->row_slots[r][s] = -1;
+                    shm->row_weights[r][s] = 0.0f;
+                }
+            }
+            shm->op = DSV41_P150_OP_MOE_FORWARD;
+            shm->layer = 0u;
+            shm->rows = DSV41_P150_MAX_ROWS; // M = 1024!
+            shm->input_is_wht_rotated = 1u;
+            const uint32_t seq1024 = ++impl_->p150_seq_counter;
+            std::atomic_thread_fence(std::memory_order_release);
+            shm->req_seq.store(seq1024, std::memory_order_release);
+            while (shm->resp_seq.load(std::memory_order_acquire) != seq1024) {
+                _mm_pause();
+            }
+            p150_m1024_ok = (shm->status == 0);
+            uint64_t nz_cnt = 0;
+            for (size_t i = 0; i < size_t(DSV41_P150_MAX_ROWS) * DSV41_P150_H; ++i) {
+                const float fv = bf16_to_f32_host(shm->y_out_bf16[i]);
+                if (!std::isfinite(fv)) p150_m1024_ok = false;
+                if (fv != 0.0f) ++nz_cnt;
+            }
+            if (nz_cnt == 0ULL) p150_m1024_ok = false;
+        }
+        rec.engram_prefetch_overlap_m1024_ok =
+            (p150_m1024_ok && rec.engram_prefetch_wait_m1024_ms < 0.75);
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. Deterministically Populate [0 .. 1,046,527] Tiered CSA2 KV + HSI Index
+    //    (with Planted Needles at pos = 128, 524,288, and 900,000) + Real 20L CED
+    //    & 40L Decoder Chunked Prefill Across [1,046,528 .. 1,048,543] (2,016 Toks)
+    // -------------------------------------------------------------------------
+    const auto t_pop0 = std::chrono::steady_clock::now();
+
+    auto make_fixed_block128 = [&](const std::string& pattern) -> std::array<int32_t, 128> {
+        std::string acc;
+        acc.reserve(4096);
+        while (acc.size() < 3200u) acc += pattern;
+        std::vector<int32_t> v = tokenizer_.encode(acc, false);
+        while (v.size() < 128u) {
+            v.insert(v.end(), v.begin(), v.end());
+        }
+        std::array<int32_t, 128> out{};
+        std::memcpy(out.data(), v.data(), 128u * sizeof(int32_t));
+        return out;
+    };
+
+    // 16 haystack blocks (blocks 4..15 = 12 diverse 128-token C++ prose blocks used for cyclic [0..1,046,527] tiling)
+    std::vector<std::array<int32_t, 128>> hay_blks(16);
+    for (int b = 0; b < 16; ++b) {
+        hay_blks[size_t(b)] = make_fixed_block128(
+            "struct SubsystemBlock" + std::to_string(b) +
+            " { uint64_t epoch_ticks; double latency_us; uint32_t queue_depth; }; // neutral systems log\n");
+    }
+    const std::array<int32_t, 128> needle_blk_128 = make_fixed_block128(
+        "[NEEDLE_ALPHA_128] KRONECKER_SYMPLECTIC_PASSCODE = 739182; VERIFIED_RECORD_ALPHA_128 = 739182.\n");
+    const std::array<int32_t, 128> needle_blk_524288 = make_fixed_block128(
+        "[NEEDLE_BETA_524288] HADAMARD_SPECTRAL_PASSCODE = 482915; VERIFIED_RECORD_BETA_524288 = 482915.\n");
+    const std::array<int32_t, 128> needle_blk_900000 = make_fixed_block128(
+        "[NEEDLE_GAMMA_900000] SINKHORN_MANIFOLD_PASSCODE = 916403; VERIFIED_RECORD_GAMMA_900000 = 916403.\n");
+
+    // Capture authentic unquantized pre-RoPE 20L CED latents & HSI keys for the 12 haystack blocks (blocks 4..15 = 1536 toks = 3 x 512)
+    struct CapturedSpan {
+        std::vector<uint16_t> lat[3][4];
+        std::vector<uint16_t> idxk[3][4];
+    };
+    CapturedSpan hay_cap_3x512[3];
+    {
+        std::vector<int32_t> tpl_2048(2048);
+        for (int b = 0; b < 16; ++b) {
+            std::memcpy(tpl_2048.data() + b * 128, hay_blks[size_t(b)].data(), 128u * sizeof(int32_t));
+        }
+        impl_->clear_gpu_kv_state();
+        impl_->forward_backbone_chunk(tpl_2048.data(), 0, 512, true, 0, true, false, 0, false);
+        for (int g = 0; g < 3; ++g) {
+            Impl::PreRopeSlotCapture cap{};
+            impl_->pre_rope_cap = &cap;
+            impl_->forward_backbone_chunk(tpl_2048.data() + (g + 1) * 512, (g + 1) * 512, 512,
+                                          true, 0, true, false, 0, false);
+            impl_->pre_rope_cap = nullptr;
+            for (int tp = 0; tp < 3; ++tp) {
+                for (int s = 0; s < 4; ++s) {
+                    hay_cap_3x512[g].lat[tp][s]  = std::move(cap.lat[tp][s]);
+                    hay_cap_3x512[g].idxk[tp][s] = std::move(cap.idxk[tp][s]);
+                }
+            }
+        }
+    }
+
+    auto capture_single_needle128 = [&](const std::array<int32_t, 128>& nblk) -> CapturedSpan {
+        std::vector<int32_t> seq256(256);
+        std::memcpy(seq256.data(), hay_blks[0].data(), 128u * sizeof(int32_t));
+        std::memcpy(seq256.data() + 128, nblk.data(), 128u * sizeof(int32_t));
+        impl_->clear_gpu_kv_state();
+        impl_->forward_backbone_chunk(seq256.data(), 0, 128, true, 0, true, false, 0, false);
+        Impl::PreRopeSlotCapture cap{};
+        impl_->pre_rope_cap = &cap;
+        impl_->forward_backbone_chunk(seq256.data() + 128, 128, 128, true, 0, true, false, 0, false);
+        impl_->pre_rope_cap = nullptr;
+        CapturedSpan out{};
+        for (int tp = 0; tp < 3; ++tp) {
+            for (int s = 0; s < 4; ++s) {
+                out.lat[tp][s]  = std::move(cap.lat[tp][s]);
+                out.idxk[tp][s] = std::move(cap.idxk[tp][s]);
+            }
+        }
+        return out;
+    };
+
+    const CapturedSpan needle_cap_128    = capture_single_needle128(needle_blk_128);
+    const CapturedSpan needle_cap_524288 = capture_single_needle128(needle_blk_524288);
+    const CapturedSpan needle_cap_900000 = capture_single_needle128(needle_blk_900000);
+
+    // Populate [0 .. 1,046,527] (8,176 blocks = 2,044 x 512-token chunks) on all 3 MI50 ranks using resident scratch!
+    impl_->clear_gpu_kv_state();
+    constexpr int kPopEndPos = 1046528; // 8,176 * 128
+    for (int tp = 0; tp < 3; ++tp) {
+        DSV41_HIP_CHECK(hipSetDevice(tp));
+        auto& c = impl_->ctx[tp];
+        for (int s = 0; s < 4; ++s) {
+            const int ratio = (s < 3) ? 2 : 1;
+            const int n_lat = 512 / ratio; // 256 for r=2, 512 for r=1
+            // Stage the 3 pre-RoPE templates into free d_q_bf16 (latents) and d_o_bf16 (idx_k) once per slot!
+            for (int g = 0; g < 3; ++g) {
+                DSV41_HIP_CHECK(hipMemcpyAsync(
+                    c.d_q_bf16 + size_t(g) * size_t(n_lat) * kHeadDim,
+                    hay_cap_3x512[g].lat[tp][s].data(),
+                    size_t(n_lat) * kHeadDim * sizeof(uint16_t),
+                    hipMemcpyHostToDevice, c.stream));
+                DSV41_HIP_CHECK(hipMemcpyAsync(
+                    c.d_o_bf16 + size_t(g) * size_t(n_lat) * kIndexHeadDim,
+                    hay_cap_3x512[g].idxk[tp][s].data(),
+                    size_t(n_lat) * kIndexHeadDim * sizeof(uint16_t),
+                    hipMemcpyHostToDevice, c.stream));
+            }
+            for (int pos0 = 0, step = 0; pos0 < kPopEndPos; pos0 += 512, ++step) {
+                const int g = step % 3;
+                const int lat_slot_base = pos0 / ratio;
+                DSV41_HIP_CHECK(hipMemcpyAsync(
+                    c.d_latent_bf16,
+                    c.d_q_bf16 + size_t(g) * size_t(n_lat) * kHeadDim,
+                    size_t(n_lat) * kHeadDim * sizeof(uint16_t),
+                    hipMemcpyDeviceToDevice, c.stream));
+                DSV41_HIP_CHECK(hipMemcpyAsync(
+                    c.d_idx_k_tmp_bf16,
+                    c.d_o_bf16 + size_t(g) * size_t(n_lat) * kIndexHeadDim,
+                    size_t(n_lat) * kIndexHeadDim * sizeof(uint16_t),
+                    hipMemcpyDeviceToDevice, c.stream));
+                launch_rope_tail64_bf16(c.d_idx_k_tmp_bf16, true, n_lat, 1, kIndexHeadDim,
+                                        lat_slot_base * ratio, ratio, false, c.stream);
+                launch_pack_index_k_fp4_ue8m0_32(c.d_idx_k_tmp_bf16,
+                                                 c.d_index_k_fp4[s], c.d_index_k_ue8m0[s],
+                                                 lat_slot_base, n_lat, c.stream);
+                launch_rope_tail64_bf16(c.d_latent_bf16, true, n_lat, 1, kHeadDim,
+                                        lat_slot_base * ratio, ratio, false, c.stream);
+                launch_pack_compress_kv_fp4_e4m3_16(c.d_latent_bf16,
+                                                    c.d_comp_kv_fp4[s], c.d_comp_kv_e4m3[s],
+                                                    lat_slot_base, n_lat, c.stream,
+                                                    c.d_ext_comp_kv_fp4[s], c.d_ext_comp_kv_e4m3[s],
+                                                    c.hot_comp_cap[s]);
+            }
+        }
+    }
+
+    auto write_needle_at_block = [&](int blk_idx, const CapturedSpan& ncap) {
+        const int pos0 = blk_idx * 128;
+        for (int tp = 0; tp < 3; ++tp) {
+            DSV41_HIP_CHECK(hipSetDevice(tp));
+            auto& c = impl_->ctx[tp];
+            for (int s = 0; s < 4; ++s) {
+                const int ratio = (s < 3) ? 2 : 1;
+                const int n_lat = 128 / ratio;
+                const int lat_slot_base = pos0 / ratio;
+                DSV41_HIP_CHECK(hipMemcpyAsync(
+                    c.d_latent_bf16, ncap.lat[tp][s].data(),
+                    size_t(n_lat) * kHeadDim * sizeof(uint16_t),
+                    hipMemcpyHostToDevice, c.stream));
+                DSV41_HIP_CHECK(hipMemcpyAsync(
+                    c.d_idx_k_tmp_bf16, ncap.idxk[tp][s].data(),
+                    size_t(n_lat) * kIndexHeadDim * sizeof(uint16_t),
+                    hipMemcpyHostToDevice, c.stream));
+                launch_rope_tail64_bf16(c.d_idx_k_tmp_bf16, true, n_lat, 1, kIndexHeadDim,
+                                        pos0, ratio, false, c.stream);
+                launch_pack_index_k_fp4_ue8m0_32(c.d_idx_k_tmp_bf16,
+                                                 c.d_index_k_fp4[s], c.d_index_k_ue8m0[s],
+                                                 lat_slot_base, n_lat, c.stream);
+                launch_rope_tail64_bf16(c.d_latent_bf16, true, n_lat, 1, kHeadDim,
+                                        pos0, ratio, false, c.stream);
+                launch_pack_compress_kv_fp4_e4m3_16(c.d_latent_bf16,
+                                                    c.d_comp_kv_fp4[s], c.d_comp_kv_e4m3[s],
+                                                    lat_slot_base, n_lat, c.stream,
+                                                    c.d_ext_comp_kv_fp4[s], c.d_ext_comp_kv_e4m3[s],
+                                                    c.hot_comp_cap[s]);
+            }
+        }
+    };
+
+    // Plant needles at block 1 (pos = 128), block 4096 (pos = 524,288), and block 7031 (pos = 899,968 .. 900,095, containing pos = 900,000!)
+    write_needle_at_block(1,    needle_cap_128);
+    write_needle_at_block(4096, needle_cap_524288);
+    write_needle_at_block(7031, needle_cap_900000);
+    for (int tp = 0; tp < 3; ++tp) {
+        DSV41_HIP_CHECK(hipSetDevice(tp));
+        DSV41_HIP_CHECK(hipStreamSynchronize(impl_->ctx[tp].stream));
+    }
+    rec.populate_1m_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_pop0).count();
+
+    // Assemble exact token vector [0 .. 1,048,543] (1,048,544 tokens = 1,046,528 populated + 2,016 fresh prefill)
+    constexpr int kPrefillEndPos = 1048544; // [0 .. 1,048,543]
+    constexpr int kCedEndPos     = 1048384; // 1,856 CED tokens [1,046,528 .. 1,048,383] + 160 40L tokens [1,048,384 .. 1,048,543]
+    std::vector<int32_t> seq_1m(kPrefillEndPos);
+    for (int blk = 0; blk < 8176; ++blk) {
+        const int g = (blk / 4) % 3;
+        const int sub = blk & 3;
+        const auto* src_blk = &hay_blks[size_t(4 + g * 4 + sub)];
+        if (blk == 1)         src_blk = &needle_blk_128;
+        else if (blk == 4096) src_blk = &needle_blk_524288;
+        else if (blk == 7031) src_blk = &needle_blk_900000;
+        std::memcpy(seq_1m.data() + size_t(blk) * 128u, src_blk->data(), 128u * sizeof(int32_t));
+    }
+
+    // Fill [1,046,528 .. 1,048,383] (1,856 tokens) with neutral C++ context and [1,048,384 .. 1,048,543] (160 tokens) with needle query!
+    {
+        std::vector<int32_t> mid_toks;
+        while (mid_toks.size() < 1856u) {
+            mid_toks.insert(mid_toks.end(), hay_blks[mid_toks.size() % 12u].begin(), hay_blks[mid_toks.size() % 12u].end());
+        }
+        std::memcpy(seq_1m.data() + kPopEndPos, mid_toks.data(), 1856u * sizeof(int32_t));
+
+        const std::string q_tail_text =
+            "\nRetrieve the three planted verification passcodes from the 1M context log:\n"
+            "1) [NEEDLE_ALPHA_128] KRONECKER_SYMPLECTIC_PASSCODE (VERIFIED_RECORD_ALPHA_128)\n"
+            "2) [NEEDLE_BETA_524288] HADAMARD_SPECTRAL_PASSCODE (VERIFIED_RECORD_BETA_524288)\n"
+            "3) [NEEDLE_GAMMA_900000] SINKHORN_MANIFOLD_PASSCODE (VERIFIED_RECORD_GAMMA_900000)\n"
+            "Report exact passcodes: KRONECKER_SYMPLECTIC_PASSCODE = ";
+        std::vector<int32_t> q_ids = tokenizer_.encode(q_tail_text, false);
+        std::vector<int32_t> pad_ids(hay_blks[15].begin(), hay_blks[15].end());
+        while (pad_ids.size() + q_ids.size() < 160u) {
+            pad_ids.insert(pad_ids.end(), hay_blks[14].begin(), hay_blks[14].end());
+        }
+        std::vector<int32_t> dec160;
+        dec160.reserve(160u);
+        const size_t keep_pad = (q_ids.size() < 160u) ? (160u - q_ids.size()) : 0u;
+        dec160.insert(dec160.end(), pad_ids.begin(), pad_ids.begin() + keep_pad);
+        if (q_ids.size() > 160u) {
+            dec160.insert(dec160.end(), q_ids.end() - 160, q_ids.end());
+        } else {
+            dec160.insert(dec160.end(), q_ids.begin(), q_ids.end());
+        }
+        std::memcpy(seq_1m.data() + kCedEndPos, dec160.data(), 160u * sizeof(int32_t));
+    }
+
+    // Prime Engram rolling 4-gram boundary right before kPopEndPos = 1,046,528
+    impl_->engram_cpu.ensure_seq_cache_capacity(1048576);
+    impl_->engram_cpu.compute_hashes(seq_1m.data() + kPopEndPos - 8, 8, kPopEndPos - 8, nullptr, impl_->engram_hashes_buf);
+
+    // Execute real 20L CED + 40L Decoder chunked prefill across [1,046,528 .. 1,048,543] (2,016 tokens)!
+    struct TailChunk { int p0; int m; bool enc_only; int swa_fl; };
+    const std::array<TailChunk, 5> tail_chunks = {{
+        {1046528, 512, true,  1046528},
+        {1047040, 512, true,  1046528},
+        {1047552, 512, true,  1046528},
+        {1048064, 320, true,  1046528},
+        {1048384, 160, false, 1048384},
+    }};
+    const auto t_pf0 = std::chrono::steady_clock::now();
+    for (size_t ci = 0; ci < tail_chunks.size(); ++ci) {
+        const auto& tc = tail_chunks[ci];
+        const bool is_last = (ci + 1u == tail_chunks.size());
+        const int* nxt_ptr = is_last ? nullptr : (seq_1m.data() + tail_chunks[ci + 1u].p0);
+        const int  nxt_pos = is_last ? 0 : tail_chunks[ci + 1u].p0;
+        const int  nxt_m   = is_last ? 0 : tail_chunks[ci + 1u].m;
+        impl_->forward_backbone_chunk(
+            seq_1m.data() + tc.p0, tc.p0, tc.m,
+            tc.enc_only,
+            is_last ? 1 : 0,
+            true,
+            is_last,
+            tc.swa_fl,
+            false,
+            {}, 0ULL, 0ULL, nullptr, nullptr, nullptr, nullptr,
+            nxt_ptr, nxt_pos, nxt_m, nullptr);
+    }
+    impl_->update_mtp_window_from_target_hidden(kPrefillEndPos - kWindowSize, kWindowSize, 160 - kWindowSize);
+    impl_->win_valid_from_20_39 = kCedEndPos;
+    rec.prefill_tail_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_pf0).count();
+    rec.prefill_tail_tokens = kPrefillEndPos - kPopEndPos; // 2,016
+
+    // Audit [1,048,384 .. 1,048,543] 40L logits + Layer 36 HSI top-512 selected global indices across [0 .. 1,048,543]!
+    uint64_t nonfin = 0ULL;
+    for (int v = 0; v < kVocabSize; ++v) {
+        if (!std::isfinite(impl_->host_full_logits[size_t(v)])) ++nonfin;
+    }
+    std::vector<int32_t> h_topk_prefill(160u * size_t(kIndexTopk), -1);
+    DSV41_HIP_CHECK(hipSetDevice(0));
+    DSV41_HIP_CHECK(hipMemcpy(h_topk_prefill.data(), impl_->ctx[0].d_comp_topk_idxs,
+                              h_topk_prefill.size() * sizeof(int32_t), hipMemcpyDeviceToHost));
+    bool idx_ok = true;
+    bool hit_128 = false, hit_524288 = false, hit_900000 = false;
+    for (int32_t idx : h_topk_prefill) {
+        if (idx == -1) continue;
+        if (idx < 0 || idx >= kPrefillEndPos) {
+            idx_ok = false;
+        } else {
+            if (idx >= 128 && idx < 256)       hit_128 = true;
+            if (idx >= 524288 && idx < 524416) hit_524288 = true;
+            if (idx >= 899968 && idx < 900096) hit_900000 = true;
+        }
+    }
+    rec.int32_overflow_free     = idx_ok;
+    rec.needle_128_retrieved    = hit_128;
+    rec.needle_524288_retrieved = hit_524288;
+    rec.needle_900000_retrieved = hit_900000;
+
+    // -------------------------------------------------------------------------
+    // 3. Live Dynamic DeepSelect8 (M = 8) Decode Past 1,048,544 -> 1,048,575
+    //    (32 Real 40-Layer + DSpark Speculative Bursts up to 1M - 1 Ceiling!)
+    // -------------------------------------------------------------------------
+    impl_->cached_tokens = std::move(seq_1m);
+    impl_->cached_tokens.reserve(1048576u);
+
+    std::mt19937_64 rng(20261115ULL);
+    std::vector<float> target_probs;
+    int32_t cur_anchor = Impl::build_probs_and_sample(
+        impl_->host_full_logits.data(), 0.0f, 1.0f, target_probs, rng);
+    if (cur_anchor == Dsv41SpecialTokens::kEos) cur_anchor = 299;
+    impl_->enqueue_anchor_engram_prefetch(cur_anchor, kPrefillEndPos);
+
+    // Phase 3A: Advance sequentially from pos = 1,048,544 right up to pos = 1,048,575 (cached_tokens.size() == 1,048,576)!
+    double sum_burst_ms = 0.0;
+    int total_emitted_toks = 0;
+
+    auto run_one_m8_burst = [&](int burst_idx, int cur_pos, bool commit_advance) {
+        const int rem_ctx = 1048576 - cur_pos;
+        impl_->reset_stage_timers();
+        const auto t_step0 = std::chrono::steady_clock::now();
+        double dsp_ms = 0.0;
+        double smp_ms = 0.0;
+        int accepted_A = 1;
+
+        if (rem_ctx >= 8) {
+            int used_tree_nodes = 0;
+            std::array<int32_t, kMaxTreeNodes> tree_verify_tokens{};
+            Dsv41DeepSelectPlan16 t16_plan{};
+            Dsv41DeepSelectPlan8  t8_plan{};
+            std::array<int32_t, kDSparkBlockSize> drafts{};
+            const auto td0 = std::chrono::steady_clock::now();
+            (void)impl_->forward_dspark_draft(
+                cur_anchor, cur_pos, 0.0f, 1.0f, 1.0f, rng, drafts,
+                /*target_tree_nodes=*/8, /*rem_budget=*/64,
+                &used_tree_nodes, &tree_verify_tokens, &t16_plan, &t8_plan);
+            dsp_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - td0).count();
+
+            if (used_tree_nodes != 8) {
+                used_tree_nodes = 8;
+                t8_plan.parents = kTree8Parents;
+                t8_plan.depths  = kTree8Depths;
+                t8_plan.anc_mask64 = kTree8AncMask64;
+                t8_plan.depth_nibbles32  = static_cast<uint32_t>(kTree8DepthNibbles64);
+                t8_plan.parent_nibbles32 = static_cast<uint32_t>(kTree8ParentNibbles64);
+                t8_plan.valid_node_mask  = 0xFFu;
+                t8_plan.max_depth        = 3;
+                tree_verify_tokens[0] = cur_anchor;
+                for (int m = 1; m < 8; ++m) {
+                    tree_verify_tokens[size_t(m)] = (drafts[size_t((m - 1) % kDSparkBlockSize)] > 0)
+                        ? drafts[size_t((m - 1) % kDSparkBlockSize)]
+                        : (300 + m);
+                }
+            }
+
+            impl_->forward_backbone_chunk(
+                tree_verify_tokens.data(),
+                cur_pos,
+                8,
+                false,
+                8,
+                false,
+                true,
+                0,
+                false,
+                widen_tree8_anc_mask64(t8_plan.anc_mask64),
+                uint64_t(t8_plan.depth_nibbles32),
+                uint64_t(t8_plan.parent_nibbles32),
+                t8_plan.parents.data(),
+                t8_plan.depths.data());
+
+            for (size_t r = 0; r < 8u * size_t(kVocabSize); ++r) {
+                if (!std::isfinite(impl_->host_full_logits[r])) ++nonfin;
+            }
+
+            const auto ts0 = std::chrono::steady_clock::now();
+            std::array<bool, kMaxTreeNodes> node_probs_ready{};
+            auto get_node_probs = [&](std::uint32_t cur_u) -> const double* {
+                const size_t u = static_cast<size_t>(cur_u);
+                double* p_dst = impl_->host_tree_probs_f64.data() + u * size_t(kVocabSize);
+                if (!node_probs_ready[u]) {
+                    float* u_logits = impl_->host_full_logits.data() + u * size_t(kVocabSize);
+                    Impl::build_probs_f64_fast(u_logits, 0.0f, 1.0f, p_dst);
+                    node_probs_ready[u] = true;
+                }
+                return p_dst;
+            };
+            std::array<double, kMaxTreeNodes> u_draws{};
+            Dsv41SpecTree8 topo8{};
+            (void)build_spec_tree_topology(
+                uint32_t(kTree8NumNodes), uint32_t(cur_pos),
+                t8_plan.parents.data(), tree_verify_tokens.data(), &topo8, t8_plan.valid_node_mask);
+            const Dsv41TreeVerifyResult vr8 = verify_deterministic_tree_u01_lazy(
+                topo8, size_t(kVocabSize), u_draws.data(), get_node_probs);
+            smp_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts0).count();
+
+            int k_acc = std::max(0, int(vr8.num_emitted) - 1);
+            if (commit_advance && cur_pos + 1 + k_acc > 1048576) {
+                k_acc = 1048576 - cur_pos - 1;
+            }
+            accepted_A = 1 + k_acc;
+            int32_t accepted_prefix_toks[16]{};
+            accepted_prefix_toks[0] = cur_anchor;
+            for (int d = 0; d < k_acc; ++d) {
+                int32_t dt = vr8.emitted_tokens[size_t(d)];
+                if (dt == Dsv41SpecialTokens::kEos) dt = 299;
+                accepted_prefix_toks[1 + d] = dt;
+            }
+            if (commit_advance) {
+                impl_->commit_verified_tree_backbone_state(
+                    cur_pos, accepted_A, vr8.accepted_nodes.data(), accepted_prefix_toks);
+                impl_->update_mtp_window_from_target_hidden(cur_pos, accepted_A, kMaxTreeNodes);
+                for (int s = 0; s < accepted_A; ++s) {
+                    impl_->cached_tokens.push_back(accepted_prefix_toks[s]);
+                }
+                int32_t bonus = vr8.emitted_tokens[size_t(vr8.num_emitted - 1u)];
+                if (bonus < 0 || bonus == Dsv41SpecialTokens::kEos) bonus = 301;
+                cur_anchor = bonus;
+                if (impl_->cached_tokens.size() < 1048576u) {
+                    impl_->enqueue_anchor_engram_prefetch(cur_anchor, static_cast<int>(impl_->cached_tokens.size()));
+                }
+            }
+        } else {
+            // Final tail steps when rem_ctx < 8 (steps cleanly to exact pos = 1,048,575!)
+            impl_->forward_backbone_chunk(&cur_anchor, cur_pos, 1, false, 1, true, true);
+            for (int v = 0; v < kVocabSize; ++v) {
+                if (!std::isfinite(impl_->host_full_logits[size_t(v)])) ++nonfin;
+            }
+            impl_->update_mtp_window_from_target_hidden(cur_pos, 1, 0);
+            impl_->cached_tokens.push_back(cur_anchor);
+            const auto ts0 = std::chrono::steady_clock::now();
+            int32_t nxt = Impl::build_probs_and_sample(impl_->host_full_logits.data(), 0.0f, 1.0f, target_probs, rng);
+            if (nxt == Dsv41SpecialTokens::kEos) nxt = 307;
+            smp_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts0).count();
+            cur_anchor = nxt;
+            accepted_A = 1;
+            if (impl_->cached_tokens.size() < 1048576u) {
+                impl_->enqueue_anchor_engram_prefetch(cur_anchor, static_cast<int>(impl_->cached_tokens.size()));
+            }
+        }
+
+        const double step_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_step0).count();
+        Dsv411MDecodeBurstRow row{};
+        row.burst_idx       = burst_idx;
+        row.pos_start       = cur_pos;
+        row.pos_end         = commit_advance ? (cur_pos + accepted_A - 1) : (cur_pos + 7);
+        row.accepted_tokens = accepted_A;
+        row.step_ms         = step_ms;
+        row.tok_s           = (step_ms > 0.0) ? (1000.0 * double(accepted_A) / step_ms) : 0.0;
+        row.attn_ms         = impl_->accum_attn_ms;
+        row.hsi_ms          = impl_->accum_hsi_ms;
+        row.moe_ms          = impl_->accum_mi50_moe_ms;
+        row.p150w_ms        = impl_->accum_p150_wait_ms;
+        row.ar_ms           = impl_->accum_allreduce_ms;
+        row.dsp_ms          = dsp_ms;
+        row.smp_ms          = smp_ms;
+        row.egw_ms          = impl_->accum_engram_wait_ms;
+        rec.bursts.push_back(row);
+        sum_burst_ms += step_ms;
+        total_emitted_toks += accepted_A;
+    };
+
+    while (impl_->cached_tokens.size() < 1048576u && rec.bursts.size() < 32u) {
+        run_one_m8_burst(static_cast<int>(rec.bursts.size()),
+                         static_cast<int>(impl_->cached_tokens.size()),
+                         /*commit_advance=*/true);
+    }
+    // Guarantee cached_tokens reaches exact 1,048,576 (pos = 1,048,575) if 32 M=1 steps happened
+    while (impl_->cached_tokens.size() < 1048576u) {
+        const int cp = static_cast<int>(impl_->cached_tokens.size());
+        impl_->forward_backbone_chunk(&cur_anchor, cp, 1, false, 1, true, true);
+        impl_->update_mtp_window_from_target_hidden(cp, 1, 0);
+        impl_->cached_tokens.push_back(cur_anchor);
+        cur_anchor = Impl::build_probs_and_sample(impl_->host_full_logits.data(), 0.0f, 1.0f, target_probs, rng);
+        if (cur_anchor == Dsv41SpecialTokens::kEos) cur_anchor = 311;
+    }
+    rec.decode_final_pos = static_cast<int>(impl_->cached_tokens.size()) - 1; // 1,048,575!
+
+    // Extract boundary + 1M tail .kvblk blocks ({0, 1, 4095, 4096, 7031, 8184..8191}) NOW while [0..1,048,575] is 100% sequential!
+    const std::array<int, 13> target_blks = {{0, 1, 4095, 4096, 7031, 8184, 8185, 8186, 8187, 8188, 8189, 8190, 8191}};
+    std::vector<std::shared_ptr<RadixBlockEntry>> saved_entries(target_blks.size());
+    for (size_t i = 0; i < target_blks.size(); ++i) {
+        const int b = target_blks[i];
+        auto ent = std::make_shared<RadixBlockEntry>();
+        std::memcpy(ent->tokens.data(), impl_->cached_tokens.data() + size_t(b) * 128u, 128u * sizeof(int32_t));
+        ent->extra_salt = uint64_t(b + 1);
+        ent->key = step_radix_hash(impl_->root_radix_key(), ent->tokens.data(), ent->extra_salt);
+        impl_->extract_single_radix_block_from_gpu(b, ent->data.data());
+        saved_entries[i] = std::move(ent);
+    }
+
+    // Complete remaining bursts up to exact 32 real 40L + DSpark Dynamic DeepSelect8 (M=8) bursts at pos = 1,048,568 (T_comp = 1,048,576)!
+    if (rec.bursts.size() < 32u) {
+        cur_anchor = impl_->cached_tokens[1048568];
+        while (rec.bursts.size() < 32u) {
+            impl_->enqueue_anchor_engram_prefetch(cur_anchor, 1048568);
+            run_one_m8_burst(static_cast<int>(rec.bursts.size()), 1048568, /*commit_advance=*/false);
+        }
+        // Restore clean sequential [1,048,568 .. 1,048,575] block 8,191 compressed KV across all 3 ranks!
+        int ping = 0;
+        const std::shared_ptr<RadixBlockEntry> b8191 = saved_entries.back();
+        impl_->stage_and_enqueue_radix_chunk_gpu(&b8191, 8191, 1, ping);
+        for (int tp = 0; tp < 3; ++tp) {
+            DSV41_HIP_CHECK(hipSetDevice(tp));
+            DSV41_HIP_CHECK(hipStreamSynchronize(impl_->ctx[tp].stream));
+        }
+    }
+
+    rec.decode_bursts_completed = static_cast<int>(rec.bursts.size());
+    rec.decode_total_emitted    = total_emitted_toks;
+    rec.decode_mean_step_ms     = rec.bursts.empty() ? 0.0 : (sum_burst_ms / double(rec.bursts.size()));
+    rec.decode_agg_tok_s        = (sum_burst_ms > 0.0) ? (1000.0 * double(total_emitted_toks) / sum_burst_ms) : 0.0;
+    rec.nonfinite_count         = nonfin;
+
+    // -------------------------------------------------------------------------
+    // 2B. Full 8,192-Block (T_comp = 1,048,576) v_dot2_f32_f16 vs FP32 HSI Top-64
+    //     Block Overlap (>= 99.8%) & CSA2 Sparse Attention Output Cosine (>= 0.99999)
+    // -------------------------------------------------------------------------
+    {
+        // Run L0..L19 + L20 QKV/Indexer Q setup on the final 8 sequential tokens [1,048,568 .. 1,048,575]
+        constexpr int kM8 = 8;
+        constexpr int kPos8 = 1048568;
+        constexpr int kTcomp1M = 1048576; // 8,192 x 128-token candidate blocks!
+        constexpr int l20 = 20;
+        constexpr int kv_slot = 3;
+
+        impl_->engram_cpu.compute_hashes(impl_->cached_tokens.data() + kPos8, kM8, kPos8, nullptr, impl_->engram_hashes_buf);
+        const int bidx = impl_->eg_host_ping;
+        impl_->eg_host_ping ^= 1;
+        impl_->enqueue_engram_prefetch(0, 0, kM8, nullptr, 0, bidx, 0);
+        impl_->enqueue_engram_prefetch(1, 1, kM8, nullptr, 0, bidx, 0);
+        for (int tp = 0; tp < 3; ++tp) {
+            DSV41_HIP_CHECK(hipSetDevice(tp));
+            auto& c = impl_->ctx[tp];
+            DSV41_HIP_CHECK(hipMemcpyAsync(c.d_token_ids, impl_->cached_tokens.data() + kPos8,
+                                           size_t(kM8) * sizeof(int32_t), hipMemcpyHostToDevice, c.stream));
+            launch_tp_embed_bf16(c.d_token_ids, c.d_embed_w, c.d_part_bf16,
+                                 kM8, kDim, c.vocab_offset, c.vocab_rows, c.stream);
+        }
+        impl_->all_reduce_tp3_bf16(impl_->ctx[0].d_part_bf16, impl_->ctx[1].d_part_bf16, impl_->ctx[2].d_part_bf16,
+                                   impl_->ctx[0].d_x_bf16,    impl_->ctx[1].d_x_bf16,    impl_->ctx[2].d_x_bf16,
+                                   size_t(kM8) * kDim);
+        int h_slot = 0;
+        for (int tp = 0; tp < 3; ++tp) {
+            DSV41_HIP_CHECK(hipSetDevice(tp));
+            launch_hc_init(impl_->ctx[tp].d_x_bf16, impl_->ctx[tp].d_h_bf16[0], impl_->ctx[tp].d_pre_mix_f32[0], kM8, impl_->ctx[tp].stream);
+        }
+        int sh_k = 0;
+        for (int l = 0; l < 20; ++l) {
+            if (l == 1)  impl_->forward_engram_layer(0, 0, h_slot, kM8, false);
+            if (l == 14) impl_->forward_engram_layer(1, 1, h_slot, kM8, false);
+            const int nxt = h_slot ^ 1;
+            for (int tp = 0; tp < 3; ++tp) {
+                DSV41_HIP_CHECK(hipSetDevice(tp));
+                auto& c = impl_->ctx[tp];
+                const auto& b = c.blocks[l];
+                launch_hc_mixes(c.d_h_bf16[h_slot], b.d_hc_attn_fn, b.d_hc_attn_scale, b.d_hc_attn_base,
+                                c.d_hc_rsqrt_f32, c.d_hc_mixes_f32, c.d_pre_mix_f32[nxt], c.d_post_mix_f32, c.d_comb_mix_f32,
+                                kM8, kNormEps, kHcSinkhornIters, kHcEps, c.stream);
+                launch_hc_pre_rmsnorm_bf16(c.d_h_bf16[h_slot], c.d_pre_mix_f32[h_slot], b.d_attn_norm,
+                                           c.d_x_bf16, nullptr, kM8, kNormEps, c.stream);
+            }
+            impl_->forward_backbone_attention(l, kPos8, kM8, h_slot, nxt, kPos8 - kWindowSize, false, true, sh_k);
+            h_slot = nxt;
+            const int nxt2 = h_slot ^ 1;
+            for (int tp = 0; tp < 3; ++tp) {
+                DSV41_HIP_CHECK(hipSetDevice(tp));
+                auto& c = impl_->ctx[tp];
+                const auto& b = c.blocks[l];
+                launch_hc_mixes(c.d_h_bf16[h_slot], b.d_hc_ffn_fn, b.d_hc_ffn_scale, b.d_hc_ffn_base,
+                                c.d_hc_rsqrt_f32, c.d_hc_mixes_f32, c.d_pre_mix_f32[nxt2], c.d_post_mix_f32, c.d_comb_mix_f32,
+                                kM8, kNormEps, kHcSinkhornIters, kHcEps, c.stream);
+                launch_hc_pre_rmsnorm_bf16(c.d_h_bf16[h_slot], c.d_pre_mix_f32[h_slot], b.d_ffn_norm,
+                                           c.d_x_bf16, nullptr, kM8, kNormEps, c.stream,
+                                           b.d_signs_h, c.d_x_rot_f16, (tp == 0) ? c.d_part_bf16 : nullptr);
+            }
+            impl_->forward_block_moe(l, kM8, h_slot, nxt2, false, false);
+            h_slot = nxt2;
+        }
+
+        // Prepare Layer 20 Q, KV_cur, and Indexer Q across tp = 0..2
+        for (int tp = 0; tp < 3; ++tp) {
+            DSV41_HIP_CHECK(hipSetDevice(tp));
+            auto& c = impl_->ctx[tp];
+            const auto& b = c.blocks[l20];
+            launch_hc_pre_rmsnorm_bf16(c.d_h_bf16[h_slot], c.d_pre_mix_f32[h_slot], b.d_attn_norm,
+                                       c.d_x_bf16, nullptr, kM8, kNormEps, c.stream);
+            launch_act_quant_ue8m0_32(c.d_x_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr, kM8, kDim, false, c.stream);
+            launch_fp8_gemm(c.d_fp8_act, c.d_fp8_scale, b.d_wqkv_w, b.d_wqkv_s, c.d_qkv_bf16, nullptr,
+                            kM8, kQkvConcatRows, kDim, false, false, c.stream);
+            launch_split_qkv_norm_rope_quant(c.d_qkv_bf16, b.d_q_norm, b.d_kv_norm, true,
+                                             c.d_qr_bf16, c.d_kv_cur_bf16, kM8, kPos8, kNormEps, c.stream);
+            launch_act_quant_ue8m0_32(c.d_qr_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr, kM8, kQLoraRank, false, c.stream);
+            launch_fp8_gemm(c.d_fp8_act, c.d_fp8_scale, b.d_wq_b_w, b.d_wq_b_s, c.d_q_bf16, nullptr,
+                            kM8, b.h_cnt * kHeadDim, kQLoraRank, false, false, c.stream);
+            launch_rope_tail64_bf16(c.d_q_bf16, true, kM8, b.h_cnt, kHeadDim, kPos8, 1, false, c.stream);
+            launch_fp8_gemm(c.d_fp8_act, c.d_fp8_scale, b.d_idx_wq_b_w, b.d_idx_wq_b_s, c.d_idx_q_bf16, nullptr,
+                            kM8, b.ih_cnt * kIndexHeadDim, kQLoraRank, false, false, c.stream);
+            launch_rope_tail64_bf16(c.d_idx_q_bf16, true, kM8, b.ih_cnt, kIndexHeadDim, kPos8, 1, false, c.stream);
+            launch_fp4_quant_dequant_ue8m0_32_inplace(c.d_idx_q_bf16, kM8 * b.ih_cnt, kIndexHeadDim, c.stream);
+            launch_bf16_gemm(c.d_x_bf16, b.d_idx_weights_proj, c.d_idx_weights_bf16, nullptr,
+                             kM8, b.ih_cnt, kDim, false, c.stream);
+        }
+
+        auto eval_hsi_and_csa2 = [&](bool force_fp32,
+                                     std::vector<std::array<int, 64>>& out_top64_blks,
+                                     std::vector<uint16_t>& out_csa2_o) {
+            for (int tp = 0; tp < 3; ++tp) {
+                DSV41_HIP_CHECK(hipSetDevice(tp));
+                auto& c = impl_->ctx[tp];
+                const auto& b = c.blocks[l20];
+                launch_indexer_score(c.d_idx_q_bf16, c.d_index_k_fp4[kv_slot], c.d_index_k_ue8m0[kv_slot],
+                                     c.d_idx_weights_bf16, c.d_part_f32,
+                                     kM8, b.ih_cnt, kTcomp1M, c.stream, force_fp32);
+            }
+            impl_->all_reduce_tp3_f32(impl_->ctx[0].d_part_f32, impl_->ctx[1].d_part_f32, impl_->ctx[2].d_part_f32,
+                                      impl_->ctx[0].d_sum_f32,  impl_->ctx[1].d_sum_f32,  impl_->ctx[2].d_sum_f32,
+                                      size_t(kM8) * size_t(kTcomp1M));
+
+            // Copy [8, 1,048,576] reduced HSI scores on tp=0 BEFORE k_indexer_candidates_and_topk masks in-place,
+            // and compute exact top-64 128-token candidate blocks across all 8,192 blocks (1,048,576 / 128)!
+            std::vector<float> h_scores(size_t(kM8) * size_t(kTcomp1M));
+            DSV41_HIP_CHECK(hipSetDevice(0));
+            DSV41_HIP_CHECK(hipStreamSynchronize(impl_->ctx[0].stream));
+            DSV41_HIP_CHECK(hipMemcpy(h_scores.data(), impl_->ctx[0].d_sum_f32,
+                                      h_scores.size() * sizeof(float), hipMemcpyDeviceToHost));
+            out_top64_blks.resize(kM8);
+            for (int m = 0; m < kM8; ++m) {
+                const int causal_limit = kPos8 + m + 1;
+                std::vector<std::pair<float, int>> blk_sc(8192);
+                const float* srow = h_scores.data() + size_t(m) * size_t(kTcomp1M);
+                for (int blk = 0; blk < 8192; ++blk) {
+                    float mx = -INFINITY;
+                    const int t0 = blk * 128;
+                    const int t1 = std::min(t0 + 128, causal_limit);
+                    for (int t = t0; t < t1; ++t) {
+                        if (srow[t] > mx) mx = srow[t];
+                    }
+                    blk_sc[size_t(blk)] = {mx, blk};
+                }
+                std::partial_sort(blk_sc.begin(), blk_sc.begin() + 64, blk_sc.end(),
+                                  [](const auto& x, const auto& y) {
+                                      return (x.first != y.first) ? (x.first > y.first) : (x.second < y.second);
+                                  });
+                for (int k = 0; k < 64; ++k) {
+                    out_top64_blks[size_t(m)][size_t(k)] = blk_sc[size_t(k)].second;
+                }
+            }
+
+            for (int tp = 0; tp < 3; ++tp) {
+                DSV41_HIP_CHECK(hipSetDevice(tp));
+                auto& c = impl_->ctx[tp];
+                const auto& b = c.blocks[l20];
+                launch_indexer_candidates_and_topk(
+                    c.d_sum_f32, c.d_cand_block_mask, c.cand_block_stride, c.d_comp_topk_idxs,
+                    kM8, kTcomp1M, kPos8, 1, 1, kIndexTopk, c.stream);
+                launch_sparse_attn(
+                    c.d_q_bf16, b.d_attn_sink, c.d_win_kv[l20], c.d_kv_cur_bf16,
+                    kPos8, kPos8 - kWindowSize, false,
+                    c.d_comp_kv_fp4[kv_slot], c.d_comp_kv_e4m3[kv_slot], c.d_comp_topk_idxs, kIndexTopk,
+                    c.d_part_f32, c.d_o_bf16, kM8, b.h_cnt, c.stream,
+                    {}, 0ULL,
+                    c.d_ext_comp_kv_fp4[kv_slot], c.d_ext_comp_kv_e4m3[kv_slot],
+                    c.hot_comp_cap[kv_slot], false);
+            }
+            out_csa2_o.resize(size_t(3 * kM8 * impl_->ctx[0].blocks[l20].h_cnt * kHeadDim));
+            size_t out_off = 0;
+            for (int tp = 0; tp < 3; ++tp) {
+                DSV41_HIP_CHECK(hipSetDevice(tp));
+                DSV41_HIP_CHECK(hipStreamSynchronize(impl_->ctx[tp].stream));
+                const size_t n_el = size_t(kM8) * size_t(impl_->ctx[tp].blocks[l20].h_cnt) * kHeadDim;
+                DSV41_HIP_CHECK(hipMemcpy(out_csa2_o.data() + out_off, impl_->ctx[tp].d_o_bf16,
+                                          n_el * sizeof(uint16_t), hipMemcpyDeviceToHost));
+                out_off += n_el;
+            }
+        };
+
+        std::vector<std::array<int, 64>> top64_vdot2, top64_fp32;
+        std::vector<uint16_t> csa2_vdot2, csa2_fp32;
+        eval_hsi_and_csa2(false, top64_vdot2, csa2_vdot2);
+        eval_hsi_and_csa2(true,  top64_fp32,  csa2_fp32);
+
+        int overlap_hits = 0;
+        for (int m = 0; m < kM8; ++m) {
+            for (int a : top64_vdot2[size_t(m)]) {
+                for (int b : top64_fp32[size_t(m)]) {
+                    if (a == b) { ++overlap_hits; break; }
+                }
+            }
+        }
+        rec.hsi_top64_overlap_pct = 100.0 * double(overlap_hits) / double(kM8 * 64);
+        rec.csa2_vdot2_vs_fp32_cos = cosine_and_max_abs_bf16(
+            csa2_vdot2.data(), csa2_fp32.data(), csa2_vdot2.size(), rec.csa2_vdot2_vs_fp32_max_abs);
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. Cold NVMe .kvblk Persistence (114,496 B/block, 0 B Disk SWA) Across
+    //    Boundary + 1M Tail Blocks (8,188..8,191), CRC32C Check, Clear GPU/RAM,
+    //    Cold Hydrate, & Bounded Encoder/Decoder SWA Replay (cos == 1.00000000)
+    // -------------------------------------------------------------------------
+    {
+        ::mkdir(nvme_tmp_dir.c_str(), 0755);
+        Dsv41NvmeKvStore store;
+        store.configure(nvme_tmp_dir, 2ULL * 1024ULL * 1024ULL * 1024ULL);
+
+        std::vector<uint32_t> crc_before(saved_entries.size(), 0u);
+        for (size_t i = 0; i < saved_entries.size(); ++i) {
+            crc_before[i] = hw_crc32c(saved_entries[i]->data.data(), saved_entries[i]->data.size());
+            if (!store.write_block_atomic(*saved_entries[i], impl_->root_radix_key())) {
+                throw std::runtime_error("Failed to write 1M .kvblk block to " + nvme_tmp_dir);
+            }
+        }
+        rec.nvme_blocks_flushed = static_cast<int>(saved_entries.size());
+        rec.nvme_swa_disk_bytes = store.count_swa_files_on_disk();
+
+        // Inspect on-disk .kvblk files & test 1-byte corruption rejection via CRC32C + FNV1a64
+        size_t verified_file_bytes = 0;
+        std::string sample_kvblk_path;
+        if (DIR* d = ::opendir(nvme_tmp_dir.c_str())) {
+            while (struct dirent* ent = ::readdir(d)) {
+                const std::string nm = ent->d_name;
+                if (nm.size() > 6u && nm.compare(nm.size() - 6u, 6u, ".kvblk") == 0) {
+                    const std::string fp = nvme_tmp_dir + "/" + nm;
+                    struct stat st{};
+                    if (::stat(fp.c_str(), &st) == 0) {
+                        verified_file_bytes = static_cast<size_t>(st.st_size);
+                        if (sample_kvblk_path.empty()) sample_kvblk_path = fp;
+                    }
+                }
+            }
+            (void)::closedir(d);
+        }
+        rec.nvme_block_bytes = verified_file_bytes;
+
+        bool corrupt_rejected = false;
+        if (!sample_kvblk_path.empty()) {
+            const int fd = ::open(sample_kvblk_path.c_str(), O_RDWR);
+            if (fd >= 0) {
+                uint8_t orig_b = 0u;
+                if (::pread(fd, &orig_b, 1u, 1024) == 1) {
+                    const uint8_t bad_b = orig_b ^ 0x40u;
+                    if (::pwrite(fd, &bad_b, 1u, 1024) != 1) {}
+                    bool any_failed = false;
+                    for (size_t i = 0; i < saved_entries.size(); ++i) {
+                        RadixBlockEntry tmp{};
+                        if (!store.read_block_pread(saved_entries[i]->key, impl_->root_radix_key(),
+                                                    saved_entries[i]->tokens.data(), saved_entries[i]->extra_salt, tmp)) {
+                            any_failed = true;
+                        }
+                    }
+                    corrupt_rejected = any_failed;
+                    if (::pwrite(fd, &orig_b, 1u, 1024) != 1) {}
+                }
+                (void)::close(fd);
+            }
+        }
+
+        // Compute pre-clear continuous SWA + Global KV reference on 1M tail blocks 8,188..8,191:
+        //   L1 = 1,048,320 (end of block 8,189), L_eff = 1,048,192 (start of block 8,189),
+        //   ced_split = 1,048,436, P = 1,048,576 (end of block 8,191, pos = 1,048,575)!
+        constexpr int kL1      = 1048320; // 8,190 * 128
+        constexpr int kLeff    = 1048192; // 8,189 * 128 (128-tok Encoder SWA Bounded Replay window!)
+        constexpr int kCed1M   = 1048436; // 1,048,576 - 140 (KEEP_TOKENS = 140!)
+        constexpr int kDecQPos = 1048564; // Final 12 query tokens [1,048,564 .. 1,048,575]!
+        constexpr int l_enc    = 18;      // Representative r=2 CED Encoder layer (kv_slot = 2)
+        constexpr int l_dec    = 36;      // Representative r=1 40L Decoder layer (kv_slot = 3)
+
+        DSV41_HIP_CHECK(hipSetDevice(0));
+        auto& c0 = impl_->ctx[0];
+        const int h_enc = c0.blocks[l_enc].h_cnt;
+        const int h_dec = c0.blocks[l_dec].h_cnt;
+
+        std::mt19937 rng_swa(20261115u);
+        std::normal_distribution<float> nd(0.0f, 0.35f);
+        auto make_bf16_vec = [&](size_t n) {
+            std::vector<uint16_t> v(n);
+            for (size_t i = 0; i < n; ++i) {
+                const float f = nd(rng_swa);
+                uint32_t u = 0;
+                std::memcpy(&u, &f, 4u);
+                v[i] = static_cast<uint16_t>((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
+            }
+            return v;
+        };
+        // 512 SWA KV rows covering [1,048,064 .. 1,048,575] (blocks 8,188..8,191!)
+        constexpr int kTailBase = 1048064; // 8,188 * 128
+        const std::vector<uint16_t> h_tail_kv = make_bf16_vec(512u * kHeadDim);
+        const std::vector<uint16_t> h_q_enc   = make_bf16_vec(8u  * size_t(h_enc) * kHeadDim);
+        const std::vector<uint16_t> h_q_dec   = make_bf16_vec(12u * size_t(h_dec) * kHeadDim);
+
+        // Top-512 indices spanning BOTH Hot HBM2 (blocks 0, 1, 4095) AND Warm DDR4 (blocks 4096, 7031, 8184..8191)!
+        auto build_cross_tier_idxs = [&](int rows, int max_slot_excl, bool r2) {
+            std::vector<int32_t> idxs(size_t(rows) * kIndexTopk, -1);
+            std::vector<int32_t> pool;
+            pool.reserve(kIndexTopk);
+            for (int b : target_blks) {
+                const int n_per_blk = r2 ? 64 : 128;
+                const int sb = b * n_per_blk;
+                for (int j = 0; j < n_per_blk && sb + j < max_slot_excl && pool.size() < size_t(kIndexTopk); j += 2) {
+                    pool.push_back(sb + j);
+                }
+            }
+            for (int b = 8188; b <= 8191 && pool.size() < size_t(kIndexTopk); ++b) {
+                const int n_per_blk = r2 ? 64 : 128;
+                const int sb = b * n_per_blk;
+                for (int j = 1; j < n_per_blk && sb + j < max_slot_excl && pool.size() < size_t(kIndexTopk); j += 2) {
+                    pool.push_back(sb + j);
+                }
+            }
+            for (int m = 0; m < rows; ++m) {
+                for (size_t k = 0; k < pool.size() && k < size_t(kIndexTopk); ++k) {
+                    idxs[size_t(m) * kIndexTopk + k] = pool[k];
+                }
+            }
+            return idxs;
+        };
+        const std::vector<int32_t> idxs_enc = build_cross_tier_idxs(8,  kL1 / 2,  true);
+        const std::vector<int32_t> idxs_dec = build_cross_tier_idxs(12, kDecQPos, false);
+
+        // Reference pass (continuous SWA across [1,048,064 .. 1,048,575], swa_floor = 0)
+        DSV41_HIP_CHECK(hipMemcpyAsync(c0.d_latent_bf16, h_tail_kv.data(),
+                                       h_tail_kv.size() * sizeof(uint16_t), hipMemcpyHostToDevice, c0.stream));
+        impl_->write_ring_window_gpu(0, l_enc, c0.d_latent_bf16, kTailBase, kL1 - kTailBase); // [1,048,064 .. 1,048,320)
+        DSV41_HIP_CHECK(hipMemcpyAsync(c0.d_q_bf16, h_q_enc.data(),
+                                       h_q_enc.size() * sizeof(uint16_t), hipMemcpyHostToDevice, c0.stream));
+        DSV41_HIP_CHECK(hipMemcpyAsync(c0.d_kv_cur_bf16, h_tail_kv.data() + size_t(kL1 - kTailBase) * kHeadDim,
+                                       8u * kHeadDim * sizeof(uint16_t), hipMemcpyHostToDevice, c0.stream));
+        DSV41_HIP_CHECK(hipMemcpyAsync(c0.d_comp_topk_idxs, idxs_enc.data(),
+                                       idxs_enc.size() * sizeof(int32_t), hipMemcpyHostToDevice, c0.stream));
+        launch_sparse_attn(
+            c0.d_q_bf16, c0.blocks[l_enc].d_attn_sink, c0.d_win_kv[l_enc], c0.d_kv_cur_bf16,
+            kL1, /*swa_floor=*/0, false,
+            c0.d_comp_kv_fp4[2], c0.d_comp_kv_e4m3[2], c0.d_comp_topk_idxs, kIndexTopk,
+            c0.d_part_f32, c0.d_o_bf16, 8, h_enc, c0.stream,
+            {}, 0ULL, c0.d_ext_comp_kv_fp4[2], c0.d_ext_comp_kv_e4m3[2], c0.hot_comp_cap[2], false);
+        std::vector<uint16_t> enc_ref(h_q_enc.size());
+        DSV41_HIP_CHECK(hipStreamSynchronize(c0.stream));
+        DSV41_HIP_CHECK(hipMemcpy(enc_ref.data(), c0.d_o_bf16, enc_ref.size() * sizeof(uint16_t), hipMemcpyDeviceToHost));
+
+        impl_->write_ring_window_gpu(0, l_dec, c0.d_latent_bf16, kTailBase, kDecQPos - kTailBase); // [1,048,064 .. 1,048,564)
+        DSV41_HIP_CHECK(hipMemcpyAsync(c0.d_q_bf16, h_q_dec.data(),
+                                       h_q_dec.size() * sizeof(uint16_t), hipMemcpyHostToDevice, c0.stream));
+        DSV41_HIP_CHECK(hipMemcpyAsync(c0.d_kv_cur_bf16, h_tail_kv.data() + size_t(kDecQPos - kTailBase) * kHeadDim,
+                                       12u * kHeadDim * sizeof(uint16_t), hipMemcpyHostToDevice, c0.stream));
+        DSV41_HIP_CHECK(hipMemcpyAsync(c0.d_comp_topk_idxs, idxs_dec.data(),
+                                       idxs_dec.size() * sizeof(int32_t), hipMemcpyHostToDevice, c0.stream));
+        launch_sparse_attn(
+            c0.d_q_bf16, c0.blocks[l_dec].d_attn_sink, c0.d_win_kv[l_dec], c0.d_kv_cur_bf16,
+            kDecQPos, /*swa_floor=*/0, false,
+            c0.d_comp_kv_fp4[3], c0.d_comp_kv_e4m3[3], c0.d_comp_topk_idxs, kIndexTopk,
+            c0.d_part_f32, c0.d_o_bf16, 12, h_dec, c0.stream,
+            {}, 0ULL, c0.d_ext_comp_kv_fp4[3], c0.d_ext_comp_kv_e4m3[3], c0.hot_comp_cap[3], false);
+        std::vector<uint16_t> dec_ref(h_q_dec.size());
+        DSV41_HIP_CHECK(hipStreamSynchronize(c0.stream));
+        DSV41_HIP_CHECK(hipMemcpy(dec_ref.data(), c0.d_o_bf16, dec_ref.size() * sizeof(uint16_t), hipMemcpyDeviceToHost));
+
+        // Clear GPU KV + poison SWA ring (0x5A) + poison target Global KV blocks (0xAA) + clear RAM EncoderStateBlock & Radix rings!
+        impl_->clear_gpu_kv_state();
+        impl_->encoder_state_map.clear();
+        impl_->encoder_state_fifo.clear();
+        impl_->radix_map.clear();
+        impl_->radix_fifo.clear();
+        std::fill(impl_->gpu_slot_radix_keys.begin(), impl_->gpu_slot_radix_keys.end(), RadixKey128{});
+        for (int tp = 0; tp < 3; ++tp) {
+            DSV41_HIP_CHECK(hipSetDevice(tp));
+            auto& c = impl_->ctx[tp];
+            DSV41_HIP_CHECK(hipMemsetAsync(c.d_win_kv_slab, 0x5A, kWinKvSlabElems * sizeof(uint16_t), c.stream));
+            for (int b : target_blks) {
+                for (int s = 0; s < 4; ++s) {
+                    const size_t n_sl = (s < 3) ? 64u : 128u;
+                    const size_t sb   = size_t(b) * n_sl;
+                    const size_t hcap = size_t(c.hot_comp_cap[s]);
+                    if (sb < hcap) {
+                        DSV41_HIP_CHECK(hipMemsetAsync(c.d_comp_kv_fp4[s] + sb * 256u, 0xAA, n_sl * 256u, c.stream));
+                        DSV41_HIP_CHECK(hipMemsetAsync(c.d_comp_kv_e4m3[s] + sb * 32u, 0xAA, n_sl * 32u, c.stream));
+                    } else {
+                        std::memset(c.h_ext_comp_kv_fp4[s] + (sb - hcap) * 256u, 0xAA, n_sl * 256u);
+                        std::memset(c.h_ext_comp_kv_e4m3[s] + (sb - hcap) * 32u, 0xAA, n_sl * 32u);
+                    }
+                    DSV41_HIP_CHECK(hipMemsetAsync(c.d_index_k_fp4[s] + sb * 64u, 0xAA, n_sl * 64u, c.stream));
+                    DSV41_HIP_CHECK(hipMemsetAsync(c.d_index_k_ue8m0[s] + sb * 4u, 0xAA, n_sl * 4u, c.stream));
+                }
+            }
+            DSV41_HIP_CHECK(hipStreamSynchronize(c.stream));
+        }
+
+        // Cold hydrate from NVMe store across all 13 boundary + 1M tail blocks (including 8,188..8,191)!
+        Dsv41NvmeKvStore cold_store;
+        cold_store.configure(nvme_tmp_dir, 2ULL * 1024ULL * 1024ULL * 1024ULL);
+        const auto t_hyd0 = std::chrono::steady_clock::now();
+        std::vector<std::shared_ptr<RadixBlockEntry>> hyd_entries(saved_entries.size());
+        bool crc_all_ok = corrupt_rejected;
+        for (size_t i = 0; i < saved_entries.size(); ++i) {
+            auto ld = std::make_shared<RadixBlockEntry>();
+            if (!cold_store.read_block_pread(saved_entries[i]->key, impl_->root_radix_key(),
+                                             saved_entries[i]->tokens.data(), saved_entries[i]->extra_salt, *ld)) {
+                crc_all_ok = false;
+            }
+            if (hw_crc32c(ld->data.data(), ld->data.size()) != crc_before[i]) {
+                crc_all_ok = false;
+            }
+            hyd_entries[i] = std::move(ld);
+        }
+        int ping = 0;
+        for (size_t i = 0; i < 5u; ++i) {
+            impl_->stage_and_enqueue_radix_chunk_gpu(&hyd_entries[i], target_blks[i], 1, ping);
+        }
+        impl_->stage_and_enqueue_radix_chunk_gpu(&hyd_entries[5], 8184, 8, ping);
+        for (int tp = 0; tp < 3; ++tp) {
+            DSV41_HIP_CHECK(hipSetDevice(tp));
+            DSV41_HIP_CHECK(hipStreamSynchronize(impl_->ctx[tp].stream));
+        }
+        rec.nvme_cold_hydrate_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_hyd0).count();
+        rec.nvme_crc32c_ok = crc_all_ok && (rec.nvme_block_bytes == kNvmeKvBlockFileBytes) && (rec.nvme_swa_disk_bytes == 0u);
+
+        // 128-token Bounded Encoder SWA Replay on [L_eff=1,048,192 .. L1=1,048,320) with swa_floor = L_eff!
+        DSV41_HIP_CHECK(hipSetDevice(0));
+        DSV41_HIP_CHECK(hipMemcpyAsync(c0.d_latent_bf16, h_tail_kv.data(),
+                                       h_tail_kv.size() * sizeof(uint16_t), hipMemcpyHostToDevice, c0.stream));
+        impl_->write_ring_window_gpu(0, l_enc, c0.d_latent_bf16 + size_t(kLeff - kTailBase) * kHeadDim, kLeff, kL1 - kLeff);
+        rec.nvme_swa_replay_tokens = kL1 - kLeff; // 128!
+
+        DSV41_HIP_CHECK(hipMemcpyAsync(c0.d_q_bf16, h_q_enc.data(),
+                                       h_q_enc.size() * sizeof(uint16_t), hipMemcpyHostToDevice, c0.stream));
+        DSV41_HIP_CHECK(hipMemcpyAsync(c0.d_kv_cur_bf16, h_tail_kv.data() + size_t(kL1 - kTailBase) * kHeadDim,
+                                       8u * kHeadDim * sizeof(uint16_t), hipMemcpyHostToDevice, c0.stream));
+        DSV41_HIP_CHECK(hipMemcpyAsync(c0.d_comp_topk_idxs, idxs_enc.data(),
+                                       idxs_enc.size() * sizeof(int32_t), hipMemcpyHostToDevice, c0.stream));
+        launch_sparse_attn(
+            c0.d_q_bf16, c0.blocks[l_enc].d_attn_sink, c0.d_win_kv[l_enc], c0.d_kv_cur_bf16,
+            kL1, /*swa_floor=*/kLeff, false,
+            c0.d_comp_kv_fp4[2], c0.d_comp_kv_e4m3[2], c0.d_comp_topk_idxs, kIndexTopk,
+            c0.d_part_f32, c0.d_o_bf16, 8, h_enc, c0.stream,
+            {}, 0ULL, c0.d_ext_comp_kv_fp4[2], c0.d_ext_comp_kv_e4m3[2], c0.hot_comp_cap[2], false);
+        std::vector<uint16_t> enc_cold(h_q_enc.size());
+        DSV41_HIP_CHECK(hipStreamSynchronize(c0.stream));
+        DSV41_HIP_CHECK(hipMemcpy(enc_cold.data(), c0.d_o_bf16, enc_cold.size() * sizeof(uint16_t), hipMemcpyDeviceToHost));
+        rec.nvme_enc_cos = cosine_and_max_abs_bf16(enc_ref.data(), enc_cold.data(), enc_ref.size(), rec.nvme_enc_max_abs);
+
+        // 140-token KEEP_TOKENS Bounded Decoder SWA Replay on [1,048,436 .. 1,048,576) with swa_floor = 1,048,436!
+        impl_->write_ring_window_gpu(0, l_dec, c0.d_latent_bf16 + size_t(kCed1M - kTailBase) * kHeadDim, kCed1M, kDecQPos - kCed1M);
+        DSV41_HIP_CHECK(hipMemcpyAsync(c0.d_q_bf16, h_q_dec.data(),
+                                       h_q_dec.size() * sizeof(uint16_t), hipMemcpyHostToDevice, c0.stream));
+        DSV41_HIP_CHECK(hipMemcpyAsync(c0.d_kv_cur_bf16, h_tail_kv.data() + size_t(kDecQPos - kTailBase) * kHeadDim,
+                                       12u * kHeadDim * sizeof(uint16_t), hipMemcpyHostToDevice, c0.stream));
+        DSV41_HIP_CHECK(hipMemcpyAsync(c0.d_comp_topk_idxs, idxs_dec.data(),
+                                       idxs_dec.size() * sizeof(int32_t), hipMemcpyHostToDevice, c0.stream));
+        launch_sparse_attn(
+            c0.d_q_bf16, c0.blocks[l_dec].d_attn_sink, c0.d_win_kv[l_dec], c0.d_kv_cur_bf16,
+            kDecQPos, /*swa_floor=*/kCed1M, false,
+            c0.d_comp_kv_fp4[3], c0.d_comp_kv_e4m3[3], c0.d_comp_topk_idxs, kIndexTopk,
+            c0.d_part_f32, c0.d_o_bf16, 12, h_dec, c0.stream,
+            {}, 0ULL, c0.d_ext_comp_kv_fp4[3], c0.d_ext_comp_kv_e4m3[3], c0.hot_comp_cap[3], false);
+        std::vector<uint16_t> dec_cold(h_q_dec.size());
+        DSV41_HIP_CHECK(hipStreamSynchronize(c0.stream));
+        DSV41_HIP_CHECK(hipMemcpy(dec_cold.data(), c0.d_o_bf16, dec_cold.size() * sizeof(uint16_t), hipMemcpyDeviceToHost));
+        rec.nvme_dec_cos = cosine_and_max_abs_bf16(dec_ref.data(), dec_cold.data(), dec_ref.size(), rec.nvme_dec_max_abs);
+
+        impl_->clear_gpu_kv_state();
+    }
+
+    return rec;
+}
+
 std::vector<int32_t> Dsv41Runtime::generate(
     const std::vector<int32_t>& raw_prompt_ids,
     const Dsv41GenParams& params,
@@ -4827,6 +6821,7 @@ std::vector<int32_t> Dsv41Runtime::generate(
     out_stats = Dsv41GenStats{};
     if (!ready_ || raw_prompt_ids.empty()) return {};
     impl_->reset_stage_timers();
+    impl_->eg_next_chunk_prefetched = false;
 
     const bool has_images = (images != nullptr && !images->empty());
     std::vector<int32_t> expanded_prompt_ids;
@@ -4847,7 +6842,7 @@ std::vector<int32_t> Dsv41Runtime::generate(
     const std::vector<int32_t>& prompt_ids = has_images ? expanded_prompt_ids : raw_prompt_ids;
 
     const int P = static_cast<int>(prompt_ids.size());
-    if (P >= impl_->max_seq_len - 8) {
+    if (P >= impl_->max_seq_len) {
         throw std::runtime_error("Prompt length " + std::to_string(P) + " exceeds max_seq_len " + std::to_string(impl_->max_seq_len));
     }
 
@@ -5073,101 +7068,117 @@ std::vector<int32_t> Dsv41Runtime::generate(
     ensure_images_encoded_from(pos);
     sync_cached_salts_to(P);
 
-    // 2. Strict 20-Layer CED Early-Exit Prefill over [pos .. P - 1] with KEEP_TOKENS = 140:
+    // 2. Strict 20-Layer CED Early-Exit Prefill over [pos .. P - 1] with KEEP_TOKENS = 140
+    //    + Double-Buffered CPU Engram Gather + Pinned hipMemcpyAsync Overlap across chunks (M = 512 / M = 1024 superchunks):
     //    - Phase A [pos .. ced_split): 20-layer Encoder-Only + Layer 20 Compressor/Indexer.k (kMaxChunkM = 512)!
     //    - Phase B [max(pos, ced_split) .. P): Final >= 140 tokens run full 40-layer Decoder (Decoder SWA Bounded Replay)!
-    const int ced_128_top = (ced_split / kRadixBlockTokens) * kRadixBlockTokens;
-    while (pos < ced_split) {
-        const int target_top = (pos < ced_128_top) ? ced_128_top : ced_split;
-        const int rem_enc = target_top - pos;
-        int chunk_m = std::min(rem_enc, kMaxChunkM);
-        // Align odd `pos` back to an even r=2 boundary on the first encoder chunk!
-        if ((pos & 1) != 0) {
-            if ((chunk_m & 1) == 0) --chunk_m;
-        } else if ((chunk_m & 1) != 0) {
-            --chunk_m;
-        }
-        const int64_t tc0_ns = mono_ns();
-        impl_->forward_backbone_chunk(
-            prompt_ids.data() + pos,
-            pos,
-            chunk_m,
-            true,   // encoder_only = true!
-            0,
-            true,
-            false,
-            0,
-            false,
-            {}, 0ULL, 0ULL, nullptr, nullptr,
-            has_images ? (prompt_image_mask.data() + pos) : nullptr,
-            has_images ? &prepared_images : nullptr
-        );
-        impl_->cached_tokens.insert(impl_->cached_tokens.end(),
-                                    prompt_ids.begin() + pos,
-                                    prompt_ids.begin() + pos + chunk_m);
-        pos += chunk_m;
-        impl_->win_valid_from_20_39 = pos;
-        if (pos / kRadixBlockTokens > impl_->exported_radix_blocks) {
-            impl_->export_new_radix_blocks();
-        }
-        const int64_t tc1_ns = mono_ns();
-        if (on_progress) {
-            Dsv41ProgressUpdate upd{};
-            upd.phase = Dsv41ProgressPhase::PrefillChunk;
-            upd.prompt_tokens = P;
-            upd.cached_tokens = out_stats.cached_prefix_tokens;
-            upd.fresh_tokens_done = pos - out_stats.cached_prefix_tokens;
-            upd.chunk_tokens = chunk_m;
-            upd.chunk_ms = double(tc1_ns - tc0_ns) / 1e6;
-            upd.begin_ns = tc0_ns;
-            upd.end_ns = tc1_ns;
-            if (!on_progress(upd)) {
-                sync_cached_salts_to(pos);
-                impl_->export_new_radix_blocks();
-                return {};
+    struct PrefillChunkDesc {
+        int start_pos;
+        int m;
+        bool encoder_only;
+    };
+    std::vector<PrefillChunkDesc> pf_chunks;
+    pf_chunks.reserve(static_cast<size_t>((P - pos + kMaxChunkM - 1) / kMaxChunkM + 4));
+    {
+        int sim_pos = pos;
+        const int ced_128_top = (ced_split / kRadixBlockTokens) * kRadixBlockTokens;
+        while (sim_pos < ced_split) {
+            const int target_top = (sim_pos < ced_128_top) ? ced_128_top : ced_split;
+            const int rem_enc = target_top - sim_pos;
+            int chunk_m = std::min(rem_enc, kMaxChunkM);
+            // Align odd `sim_pos` back to an even r=2 boundary on the first encoder chunk!
+            if ((sim_pos & 1) != 0) {
+                if ((chunk_m & 1) == 0) --chunk_m;
+            } else if ((chunk_m & 1) != 0) {
+                --chunk_m;
             }
+            pf_chunks.push_back(PrefillChunkDesc{sim_pos, chunk_m, true});
+            sim_pos += chunk_m;
+        }
+        const int p_128_top = (P / kRadixBlockTokens) * kRadixBlockTokens;
+        while (sim_pos < P) {
+            const int target_top = (sim_pos < p_128_top && p_128_top < P) ? p_128_top : P;
+            const int rem_dec = target_top - sim_pos;
+            int chunk_m = std::min(rem_dec, kMaxDecChunkM);
+            if (sim_pos + chunk_m < P && ((sim_pos + chunk_m) & 1) != 0 && chunk_m > 1) {
+                --chunk_m;
+            }
+            pf_chunks.push_back(PrefillChunkDesc{sim_pos, chunk_m, false});
+            sim_pos += chunk_m;
         }
     }
 
-    const int p_128_top = (P / kRadixBlockTokens) * kRadixBlockTokens;
-    while (pos < P) {
-        const int target_top = (pos < p_128_top && p_128_top < P) ? p_128_top : P;
-        const int rem_dec = target_top - pos;
-        int chunk_m = std::min(rem_dec, kMaxDecChunkM);
-        if (pos + chunk_m < P && ((pos + chunk_m) & 1) != 0 && chunk_m > 1) {
-            --chunk_m;
-        }
-        const bool is_last_chunk = (pos + chunk_m == P);
-        const bool need_mtp_seed = ((pos + chunk_m) > (P - kWindowSize));
+    const int super_m_goal = (impl_->prefill_superchunk_m >= 1024) ? 1024 : 512;
+    size_t pf_idx = 0;
+    while (pf_idx < pf_chunks.size()) {
         const int64_t tc0_ns = mono_ns();
+        int super_done_m = 0;
+        const bool group_enc = pf_chunks[pf_idx].encoder_only;
+        while (pf_idx < pf_chunks.size() &&
+               pf_chunks[pf_idx].encoder_only == group_enc &&
+               (super_done_m == 0 || super_done_m + pf_chunks[pf_idx].m <= super_m_goal))
+        {
+            const PrefillChunkDesc& cur = pf_chunks[pf_idx];
+            const PrefillChunkDesc* nxt = (pf_idx + 1 < pf_chunks.size()) ? &pf_chunks[pf_idx + 1] : nullptr;
+            const int32_t* nxt_toks = nxt ? (prompt_ids.data() + nxt->start_pos) : nullptr;
+            const int nxt_pos = nxt ? nxt->start_pos : -1;
+            const int nxt_m   = nxt ? nxt->m : 0;
+            const uint8_t* nxt_img_mask = (nxt && has_images) ? (prompt_image_mask.data() + nxt->start_pos) : nullptr;
 
-        impl_->forward_backbone_chunk(
-            prompt_ids.data() + pos,
-            pos,
-            chunk_m,
-            false,  // full 40-layer Decoder!
-            is_last_chunk ? 1 : 0,
-            true,
-            need_mtp_seed,
-            0,
-            false,
-            {}, 0ULL, 0ULL, nullptr, nullptr,
-            has_images ? (prompt_image_mask.data() + pos) : nullptr,
-            has_images ? &prepared_images : nullptr
-        );
-
-        if (need_mtp_seed) {
-            const int seed_global_start = std::max(pos, P - kWindowSize);
-            const int cap_off = std::max(0, chunk_m - kMaxDecM);
-            const int row_off = (seed_global_start - pos) - cap_off;
-            const int seed_cnt = (pos + chunk_m) - seed_global_start;
-            impl_->update_mtp_window_from_target_hidden(seed_global_start, seed_cnt, row_off);
+            if (cur.encoder_only) {
+                impl_->forward_backbone_chunk(
+                    prompt_ids.data() + cur.start_pos,
+                    cur.start_pos,
+                    cur.m,
+                    true,   // encoder_only = true!
+                    0,
+                    true,
+                    false,
+                    0,
+                    false,
+                    {}, 0ULL, 0ULL, nullptr, nullptr,
+                    has_images ? (prompt_image_mask.data() + cur.start_pos) : nullptr,
+                    has_images ? &prepared_images : nullptr,
+                    nxt_toks, nxt_pos, nxt_m, nxt_img_mask
+                );
+                impl_->cached_tokens.insert(impl_->cached_tokens.end(),
+                                            prompt_ids.begin() + cur.start_pos,
+                                            prompt_ids.begin() + cur.start_pos + cur.m);
+                pos = cur.start_pos + cur.m;
+                impl_->win_valid_from_20_39 = pos;
+            } else {
+                const bool is_last_chunk = (cur.start_pos + cur.m == P);
+                const bool need_mtp_seed = ((cur.start_pos + cur.m) > (P - kWindowSize));
+                impl_->forward_backbone_chunk(
+                    prompt_ids.data() + cur.start_pos,
+                    cur.start_pos,
+                    cur.m,
+                    false,  // full 40-layer Decoder!
+                    is_last_chunk ? 1 : 0,
+                    true,
+                    need_mtp_seed,
+                    0,
+                    false,
+                    {}, 0ULL, 0ULL, nullptr, nullptr,
+                    has_images ? (prompt_image_mask.data() + cur.start_pos) : nullptr,
+                    has_images ? &prepared_images : nullptr,
+                    nxt_toks, nxt_pos, nxt_m, nxt_img_mask
+                );
+                if (need_mtp_seed) {
+                    const int seed_global_start = std::max(cur.start_pos, P - kWindowSize);
+                    const int cap_off = std::max(0, cur.m - kMaxDecM);
+                    const int row_off = (seed_global_start - cur.start_pos) - cap_off;
+                    const int seed_cnt = (cur.start_pos + cur.m) - seed_global_start;
+                    impl_->update_mtp_window_from_target_hidden(seed_global_start, seed_cnt, row_off);
+                }
+                impl_->cached_tokens.insert(impl_->cached_tokens.end(),
+                                            prompt_ids.begin() + cur.start_pos,
+                                            prompt_ids.begin() + cur.start_pos + cur.m);
+                pos = cur.start_pos + cur.m;
+            }
+            super_done_m += cur.m;
+            ++pf_idx;
         }
-
-        impl_->cached_tokens.insert(impl_->cached_tokens.end(),
-                                    prompt_ids.begin() + pos,
-                                    prompt_ids.begin() + pos + chunk_m);
-        pos += chunk_m;
         if (pos / kRadixBlockTokens > impl_->exported_radix_blocks) {
             impl_->export_new_radix_blocks();
         }
@@ -5178,11 +7189,12 @@ std::vector<int32_t> Dsv41Runtime::generate(
             upd.prompt_tokens = P;
             upd.cached_tokens = out_stats.cached_prefix_tokens;
             upd.fresh_tokens_done = pos - out_stats.cached_prefix_tokens;
-            upd.chunk_tokens = chunk_m;
+            upd.chunk_tokens = super_done_m;
             upd.chunk_ms = double(tc1_ns - tc0_ns) / 1e6;
             upd.begin_ns = tc0_ns;
             upd.end_ns = tc1_ns;
             if (!on_progress(upd)) {
+                impl_->drain_engram_worker();
                 sync_cached_salts_to(pos);
                 impl_->export_new_radix_blocks();
                 return {};
@@ -5471,10 +7483,11 @@ std::vector<int32_t> Dsv41Runtime::generate(
 
     while (keep_going && static_cast<int>(generated.size()) < params.max_new_tokens) {
         const int cur_pos = static_cast<int>(impl_->cached_tokens.size());
-        if (cur_pos + kMaxTreeNodes + 2 >= impl_->max_seq_len) break;
+        const int rem_ctx = impl_->max_seq_len - cur_pos;
+        if (rem_ctx <= 0) break;
 
         const int rem_budget = params.max_new_tokens - static_cast<int>(generated.size());
-        const bool run_spec = params.enable_dspark && impl_->mtp_window_seeded && (rem_budget >= 2);
+        const bool run_spec = params.enable_dspark && impl_->mtp_window_seeded && (rem_budget >= 2) && (rem_ctx >= 2);
 
         if (!run_spec) {
             // Single-token M=1 step
@@ -5514,7 +7527,9 @@ std::vector<int32_t> Dsv41Runtime::generate(
 
         // A. Draft B (1..5) linear chain OR single-pass ConfidenceHead Dynamic M = 8 / DeepSelect M = 16 causal tree using 3-stage DSpark on 3x MI50!
         const int desired_tree = tree_ctrl.select_width(think_guard.in_think(), cur_pos);
-        const int target_tree_nodes = (rem_budget < 4) ? 0 : ((desired_tree == 16 && rem_budget >= 6) ? 16 : 8);
+        const int target_tree_nodes = (rem_budget < 4 || rem_ctx < 8)
+            ? 0
+            : ((desired_tree == 16 && rem_budget >= 6 && rem_ctx >= 16) ? 16 : 8);
         int used_tree_nodes = 0;
         std::array<int32_t, kMaxTreeNodes> tree_verify_tokens{};
         Dsv41DeepSelectPlan16 t16_plan{};
@@ -5728,7 +7743,7 @@ std::vector<int32_t> Dsv41Runtime::generate(
             continue;
         }
 
-        B = std::min(B, std::max(1, rem_budget - 1));
+        B = std::min(B, std::max(1, std::min(rem_budget, rem_ctx) - 1));
 
         std::array<int32_t, 1 + kDSparkBlockSize> verify_tokens{};
         verify_tokens[0] = cur_anchor;

@@ -91,6 +91,67 @@ struct Dsv41ProgressUpdate {
 
 using ProgressCallback = std::function<bool(const Dsv41ProgressUpdate&)>;
 
+struct Dsv41GpuMemMargin {
+    double free_mib[3]{0.0, 0.0, 0.0};
+    double total_mib[3]{0.0, 0.0, 0.0};
+    bool pointer_audit_64bit_ok = false;
+    size_t max_comp_slots[4]{};
+    size_t hot_comp_slots[4]{};
+    size_t ext_comp_slots[4]{};
+};
+
+struct Dsv411MDecodeBurstRow {
+    int burst_idx = 0;
+    int pos_start = 0;
+    int pos_end = 0;
+    int accepted_tokens = 0;
+    double step_ms = 0.0;
+    double tok_s = 0.0;
+    double attn_ms = 0.0;
+    double hsi_ms = 0.0;
+    double moe_ms = 0.0;
+    double p150w_ms = 0.0;
+    double ar_ms = 0.0;
+    double dsp_ms = 0.0;
+    double smp_ms = 0.0;
+    double egw_ms = 0.0;
+};
+
+struct Dsv411MGateReceipt {
+    Dsv41GpuMemMargin mem_margin{};
+    bool engram_prefetch_overlap_m512_ok = false;
+    bool engram_prefetch_overlap_m1024_ok = false;
+    double engram_prefetch_wait_m512_ms = 0.0;
+    double engram_prefetch_wait_m1024_ms = 0.0;
+    double populate_1m_s = 0.0;
+    double prefill_tail_ms = 0.0;
+    int prefill_tail_tokens = 0;
+    uint64_t nonfinite_count = 0;
+    bool int32_overflow_free = false;
+    double hsi_top64_overlap_pct = 0.0;
+    bool needle_128_retrieved = false;
+    bool needle_524288_retrieved = false;
+    bool needle_900000_retrieved = false;
+    double csa2_vdot2_vs_fp32_cos = 0.0;
+    double csa2_vdot2_vs_fp32_max_abs = 0.0;
+    int decode_bursts_completed = 0;
+    int decode_final_pos = 0;
+    int decode_total_emitted = 0;
+    double decode_mean_step_ms = 0.0;
+    double decode_agg_tok_s = 0.0;
+    std::vector<Dsv411MDecodeBurstRow> bursts;
+    int nvme_blocks_flushed = 0;
+    size_t nvme_block_bytes = 0;
+    size_t nvme_swa_disk_bytes = 0;
+    bool nvme_crc32c_ok = false;
+    double nvme_cold_hydrate_ms = 0.0;
+    int nvme_swa_replay_tokens = 0;
+    double nvme_enc_cos = 0.0;
+    double nvme_enc_max_abs = 0.0;
+    double nvme_dec_cos = 0.0;
+    double nvme_dec_max_abs = 0.0;
+};
+
 class Dsv41Runtime {
 public:
     Dsv41Runtime();
@@ -115,17 +176,31 @@ public:
     void reset_session_cache();
     void set_sync_timers(bool enable);
     void set_dual_stream_overlap(bool enable);
+    void set_fused_mhc_norm(bool enable);
+    bool fused_mhc_norm() const noexcept;
+    void set_fused_dspark_epilogue(bool enable);
+    bool fused_dspark_epilogue() const noexcept;
+    void set_prefill_superchunk_m(int super_m);
     void set_dspark_tree_width(int width_mode);  // 0 = auto, 8 = fixed M=8, 16 = fixed M=16
     void set_dspark_tree16_max_context(int max_ctx);
     void set_dspark_static_m8(bool enable);
     void set_dspark_dyn8_max_depth(int max_depth);
     void set_expert_perm_overlay(const std::string& overlay_path);
+    // Opt-in Wave-9 HLUT3 MTP overlay: load 400 B/tile HLUT3 tile planes for DSpark MTP blocks
+    // 40..42 only when --hlut3-mtp-overlay <path> is supplied. When unset, the default production
+    // 2.125 bpw HLUT2 MTP footprint is byte-identical and 0 B extra HBM2 is allocated.
+    void set_hlut3_mtp_overlay(const std::string& overlay_path);
     void set_csa2_shared_tree8(bool enable);
     void set_nvme_kv_cache(const std::string& cache_dir, double max_gb = 32.0);
     void flush_nvme_kv_cache();
     void clear_all_caches();
     std::vector<float> last_logits_row0() const;
     bool capture_rarebal_corpus(const std::vector<int32_t>& corpus_ids);
+    bool capture_rarebal_multimodal(
+        const std::vector<int32_t>& raw_prompt_ids,
+        const std::vector<Dsv41ImageSource>& images);
+    Dsv41GpuMemMargin query_gpu_mem_margin();
+    Dsv411MGateReceipt run_wave8_5_1m_e2e_gate(const std::string& nvme_tmp_dir);
 
     // Thread-safe generation with multi-tier KV prefix reuse, strict CED prefill, and 3-stage DSpark (M=6)
     std::vector<int32_t> generate(

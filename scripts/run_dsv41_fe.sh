@@ -4,7 +4,13 @@ export OMP_WAIT_POLICY=PASSIVE
 export GPU_MAX_HW_QUEUES="${GPU_MAX_HW_QUEUES:-8}"
 
 DSV41_ROOT="${DSV41_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-OVERLAY="${DSV41_OVERLAY:-$DSV41_ROOT/packed_rarebal_overlay_wave8_4/hot_experts_wave8_4_perm.safetensors}"
+OVERLAY="${DSV41_OVERLAY:-$DSV41_ROOT/packed_rarebal_overlay_wave8_5/hot_experts_wave8_5.safetensors}"
+if [[ ! -f "$OVERLAY" && -f "$DSV41_ROOT/hot_experts_wave8_5.safetensors" ]]; then
+  OVERLAY="$DSV41_ROOT/hot_experts_wave8_5.safetensors"
+fi
+if [[ ! -f "$OVERLAY" && -f "$DSV41_ROOT/packed_rarebal_overlay_wave8_4/hot_experts_wave8_4_perm.safetensors" ]]; then
+  OVERLAY="$DSV41_ROOT/packed_rarebal_overlay_wave8_4/hot_experts_wave8_4_perm.safetensors"
+fi
 if [[ ! -f "$OVERLAY" && -f "$DSV41_ROOT/hot_experts_wave8_4_perm.safetensors" ]]; then
   OVERLAY="$DSV41_ROOT/hot_experts_wave8_4_perm.safetensors"
 fi

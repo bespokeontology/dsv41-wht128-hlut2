@@ -53,7 +53,7 @@ inline CapturedExpertData load_captured_expert_bin(const std::string& path) {
         }
     };
     rd(&hdr, sizeof(hdr));
-    if (hdr.magic != 0x5242414Cu || hdr.rows <= 0) {
+    if ((hdr.magic != 0x5242414Cu && hdr.magic != 0x5242414Du) || hdr.rows <= 0) {
         ::close(fd);
         throw std::runtime_error("Invalid RAREBAL capture header in " + path);
     }
@@ -65,9 +65,17 @@ inline CapturedExpertData load_captured_expert_bin(const std::string& path) {
     out.router_hits = hdr.hits;
     out.rare.resize(size_t(hdr.rows));
     out.x_bf16.resize(size_t(hdr.rows) * DSV41_H);
-    rd(out.rare.data(), out.rare.size());
-    rd(out.x_bf16.data(), out.x_bf16.size() * sizeof(uint16_t));
+    if (hdr.magic == 0x5242414Du) {
+        rd(out.x_bf16.data(), out.x_bf16.size() * sizeof(uint16_t));
+        rd(out.rare.data(), out.rare.size());
+    } else {
+        rd(out.rare.data(), out.rare.size());
+        rd(out.x_bf16.data(), out.x_bf16.size() * sizeof(uint16_t));
+    }
     ::close(fd);
+    for (uint16_t& b : out.x_bf16) {
+        if ((b & 0x7F80u) == 0x7F80u) b = 0u;
+    }
     return out;
 }
 
@@ -521,12 +529,16 @@ public:
         const uint8_t* rare_mask,
         Hlut2RarebalStats* out_stats)
     {
-        if (!ok_ || M_cal <= 2 * K || size_t(M_cal) > kMaxM || size_t(K) > kMaxD) {
+        if (!ok_ || M_cal < 2 * K || size_t(M_cal) > kMaxM || size_t(K) > kMaxD) {
             return build_rarebal_cholesky_rup(X_cal_rm, M_cal, K, signs, true, rare_mask, out_stats);
         }
 
         std::vector<float> x_rot(size_t(M_cal) * K);
         wht128_rows(X_cal_rm, x_rot.data(), M_cal, K, signs);
+        #pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < x_rot.size(); ++i) {
+            if (!std::isfinite(x_rot[i])) x_rot[i] = 0.0f;
+        }
 
         double tr_common = 0.0, tr_rare = 0.0;
         int m_common = 0, m_rare = 0;

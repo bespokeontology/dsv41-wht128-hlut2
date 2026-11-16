@@ -909,7 +909,56 @@ bool test_delta_8_3d_hostile_16kib_zero_injection(const Dsv41Tokenizer& tok) {
         CHECK_TRUE(!sp.in_thinking(), "genuine token ID 128822 closes <think>");
     }
 
-    std::printf("[PASS] Delta 8.3D: >= 16 KiB (%zu B) hostile zero-injection (0 injected 128803/128804/129264/128822/128825) + BPE '</'+'think>' isolation\n",
+    // 4. Wave 8.5 DSML bare-parameter quarantine guard: orphan <｜DSML｜ parameter ...> without enclosing invoke
+    //    must NEVER flush raw DSML markup into assistant message text or emit a bogus tool call!
+    {
+        const std::string dsml = "\xEF\xBD\x9C" "DSML\xEF\xBD\x9C";
+        const std::string orphan_bare =
+            "Reasoning complete.</think>Verified answer.\n\n<" + dsml +
+            " parameter name=\"command\" string=\"true\">rm -rf /tmp/x</" + dsml +
+            " parameter>\n</" + dsml + " invoke>\n</" + dsml + " function_calls>";
+        const std::string orphan_wrapped =
+            "Reasoning 2.</think>Second answer.\n\n<" + dsml + " function_calls>\n<" + dsml +
+            " parameter name=\"command\" string=\"true\">echo bad</" + dsml +
+            " parameter>\n</" + dsml + " function_calls>";
+
+        for (const std::string* sample : {&orphan_bare, &orphan_wrapped}) {
+            const std::vector<int32_t> ids = tok.encode(*sample, true);
+            Dsv41StreamParser sp("thinking");
+            std::string streamed_content;
+            std::vector<Dsv41ToolStreamDelta> tool_deltas;
+            for (int32_t id : ids) {
+                std::string rd, cd;
+                std::vector<Dsv41ToolStreamDelta> step_td;
+                sp.feed_token(id, tok.raw_bytes_single(id, false), rd, cd, &step_td, 42ULL);
+                streamed_content += cd;
+                for (auto& td : step_td) tool_deltas.push_back(std::move(td));
+                if (sp.should_stop_generation()) break;
+            }
+            std::string rd_fin, cd_fin;
+            std::vector<Dsv41ToolStreamDelta> fin_td;
+            Dsv41ParsedCompletion fin_out;
+            sp.finish(rd_fin, cd_fin, fin_out, 42ULL, &fin_td);
+            streamed_content += cd_fin;
+            for (auto& td : fin_td) tool_deltas.push_back(std::move(td));
+
+            CHECK_TRUE(streamed_content.find("DSML") == std::string::npos &&
+                       streamed_content.find("parameter") == std::string::npos,
+                       "0 raw DSML markup leaked into streamed assistant content on orphan parameter tag");
+            CHECK_TRUE(fin_out.content == streamed_content &&
+                       (fin_out.content == "Verified answer." || fin_out.content == "Second answer."),
+                       "assistant content cleanly preserved before quarantined orphan parameter block");
+            CHECK_TRUE(tool_deltas.empty() && fin_out.tool_calls.empty(),
+                       "0 bogus tool calls emitted on orphan parameter tag without invoke");
+
+            const Dsv41ParsedCompletion sync_parsed =
+                parse_dsv41_completion(std::string("<think>") + *sample, "thinking", 42ULL);
+            CHECK_TRUE(sync_parsed.content == fin_out.content && sync_parsed.tool_calls.empty(),
+                       "parse_dsv41_completion matches streaming bare-parameter quarantine");
+        }
+    }
+
+    std::printf("[PASS] Delta 8.3D + Wave 8.5: >= 16 KiB (%zu B) hostile zero-injection + BPE '</'+'think>' isolation + DSML bare-parameter quarantine\n",
                 hostile_16k.size());
     return true;
 }

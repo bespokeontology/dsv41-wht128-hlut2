@@ -1573,6 +1573,17 @@ Dsv41ParsedCompletion parse_dsv41_completion(
         open_len = 0;
     }
     if (cs == std::string::npos) {
+        // Quarantine orphan bare <｜DSML｜ parameter...> arriving without an enclosing invoke block
+        const size_t ps = find_dsml_variant(text, pos, {" parameter", "parameter"}, false, nullptr);
+        if (ps != std::string::npos) {
+            out.content = text.substr(pos, ps - pos);
+            if (out.content.size() >= 2 && out.content.compare(out.content.size() - 2, 2, "\n\n") == 0) {
+                out.content.erase(out.content.size() - 2);
+            } else if (!out.content.empty() && out.content.back() == '\n') {
+                out.content.pop_back();
+            }
+            return out;
+        }
         out.content = text.substr(pos);
         return out;
     }
@@ -1703,16 +1714,19 @@ void push_assistant_seg_txt(std::vector<PromptSegment>& segs, std::string_view s
 }
 
 struct DsmlOpenKmpSpec {
-    static constexpr int kNumPats = 6;
+    static constexpr int kNumPats = 8;
     const char* pats[kNumPats] = {
         " calls>",
         "calls>",
         " function_calls>",
         "function_calls>",
         " invoke",
-        "invoke"
+        "invoke",
+        " parameter",
+        "parameter"
     };
-    bool is_wrapper[kNumPats] = {true, true, true, true, false, false};
+    bool is_wrapper[kNumPats] = {true, true, true, true, false, false, false, false};
+    bool is_orphan_param[kNumPats] = {false, false, false, false, false, false, true, true};
     int lens[kNumPats] = {};
     int pi[kNumPats][24] = {};
 
@@ -1792,6 +1806,10 @@ void Dsv41StreamParser::step_token_gated_dsml_bytes(
             const std::string hdr = dsml_tag_buf_.substr(0, gt);
             work = dsml_tag_buf_.substr(gt + 1);
             dsml_tag_buf_.clear();
+            if (trim_leading_ascii_ws(hdr).rfind("invoke", 0) != 0) {
+                tool_block_closed_ = true;
+                return;
+            }
 
             const size_t nq0 = hdr.find("name=\"");
             if (nq0 == std::string::npos) {
@@ -2236,7 +2254,10 @@ void Dsv41StreamParser::feed_token(
                 if (matched_pat >= 0) {
                     const std::string_view rem(utf8_chunk.data() + idx + 1, utf8_chunk.size() - (idx + 1));
                     state_ = State::InToolCalls;
-                    if (kmp.is_wrapper[matched_pat]) {
+                    if (kmp.is_orphan_param[matched_pat]) {
+                        tool_block_closed_ = true;
+                        dsml_tag_buf_.clear();
+                    } else if (kmp.is_wrapper[matched_pat]) {
                         dsml_sub_ = DsmlSub::BetweenInvokes;
                         dsml_tag_buf_.clear();
                     } else {
@@ -2245,7 +2266,7 @@ void Dsv41StreamParser::feed_token(
                     }
                     dsml_pre_ws_.clear();
                     dsml_open_buf_.clear();
-                    if (!rem.empty()) {
+                    if (!rem.empty() && !tool_block_closed_) {
                         step_token_gated_dsml_bytes(rem, out_tool_deltas, call_id_seed);
                     }
                     return;

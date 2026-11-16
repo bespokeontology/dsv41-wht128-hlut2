@@ -320,7 +320,7 @@ inline std::vector<float> build_rarebal_cholesky_rup(
     bool bypass_starvation_gate = false)
 {
     if (out_stats) *out_stats = Hlut2RarebalStats{};
-    if (!X_cal_rm || M_cal <= 0 || (!bypass_starvation_gate && M_cal <= 2 * K)) {
+    if (!X_cal_rm || M_cal <= 0 || (!bypass_starvation_gate && M_cal < 2 * K)) {
         if (out_stats) {
             out_stats->m_cal = std::max(0, M_cal);
             out_stats->used_starvation_fallback = true;
@@ -875,7 +875,7 @@ inline Hlut2P150Packed pack_hlut2_for_p150_shard(
     return p;
 }
 
-// ---- Real DeepSeek-V4.1-Flash-1017 Layer 6 Expert 0 MXFP4 Loader (Dual-NVMe Shards) ----
+// ---- Real DeepSeek-V4.1-Flash-1017 Layer 6 Expert 0 MXFP4 Loader (Split SK hynix + Great Wall) ----
 struct SwigluExpertF32 {
     std::string name;
     std::vector<float> gate;  // [2304, 5120]

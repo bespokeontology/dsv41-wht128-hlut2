@@ -225,7 +225,7 @@ private:
     std::vector<PromptSegment> assistant_segs_;
     std::string dsml_pre_ws_;
     std::string dsml_open_buf_;
-    int kmp_q_[6] = {0, 0, 0, 0, 0, 0};
+    int kmp_q_[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     DsmlSub dsml_sub_ = DsmlSub::BetweenInvokes;
     std::string dsml_tag_buf_;
     std::string param_val_pending_;

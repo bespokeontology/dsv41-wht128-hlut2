@@ -214,6 +214,74 @@ void launch_host_ring_finish_f32_hc_post(
     uint32_t p150_req_seq = 0u,
     Dsv41GpuStageRtc* d_stage_rtc = nullptr);
 
+// Wave 8.5B: Cross-sublayer fused HostRing TP3 AllReduce + mHC post + next-sublayer H_pre contraction +
+// RMSNorm + optional UE8M0/32 FP8 quant + optional WHT128 (M <= 16 decode fast path, ScratchSize == 0).
+void launch_host_ring_allreduce_f32_mhc_fused(
+    const float* d_src_f32,         // [M, 5120] FP32 local shard
+    const uint16_t* d_p150_bf16,    // [M, 5120] optional P150A BF16 output
+    const uint16_t* d_res_bf16,     // [M, 4, 5120] BF16 residual hyper-stream
+    const float* d_post_f32,        // [M, 4] FP32 post mix
+    const float* d_comb_f32,        // [M, 16] FP32 comb mix
+    uint16_t* d_out_h_bf16,         // [M, 4, 5120] BF16 updated hyper-stream
+    const float* d_next_pre_f32,    // [M, 4] next-sublayer H_pre mix
+    const uint16_t* d_next_norm_w,  // [5120] BF16 next-sublayer RMSNorm gamma
+    uint16_t* d_out_norm_bf16,      // [M, 5120] BF16 normalized next-sublayer activation
+    uint16_t* d_out_raw_bf16,       // [M, 5120] optional raw pre-norm BF16 (MTP ConfidenceHead)
+    uint8_t* d_out_fp8,             // [M, 5120] optional UE8M0/32 FP8 output
+    uint8_t* d_out_ue8m0,           // [M, 160]  optional UE8M0/32 scale output
+    const uint64_t* d_signs_u64,    // [80] optional WHT128 signs
+    uint16_t* d_out_rot_f16,        // [M, 5120] optional FP16 rotated output
+    uint16_t* d_out_rot_bf16,       // [M, 5120] optional BF16 rotated output (tp=0 -> P150A)
+    float norm_eps,
+    HostRingAllReduceSlot* d_mapped_slot,
+    int rank,
+    uint64_t seq,
+    int M,
+    hipStream_t stream,
+    Dsv41GpuStageRtc* d_stage_rtc = nullptr);
+
+void launch_host_ring_finish_f32_mhc_fused(
+    const float* d_src_f32,         // [M, 5120] FP32 local shard (already uploaded via launch_host_ring_upload_f32)
+    const uint16_t* d_p150_bf16,    // [M, 5120] BF16 mapped /dsv41_p150_ipc y_out_bf16
+    const uint16_t* d_res_bf16,     // [M, 4, 5120] BF16 residual hyper-stream
+    const float* d_post_f32,        // [M, 4] FP32 post mix
+    const float* d_comb_f32,        // [M, 16] FP32 comb mix
+    uint16_t* d_out_h_bf16,         // [M, 4, 5120] BF16 updated hyper-stream
+    const float* d_next_pre_f32,    // [M, 4] next-sublayer H_pre mix
+    const uint16_t* d_next_norm_w,  // [5120] BF16 next-sublayer RMSNorm gamma
+    uint16_t* d_out_norm_bf16,      // [M, 5120] BF16 normalized next-sublayer activation
+    uint16_t* d_out_raw_bf16,       // [M, 5120] optional raw pre-norm BF16
+    uint8_t* d_out_fp8,             // [M, 5120] optional UE8M0/32 FP8 output
+    uint8_t* d_out_ue8m0,           // [M, 160]  optional UE8M0/32 scale output
+    const uint64_t* d_signs_u64,    // [80] optional WHT128 signs
+    uint16_t* d_out_rot_f16,        // [M, 5120] optional FP16 rotated output
+    uint16_t* d_out_rot_bf16,       // [M, 5120] optional BF16 rotated output
+    float norm_eps,
+    HostRingAllReduceSlot* d_mapped_slot,
+    int rank,
+    uint64_t seq,
+    int M,
+    hipStream_t stream,
+    const uint32_t* d_p150_resp_seq = nullptr,
+    uint32_t p150_req_seq = 0u,
+    Dsv41GpuStageRtc* d_stage_rtc = nullptr);
+
+// Wave 8.5B standalone zero-scratch FP32 4-stream mHC update + H_pre contraction + RMSNorm + INT8 quant (+ optional BF16 norm):
+// 1 CTA/token row (M <= 16), 256 threads (20 channels/thread), ScratchSize == 0, VGPRs <= 64.
+void launch_mhc_post_res_pre_rmsnorm_quant_i8(
+    const float* d_y_s_f32,         // [M, 5120] reduced sublayer output y_s
+    const float* d_streams_in_f32,  // [M, 4, 5120] FP32 hyper-residual streams in
+    const float* d_post_f32,        // [M, 4] H_post_s
+    const float* d_comb_f32,        // [M, 16] H_res_s (4x4 Sinkhorn doubly-stochastic)
+    const float* d_next_pre_f32,    // [M, 4] H_pre_{s+1}
+    const uint16_t* d_next_gamma,   // [5120] BF16 RMSNorm gamma_{s+1}
+    float* d_streams_out_f32,       // [M, 4, 5120] FP32 updated streams' (may alias d_streams_in_f32)
+    int8_t* d_out_q8,               // [M, 5120] optional per-row INT8 quantized activation
+    float* d_out_scale_f32,         // [M] optional per-row INT8 scale (absmax / 127)
+    uint16_t* d_out_norm_bf16,      // [M, 5120] optional BF16 normalized hidden state
+    int M, float eps,
+    hipStream_t stream);
+
 void launch_add_f32_and_bf16_to_bf16(
     const float* d_routed_tp3_sum,  // [M, 5120] FP32 (sum of 3 MI50 routed + shared partials)
     const uint16_t* d_p150_bf16,    // [M, 5120] BF16 (optional P150A expert output, may be nullptr)
@@ -246,7 +314,8 @@ void launch_hc_mixes(
     float* d_out_post_f32,        // [M, 4]
     float* d_out_comb_f32,        // [M, 16] ([M, 4, 4])
     int M, float norm_eps, int sinkhorn_iters, float hc_eps,
-    hipStream_t stream);
+    hipStream_t stream,
+    uint32_t* d_wg_sync_u32 = nullptr);
 
 void launch_hc_pre(
     const uint16_t* d_h_bf16,     // [M, 4, 5120]
@@ -362,6 +431,17 @@ void launch_rope_tail64_bf16(
     TreeAncMask256 tree_anc_mask = {},
     uint64_t tree_depth_nibbles = 0ULL);
 
+// Wave 8.5B: Fused inverse tail-64 RoPE on [M, H, 512] + UE8M0/32 FP8 quantization (eliminates HBM2 writeback + 2nd launch).
+void launch_inv_rope_tail64_quant_ue8m0_32(
+    const uint16_t* d_o_bf16,     // [M, H, 512]
+    uint8_t* d_out_fp8,           // [M, H * 512]
+    uint8_t* d_out_ue8m0,         // [M, H * 16]
+    bool use_comp_yarn,
+    int M, int H, int pos_base,
+    hipStream_t stream,
+    TreeAncMask256 tree_anc_mask = {},
+    uint64_t tree_depth_nibbles = 0ULL);
+
 int launch_compressor_r2_pool(
     const float* d_kv_f32,        // [M, 512]
     const float* d_score_f32,     // [M, 512]
@@ -413,7 +493,8 @@ void launch_indexer_score(
     const uint16_t* d_weights_bf16, // [M, ih_cnt]
     float* d_out_score_f32,         // [M, T_comp]
     int M, int ih_cnt, int T_comp,
-    hipStream_t stream);
+    hipStream_t stream,
+    bool force_fp32 = false);
 
 void launch_indexer_candidates_and_topk(
     float* d_score_f32,             // [M, T_comp] (TP3 all-reduced; upper tail holds M * ceil(T_comp/8) scratch!)
@@ -661,6 +742,37 @@ void launch_dspark_pack_conf_in(
     const uint16_t* d_sub_bf16,                 // [5, 5120]
     const uint16_t* d_markov_sum_bf16,          // [5, 256]
     uint16_t* d_conf_in_bf16,                   // [5, 5376]
+    hipStream_t stream);
+
+// Wave 8.5B: Single-CTA fused ConfidenceHead [5, 5376] dot-product straight into mapped ctrl->out_conf_logits[0..4]!
+void launch_dspark_fused_conf_head_proj(
+    DsparkGpuSampleSlot* d_ctrl,
+    const uint16_t* d_sub_bf16,                 // [5, 5120]
+    const uint16_t* d_markov_sum_bf16,          // [5, 256]
+    const uint16_t* d_conf_proj_w,              // [5376] BF16
+    int B,
+    hipStream_t stream);
+
+struct DsparkTreeStageBatchArgs {
+    uint64_t anc_slots_bytes[5];
+    int32_t  tree_stage[5];
+    int32_t  out_slot[5];
+    int32_t  B_out[5];
+    int32_t  anc_cnt[5];
+    int32_t  markov_row_idx[5];
+};
+
+// Wave 8.5B: Multi-stage batched tree_topk launch (1 launch instead of 2..5 serialized launches per Markov batch).
+void launch_dspark_tree_topk_batch_tp3(
+    DsparkGpuSampleSlot* d_ctrl,
+    const float* d_base_logits_row_f32,         // shared saved raw base logits row [vocab_rows]
+    const float* d_markov_logits_base_f32,      // base pointer for markov_logits_f32
+    uint64_t seq,
+    DsparkTreeStageBatchArgs batch,
+    int num_stages,                             // 1..5
+    int rank,
+    int vocab_offset,
+    int vocab_rows,
     hipStream_t stream);
 
 void launch_dspark_prepare_tree_markov_emb(

@@ -1,0 +1,30 @@
+[SAFETY] device=2 gfx906 free=696.00 MiB total=32752.00 MiB min_free=550 MiB cap=48 MiB
+[MATH] HLUT3 c=[0.245094008523 0.756004815833 1.343908643574 2.151945077793] t=[0.500549412178 1.049956729703 1.747926860683]
+[MATH] HLUT3 MSE=0.034547865738 EQ2=0.965452134262 SQNR=14.615788 dB iters=101 delta=9.062e-08 fixed=7.930e-08
+[MATH] HLUT2 MSE=0.117481905322 SQNR=9.300290 dB | gain=+5.315498 dB
+[PACK] tile deterministic, 400 B, q_lo2/q_hi1/scales exact pack-unpack match
+[P150] 16-subtile 6,400 B superblock equivalence over 2 blocks (12800 B exact)
+[P150_HLUT3] tile=400 B superblock=6400 B superblocks/shard=360 shard=2304000 B expert=6912000 B
+[P150_HLUT3] bank=1459200 hot_shards=11 bank_at11=1413248 margin=45952 bank_at12=1490048 overflow=30848 hot/card=72.51 MiB
+[P150_HLUT3] pages/proj/bank=4 bank_pages=4 expert_stride=6912000 hot_tp2=22
+[WEIGHTS] real layer6 expert0 2304x5120: HLUT3 gate=4608000 B up=4608000 B down=4608000 B (3.125 bpw)
+[ALLOC] device-2 strict total = 14.090 MiB <= 48 MiB
+[PARITY] M= 1 cosine=1.000000000 max_abs=1.525879e-05 PASS
+[PARITY] M= 6 cosine=1.000000000 max_abs=1.335144e-05 PASS
+[PARITY] M= 8 cosine=1.000000000 max_abs=1.692772e-05 PASS
+[PARITY] M=16 cosine=1.000000000 max_abs=1.668930e-05 PASS
+
+=== WAVE9_HLUT3_VERIFY RECEIPT ===
+[MATH] HLUT3 c=[0.245094008523 0.756004815833 1.343908643574 2.151945077793] t=[0.500549412178 1.049956729703 1.747926860683]
+[MATH] HLUT3 MSE=0.034547865738 EQ2=0.965452134262 SQNR=14.615788 dB iters=101 delta=9.062e-08 fixed=7.930e-08
+[MATH] HLUT2 MSE=0.117481905322 SQNR=9.300290 dB | gain=+5.315498 dB
+solver_convergence_le_1e-7 : PASS
+[PACK] tile deterministic, 400 B, q_lo2/q_hi1/scales exact pack-unpack match
+tile_400B_pack_unpack_exact : PASS
+[P150] 16-subtile 6,400 B superblock equivalence over 2 blocks (12800 B exact)
+p150_6400B_superblock_eq    : PASS
+device2_free_hbm2_ge_550MiB : 696.00 MiB PASS
+device2_total_alloc_le_48MiB: 14.090 MiB PASS
+hip_vs_cpu_parity_M1_6_8_16 : min_cos=1.000000000 max_abs=1.692772e-05 PASS
+real_weight_hlut3_bytes     : 4,608,000 B/matrix (3.125 bpw exact)
+overall                     : PASS
