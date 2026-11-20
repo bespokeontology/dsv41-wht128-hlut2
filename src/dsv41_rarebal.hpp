@@ -317,6 +317,46 @@ struct RarebalLiveCollector {
         if (hipHostMalloc(&hp, 512ULL * kDim * sizeof(uint16_t), hipHostMallocDefault) == hipSuccess) {
             h_x_pinned = static_cast<uint16_t*>(hp);
         }
+
+        // Wave 9.2 exact target list override ("block logical_eid"): locks ONLY the exact 1,704
+        // promoted HLUT3 experts (384 MTP + 720 dev3 BB + 600 TP3 BB), ignoring already_wave8!
+        {
+            std::ifstream w92(out_dir + "/wave9_2_harvest_targets.txt");
+            if (w92.is_open()) {
+                int main_n = 0, mtp_n = 0;
+                std::string line;
+                while (std::getline(w92, line)) {
+                    if (line.empty() || line[0] == '#') continue;
+                    std::istringstream iss(line);
+                    int b = -1, e = -1;
+                    if ((iss >> b >> e) && b >= 0 && b < kTotalBlocks && e >= 0 && e < ((b < 40) ? 384 : 128)) {
+                        if (cand_slot[size_t(b)][size_t(e)] >= 0) continue;
+                        const int16_t idx = static_cast<int16_t>(cands.size());
+                        cand_slot[size_t(b)][size_t(e)] = idx;
+                        CandBuf cb;
+                        cb.block_id = b;
+                        cb.eid = e;
+                        cb.pinned_p150 = false;
+                        cb.bin_path = assign_bin_path(b, e);
+                        cb.rare.reserve(512);
+                        cb.stage_x_bf16.reserve(size_t(kStageFlush) * kDim);
+                        cands.push_back(std::move(cb));
+                        block_need_mask |= (1ULL << b);
+                        if (b < 40) ++main_n;
+                        else        ++mtp_n;
+                    }
+                }
+                if (!cands.empty()) {
+                    pinned_p150_pairs.clear();
+                    candidates_locked = true;
+                    std::printf("[RAREBAL_CAL] Wave 9.2 exact target override LOCKED %zu experts (%d main + %d MTP) -> %s\n",
+                                cands.size(), main_n, mtp_n, out_dir.c_str());
+                    std::fflush(stdout);
+                    return;
+                }
+            }
+        }
+
         std::printf("[RAREBAL_CAL] Armed Wave 8.5 streaming collector -> %s (mounts=%zu, main_cap=%d, preserved=%zu, vocab_rare=%zu/%zu, p150_l1=%zu)\n",
                     out_dir.c_str(), spill_mounts.size(), main_cand_cap, preserved_cnt, rare_v, V, pinned_p150_pairs.size());
         std::fflush(stdout);

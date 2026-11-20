@@ -94,10 +94,34 @@ using ProgressCallback = std::function<bool(const Dsv41ProgressUpdate&)>;
 struct Dsv41GpuMemMargin {
     double free_mib[3]{0.0, 0.0, 0.0};
     double total_mib[3]{0.0, 0.0, 0.0};
+    double dev3_free_mib = 0.0;
+    double dev3_total_mib = 0.0;
+    bool dev3_active = false;
     bool pointer_audit_64bit_ok = false;
     size_t max_comp_slots[4]{};
     size_t hot_comp_slots[4]{};
     size_t ext_comp_slots[4]{};
+};
+
+struct Dsv41StageBreakdown {
+    double att_qkv_ms = 0.0;
+    double att_hsi_ms = 0.0;
+    double att_sparse_ms = 0.0;
+    double att_wo_ms = 0.0;
+    double att_ar_ms = 0.0;
+    double moe_router_ms = 0.0;
+    double moe_shared_ms = 0.0;
+    double moe_tp3_hlut2_ms = 0.0;
+    double moe_tp3_hlut3_ms = 0.0;
+    double moe_dev3_wait_ms = 0.0;
+    double moe_p150_wait_ms = 0.0;
+    double moe_ar_ms = 0.0;
+    double mhc_ms = 0.0;
+    double commit_ms = 0.0;
+    double engram_wait_ms = 0.0;
+    double p150_dev_ms = 0.0;
+    double dev3_dev_busy_ms = 0.0;
+    uint64_t dev3_dispatches = 0;
 };
 
 struct Dsv411MDecodeBurstRow {
@@ -190,6 +214,16 @@ public:
     // 40..42 only when --hlut3-mtp-overlay <path> is supplied. When unset, the default production
     // 2.125 bpw HLUT2 MTP footprint is byte-identical and 0 B extra HBM2 is allocated.
     void set_hlut3_mtp_overlay(const std::string& overlay_path);
+    // Wave 9.2 SB-M4-P2-176G asymmetric 4x MI50 + 2x P150A WHT128-HLUT3 overlays:
+    //   --hlut3-dev3-overlay: 384 unsharded MTP + up to 720 unsharded backbone experts on hlut3_dev=3 (0000:85:00.0)
+    //   --hlut3-tp3-overlay : 600+ TP3-sharded backbone experts promoted in-place on tp=0,1,2 (C7/88/03)
+    void set_hlut3_dev3_overlay(const std::string& overlay_path, int dev_id = 3);
+    void set_hlut3_tp3_overlay(const std::string& overlay_path);
+    void set_rocblas_prefill(bool enable);
+    void set_rocblas_expert_thresh(int thresh);
+    void set_rocblas_hlut2_thresh(int thresh);
+    void set_dspark_tree8_conf_thresh(float thresh);
+    void set_dspark_chain_max_b(int max_b);
     void set_csa2_shared_tree8(bool enable);
     void set_nvme_kv_cache(const std::string& cache_dir, double max_gb = 32.0);
     void flush_nvme_kv_cache();
@@ -200,6 +234,9 @@ public:
         const std::vector<int32_t>& raw_prompt_ids,
         const std::vector<Dsv41ImageSource>& images);
     Dsv41GpuMemMargin query_gpu_mem_margin();
+    Dsv41StageBreakdown query_stage_breakdown() const;
+    void reset_stage_breakdown();
+    void seed_synthetic_context_for_profile(int ctx_len);
     Dsv411MGateReceipt run_wave8_5_1m_e2e_gate(const std::string& nvme_tmp_dir);
 
     // Thread-safe generation with multi-tier KV prefix reuse, strict CED prefill, and 3-stage DSpark (M=6)

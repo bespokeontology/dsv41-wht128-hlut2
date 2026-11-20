@@ -61,9 +61,9 @@ struct TraceStorageContextGuard {
     TraceStorageContextGuard& operator=(const TraceStorageContextGuard&) = delete;
 };
 
-static constexpr uint32_t kBatchSlots      = 16u;    // 16 expert slots/launch (fits 95%+ of M=6 decode in 1 batch & 25% fewer prefill launches!)
-static constexpr uint32_t kMaxCompactSlots = 288u;   // 18 * 16 = 288 >= 272 max compact slots for M=512
-static constexpr uint32_t kSlotIdsBytes    = 640u;   // [0..575]=288 uint16_t slot_ids, [576..639]=64B layer_desc
+static constexpr uint32_t kBatchSlots      = 24u;    // Wave 9.4: 24 expert slots/launch -> single-batch M=6/8 decode + 50% fewer prefill launches!
+static constexpr uint32_t kMaxCompactSlots = 640u;   // Wave 9.4: covers full M=4096 single-pass prefill!
+static constexpr uint32_t kSlotIdsBytes    = 1344u;  // [0..1279]=640 uint16_t slot_ids, [1280..1343]=64B layer_desc
 [[maybe_unused]] static constexpr uint32_t kNumHotL1Layers = 0u; // Keep full L1 bottom free for CBs + 16-slot CoreWorkspace1!
 
 void check_no_existing_p150_owner() {
@@ -370,8 +370,9 @@ struct CoreWorkspace1 {
           down_partials(gate_partials),
           combined_f32(alloc_l1(mesh, Shape({1, 1, 32u, 5120u}), DataType::FLOAT32, Layout::TILE, true))
     {
-        if (gate_partials.buffer()->size() < size_t(k_dn) * kBatchSlots * 160u * 4096ULL) {
-            throw std::runtime_error("gate_partials smaller than down_partials requirement");
+        if (gate_partials.buffer()->size() < size_t(k_dn) * kBatchSlots * 160u * 4096ULL ||
+            gate_partials.buffer()->size() < size_t(k_up) * kBatchSlots * 36u * 4096ULL) {
+            throw std::runtime_error("gate_partials smaller than gate/down partials requirement");
         }
     }
 
@@ -449,7 +450,7 @@ struct CompactPrefillArena {
 };
 
 uint32_t choose_decode_slot_bucket(uint32_t active) {
-    static constexpr uint32_t kBuckets[] = {4u, 8u, 12u, 16u, 20u, 24u, 28u, 32u, 36u, 40u, 44u, 48u, 56u, 64u};
+    static constexpr uint32_t kBuckets[] = {4u, 8u, 12u, 16u, 18u, 20u, 22u, 24u, 32u, 40u, 48u, 64u};
     for (uint32_t b : kBuckets) {
         if (active <= b) return b;
     }
@@ -458,18 +459,14 @@ uint32_t choose_decode_slot_bucket(uint32_t active) {
 
 uint32_t choose_compact_slot_bucket(uint32_t active, uint32_t mode) {
     if (mode == 1u) {
-        static constexpr uint32_t kBuckets128[] = {32u, 64u, 96u, 128u, 160u, 192u, 224u};
+        static constexpr uint32_t kBuckets128[] = {24u, 48u, 72u, 96u, 120u, 144u, 192u, 240u};
         for (uint32_t b : kBuckets128) {
             if (active <= b) return b;
         }
-        return std::min<uint32_t>(((active + kBatchSlots - 1u) / kBatchSlots) * kBatchSlots, kMaxCompactSlots);
     }
-    static constexpr uint32_t kBuckets512[] = {
-        32u, 64u, 96u, 128u, 160u, 192u, 224u, 256u, kMaxCompactSlots};
-    for (uint32_t b : kBuckets512) {
-        if (active <= b) return b;
-    }
-    return kMaxCompactSlots;
+    const uint32_t step = (active <= 240u) ? 24u : 48u;
+    const uint32_t rounded = ((active + step - 1u) / step) * step;
+    return std::min<uint32_t>(std::max<uint32_t>(24u, rounded), kMaxCompactSlots);
 }
 
 template <int MR>
@@ -774,26 +771,32 @@ struct P150Dsv41Engine::Impl {
     bool x16_relay = true;                        // Wave 8.4C: Card #0 PCIe x16 -> 4x800G FABRIC_1D relay (0 Card #1 x4 host DMA!)
     bool overlay_pinned_hot_l1 = false;           // True when p150.hot_l1_assignments was loaded from overlay
     std::optional<ttnn::Tensor> x_rm_src;         // Card #0 PCIe x16 staging [1, 1, 512, 5120] BFLOAT16 TILE
-    std::optional<ttnn::Tensor> slot_meta_src;    // Card #0 PCIe x16 staging [1, 1, 288, 32] UINT32 ROW_MAJOR
+    std::optional<ttnn::Tensor> x_rm_2048_src;    // Card #0 PCIe x16 staging [1, 1, 2048, 5120] BFLOAT16 TILE (GDDR6)
+    std::optional<ttnn::Tensor> x_rm_4096_src;    // Card #0 PCIe x16 staging [1, 1, 4096, 5120] BFLOAT16 TILE (GDDR6)
+    std::optional<ttnn::Tensor> slot_meta_src;    // Card #0 PCIe x16 staging [1, 1, 640, 32] UINT32 ROW_MAJOR
     std::optional<ttnn::Tensor> x_rm_l1;          // Broadcast output [1, 1, 512, 5120] BFLOAT16 TILE
-    std::optional<ttnn::Tensor> slot_meta_l1;     // Broadcast output [1, 1, 288, 32] UINT32 ROW_MAJOR
+    std::optional<ttnn::Tensor> x_rm_2048;        // Broadcast output [1, 1, 2048, 5120] BFLOAT16 TILE (GDDR6)
+    std::optional<ttnn::Tensor> x_rm_4096;        // Broadcast output [1, 1, 4096, 5120] BFLOAT16 TILE (GDDR6)
+    std::optional<ttnn::Tensor> slot_meta_l1;     // Broadcast output [1, 1, 640, 32] UINT32 ROW_MAJOR
     std::optional<ttnn::Tensor> l1_slot_lut;      // L1 replicated [1, 40, 256] UINT16 ROW_MAJOR (20 KiB/card O(1) hot LUT!)
     std::optional<ttnn::Tensor> dummy_hot_l1;     // Sharded       [2, 1, 1088] UINT32 ROW_MAJOR (4352 B/card)
-    std::unique_ptr<CompactPrefillArena> arena128; // L1 MR compact arena for M = 33..128 (y_accum in L1, finish in GDDR6 MP!)
-    std::unique_ptr<CompactPrefillArena> arena512; // L1 MR compact arena for M = 129..512 (y_accum in L1, finish in GDDR6 MP!)
-    std::array<uint32_t, 6> bcast_expected_addrs{};
+    std::unique_ptr<CompactPrefillArena> arena128;  // GDDR6 compact arena for M = 33..128
+    std::unique_ptr<CompactPrefillArena> arena512;  // compact arena for M = 129..512
+    std::unique_ptr<CompactPrefillArena> arena2048; // GDDR6 compact arena for M = 513..2048 (Wave 9.4)
+    std::unique_ptr<CompactPrefillArena> arena4096; // GDDR6 compact arena for M = 2049..4096 (Wave 9.4)
+    std::array<uint32_t, 8> bcast_expected_addrs{};
 
     HostAvxPool avx_pool;
     CpuTailPool tail_pool;
-    LockedBuffer host_x_tilized{160u * 2048u};                      // [32, 5120] BF16 tiled = 320 KiB
-    LockedBuffer host_x_rm{1024u * 5120u * sizeof(uint16_t)};       // [1024, 5120] BF16 row-major = 10.0 MiB
-    LockedBuffer host_x_rot_f32{1024u * 5120u * sizeof(float)};     // [1024, 5120] FP32 rotated = 20.0 MiB
-    LockedBuffer host_tail_pairs_f32{1024u * 2u * 5120u * sizeof(float)}; // [2, 1024, 5120] FP32 tail pairs = 40.0 MiB
-    LockedBuffer host_slot_ids{kSlotIdsBytes};                      // 640 B
+    LockedBuffer host_x_tilized{160u * 2048u};                              // [32, 5120] BF16 tiled = 320 KiB
+    LockedBuffer host_x_rm{DSV41_P150_MAX_ROWS * 5120u * sizeof(uint16_t)}; // [4096, 5120] BF16 row-major = 40.0 MiB
+    LockedBuffer host_x_rot_f32{DSV41_P150_MAX_ROWS * 5120u * sizeof(float)};
+    LockedBuffer host_tail_pairs_f32{1024u * 2u * 5120u * sizeof(float)};   // [2, 1024, 5120] FP32 tail pairs = 40.0 MiB
+    LockedBuffer host_slot_ids{kSlotIdsBytes};                              // 1344 B
     LockedBuffer host_slot_lut{DSV41_P150_NUM_LAYERS * 256u * sizeof(uint16_t)}; // 20 KiB O(1) hot LUT
-    LockedBuffer host_slot_meta{288u * 128u};                       // 36 KiB
-    LockedBuffer host_weights{kMaxCompactSlots * 4096u};            // 288 * 4 KiB = 1.125 MiB
-    LockedBuffer host_out_rm{1024u * 5120u * sizeof(uint16_t)};     // [1024, 5120] BF16 row-major = 10.0 MiB
+    LockedBuffer host_slot_meta{kMaxCompactSlots * 128u};                   // 80 KiB
+    LockedBuffer host_weights{kMaxCompactSlots * 4096u};                    // 640 * 4 KiB = 2.5 MiB
+    LockedBuffer host_out_rm{DSV41_P150_MAX_ROWS * 5120u * sizeof(uint16_t)}; // [4096, 5120] BF16 row-major = 40.0 MiB
 
     std::array<std::optional<ResidentLayerBank>, DSV41_P150_NUM_LAYERS> layers;
     uint64_t loaded_mask = 0ULL;
@@ -829,10 +832,10 @@ struct P150Dsv41Engine::Impl {
         bool skipped = false;
     };
     // Layer-agnostic global MeshTraces keyed ONLY by (mode, scheduled_slots)!
-    // mode: 0 = decode (M<=32), 1 = compact128 (M=33..128), 2 = compact512 (M=129..1024)
+    // mode: 0 = decode (M<=32), 1 = compact128, 2 = compact512, 3 = compact2048, 4 = compact4096
     std::map<std::pair<uint32_t, uint32_t>, TraceSlot> op_traces;  // (mode, bucket)
-    std::array<TraceSlot, 3> reduce_traces;  // indexed by mode 0, 1, 2
-    std::array<TraceSlot, 3> bcast_traces;   // [0]=decode64 (x_decode+slot_ids+w64), [1]=w288, [2]=prefill (x_rm+slot_meta)
+    std::array<TraceSlot, 5> reduce_traces;  // indexed by mode 0..4
+    std::array<TraceSlot, 5> bcast_traces;   // [0]=decode64, [1]=w_tiled, [2]=prefill512, [3]=prefill2048, [4]=prefill4096
     uint32_t trace_region_bytes = 0;
     uint32_t dirty_mt0 = 0;
     bool programs_prewarmed = false;
@@ -854,24 +857,41 @@ struct P150Dsv41Engine::Impl {
     }
 
     void run_bcast_weights288_untraced() {
-        auto keep = ws1->weights_tiled;
-        (void)keep;
+        auto keep0 = ws1->weights_tiled;
+        auto keep1 = slot_meta_l1;
+        (void)keep0; (void)keep1;
+        const MemoryConfig meta_cfg = expanded_l1_demotion ? ttnn::DRAM_MEMORY_CONFIG : ttnn::L1_MEMORY_CONFIG;
         ws1->weights_tiled = ttnn::broadcast(
             ws1->weights_tiled_src, distributed::MeshCoordinate{0, 0}, std::nullopt,
             ws1->weights_mem_cfg(), tt::tt_fabric::Topology::Linear, 1);
+        slot_meta_l1 = ttnn::broadcast(
+            *slot_meta_src, distributed::MeshCoordinate{0, 0}, std::nullopt,
+            meta_cfg, tt::tt_fabric::Topology::Linear, 1);
     }
 
     void run_bcast_prefill_untraced() {
         auto keep0 = x_rm_l1;
-        auto keep1 = slot_meta_l1;
-        (void)keep0; (void)keep1;
+        (void)keep0;
         const MemoryConfig prefill_cfg = expanded_l1_demotion ? ttnn::DRAM_MEMORY_CONFIG : ttnn::L1_MEMORY_CONFIG;
         x_rm_l1 = ttnn::broadcast(
             *x_rm_src, distributed::MeshCoordinate{0, 0}, std::nullopt,
             prefill_cfg, tt::tt_fabric::Topology::Linear, 1);
-        slot_meta_l1 = ttnn::broadcast(
-            *slot_meta_src, distributed::MeshCoordinate{0, 0}, std::nullopt,
-            prefill_cfg, tt::tt_fabric::Topology::Linear, 1);
+    }
+
+    void run_bcast_prefill2048_untraced() {
+        auto keep0 = x_rm_2048;
+        (void)keep0;
+        x_rm_2048 = ttnn::broadcast(
+            *x_rm_2048_src, distributed::MeshCoordinate{0, 0}, std::nullopt,
+            ttnn::DRAM_MEMORY_CONFIG, tt::tt_fabric::Topology::Linear, 1);
+    }
+
+    void run_bcast_prefill4096_untraced() {
+        auto keep0 = x_rm_4096;
+        (void)keep0;
+        x_rm_4096 = ttnn::broadcast(
+            *x_rm_4096_src, distributed::MeshCoordinate{0, 0}, std::nullopt,
+            ttnn::DRAM_MEMORY_CONFIG, tt::tt_fabric::Topology::Linear, 1);
     }
 
     Impl(const std::string& root, const std::string& kdir, bool trace, const std::string& ov_path,
@@ -915,9 +935,11 @@ struct P150Dsv41Engine::Impl {
         x_rm_src = x_rm_dram
             ? alloc_dram_replicated(*mesh, Shape({1, 1, 512u, 5120u}), DataType::BFLOAT16, Layout::TILE)
             : alloc_l1(*mesh, Shape({1, 1, 512u, 5120u}), DataType::BFLOAT16, Layout::TILE, false);
+        x_rm_2048_src = alloc_dram_replicated(*mesh, Shape({1, 1, 2048u, 5120u}), DataType::BFLOAT16, Layout::TILE);
+        x_rm_4096_src = alloc_dram_replicated(*mesh, Shape({1, 1, 4096u, 5120u}), DataType::BFLOAT16, Layout::TILE);
         slot_meta_src = expanded_l1_demotion
-            ? alloc_dram_replicated(*mesh, Shape({1, 1, 288u, 32u}), DataType::UINT32, Layout::ROW_MAJOR)
-            : alloc_l1(*mesh, Shape({1, 1, 288u, 32u}), DataType::UINT32, Layout::ROW_MAJOR, false);
+            ? alloc_dram_replicated(*mesh, Shape({1, 1, kMaxCompactSlots, 32u}), DataType::UINT32, Layout::ROW_MAJOR)
+            : alloc_l1(*mesh, Shape({1, 1, kMaxCompactSlots, 32u}), DataType::UINT32, Layout::ROW_MAJOR, false);
         l1_slot_lut = alloc_l1(*mesh, Shape({1, DSV41_P150_NUM_LAYERS, 256u}), DataType::UINT16, Layout::ROW_MAJOR, false);
         dummy_hot_l1 = expanded_l1_demotion
             ? alloc_dram_sharded0(*mesh, Shape({1, 1u, 1088u}), DataType::UINT32, Layout::ROW_MAJOR)
@@ -925,13 +947,15 @@ struct P150Dsv41Engine::Impl {
 
         // Dumitrescu MR vs MP block law: Tier 1/2 (14..18) demotes M>32 prefill arenas + scalar combine weights
         // while keeping x_decode [1,1,32,5120] BF16 + finish_decode[0..1] 100% in L1 MR under FABRIC_1D!
-        arena128 = std::make_unique<CompactPrefillArena>(*mesh, 128u, true);
-        arena512 = std::make_unique<CompactPrefillArena>(*mesh, 512u, expanded_l1_demotion);
+        arena128  = std::make_unique<CompactPrefillArena>(*mesh, 128u, true);
+        arena512  = std::make_unique<CompactPrefillArena>(*mesh, 512u, expanded_l1_demotion);
+        arena2048 = std::make_unique<CompactPrefillArena>(*mesh, 2048u, true);
+        arena4096 = std::make_unique<CompactPrefillArena>(*mesh, 4096u, true);
 
         // Allocate maximum safe static L1 Hot-Expert Shard Arena at top of L1 while guaranteeing >= 220 KiB/core
         // bottom CB headroom (covers 204,800 B peak static CB + x_decode/slot_ids + finish_decode[0..1] = 217,728 B;
         // auto-falls back to 17 shards if bank 0-0 ever spills)!
-        for (uint32_t k_try = requested_hot_shards; k_try >= 8u; --k_try) {
+        for (uint32_t k_try = requested_hot_shards; k_try >= 1u; --k_try) {
             const uint32_t guard_kb = (k_try >= 18u) ? 220u : 256u;
             const uint32_t guard_pages = (total_cores * guard_kb * 1024u) / 4096u;
             try {
@@ -982,18 +1006,24 @@ struct P150Dsv41Engine::Impl {
         run_bcast_decode64_untraced();
         run_bcast_weights288_untraced();
         run_bcast_prefill_untraced();
+        run_bcast_prefill2048_untraced();
+        run_bcast_prefill4096_untraced();
         bcast_expected_addrs = {
             ws1->x_decode.buffer()->address(),
             ws1->slot_ids.buffer()->address(),
             ws1->weights_decode64.buffer()->address(),
             ws1->weights_tiled.buffer()->address(),
             x_rm_l1->buffer()->address(),
-            slot_meta_l1->buffer()->address()
+            slot_meta_l1->buffer()->address(),
+            x_rm_2048->buffer()->address(),
+            x_rm_4096->buffer()->address()
         };
 
         run_red_decode();
         run_red_arena(*arena128);
         run_red_arena(*arena512);
+        run_red_arena(*arena2048);
+        run_red_arena(*arena4096);
         cq.finish();
 
         p150_l1_geometry_report();
@@ -1025,12 +1055,18 @@ struct P150Dsv41Engine::Impl {
             hot_down_l1.reset();
             hot_up_l1.reset();
             hot_gate_l1.reset();
+            arena4096.reset();
+            arena2048.reset();
             arena512.reset();
             arena128.reset();
             dummy_hot_l1.reset();
             l1_slot_lut.reset();
             slot_meta_l1.reset();
             slot_meta_src.reset();
+            x_rm_4096.reset();
+            x_rm_4096_src.reset();
+            x_rm_2048.reset();
+            x_rm_2048_src.reset();
             x_rm_l1.reset();
             x_rm_src.reset();
             ws1.reset();
@@ -1062,7 +1098,7 @@ struct P150Dsv41Engine::Impl {
     }
 
     void write_layer_desc_to_slot_ids(const ResidentLayerBank& bank) {
-        auto* ldesc = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(host_slot_ids.ptr) + 576u);
+        auto* ldesc = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(host_slot_ids.ptr) + (kSlotIdsBytes - 64u));
         ldesc[0] = bank.gate_pages.buffer()->address();
         ldesc[1] = bank.up_pages.buffer()->address();
         ldesc[2] = bank.down_pages.buffer()->address();
@@ -1258,38 +1294,63 @@ struct P150Dsv41Engine::Impl {
         }
         {
             ws1->weights_tiled = ttnn::Tensor();
+            slot_meta_l1 = std::nullopt;
             cq.finish();
+            const MemoryConfig meta_cfg = expanded_l1_demotion ? ttnn::DRAM_MEMORY_CONFIG : ttnn::L1_MEMORY_CONFIG;
             const auto tid = mesh->begin_mesh_trace(cq);
             ws1->weights_tiled = ttnn::broadcast(
                 ws1->weights_tiled_src, distributed::MeshCoordinate{0, 0}, std::nullopt,
                 ws1->weights_mem_cfg(), tt::tt_fabric::Topology::Linear, 1);
+            slot_meta_l1 = ttnn::broadcast(
+                *slot_meta_src, distributed::MeshCoordinate{0, 0}, std::nullopt,
+                meta_cfg, tt::tt_fabric::Topology::Linear, 1);
             mesh->end_mesh_trace(cq, tid);
             bcast_traces[1].id = tid;
             bcast_traces[1].warmed = true;
         }
         {
             x_rm_l1 = std::nullopt;
-            slot_meta_l1 = std::nullopt;
             cq.finish();
             const MemoryConfig prefill_cfg = expanded_l1_demotion ? ttnn::DRAM_MEMORY_CONFIG : ttnn::L1_MEMORY_CONFIG;
             const auto tid = mesh->begin_mesh_trace(cq);
             x_rm_l1 = ttnn::broadcast(
                 *x_rm_src, distributed::MeshCoordinate{0, 0}, std::nullopt,
                 prefill_cfg, tt::tt_fabric::Topology::Linear, 1);
-            slot_meta_l1 = ttnn::broadcast(
-                *slot_meta_src, distributed::MeshCoordinate{0, 0}, std::nullopt,
-                prefill_cfg, tt::tt_fabric::Topology::Linear, 1);
             mesh->end_mesh_trace(cq, tid);
             bcast_traces[2].id = tid;
             bcast_traces[2].warmed = true;
         }
-        const std::array<uint32_t, 6> cur_addrs = {
+        {
+            x_rm_2048 = std::nullopt;
+            cq.finish();
+            const auto tid = mesh->begin_mesh_trace(cq);
+            x_rm_2048 = ttnn::broadcast(
+                *x_rm_2048_src, distributed::MeshCoordinate{0, 0}, std::nullopt,
+                ttnn::DRAM_MEMORY_CONFIG, tt::tt_fabric::Topology::Linear, 1);
+            mesh->end_mesh_trace(cq, tid);
+            bcast_traces[3].id = tid;
+            bcast_traces[3].warmed = true;
+        }
+        {
+            x_rm_4096 = std::nullopt;
+            cq.finish();
+            const auto tid = mesh->begin_mesh_trace(cq);
+            x_rm_4096 = ttnn::broadcast(
+                *x_rm_4096_src, distributed::MeshCoordinate{0, 0}, std::nullopt,
+                ttnn::DRAM_MEMORY_CONFIG, tt::tt_fabric::Topology::Linear, 1);
+            mesh->end_mesh_trace(cq, tid);
+            bcast_traces[4].id = tid;
+            bcast_traces[4].warmed = true;
+        }
+        const std::array<uint32_t, 8> cur_addrs = {
             ws1->x_decode.buffer()->address(),
             ws1->slot_ids.buffer()->address(),
             ws1->weights_decode64.buffer()->address(),
             ws1->weights_tiled.buffer()->address(),
             x_rm_l1->buffer()->address(),
-            slot_meta_l1->buffer()->address()
+            slot_meta_l1->buffer()->address(),
+            x_rm_2048->buffer()->address(),
+            x_rm_4096->buffer()->address()
         };
         if (cur_addrs != bcast_expected_addrs) {
             throw std::runtime_error("P150 bcast_traces buffer address drift detected during trace capture!");
@@ -1319,6 +1380,8 @@ struct P150Dsv41Engine::Impl {
         };
         cap_arena(*arena128, reduce_traces[1]);
         cap_arena(*arena512, reduce_traces[2]);
+        cap_arena(*arena2048, reduce_traces[3]);
+        cap_arena(*arena4096, reduce_traces[4]);
         cq.finish();
     }
 
@@ -1344,9 +1407,9 @@ struct P150Dsv41Engine::Impl {
         programs_prewarmed = true;
 
         auto* slot_u16 = static_cast<uint16_t*>(host_slot_ids.ptr);
-        for (uint32_t i = 0; i < 288u; ++i) slot_u16[i] = (i == 0u) ? 0u : 0xFFFFu;
+        for (uint32_t i = 0; i < kMaxCompactSlots; ++i) slot_u16[i] = (i == 0u) ? 0u : 0xFFFFu;
         write_layer_desc_to_slot_ids(bank);
-        std::memset(host_slot_meta.ptr, 0, 288u * 128u);
+        std::memset(host_slot_meta.ptr, 0, kMaxCompactSlots * 128u);
         std::memset(host_weights.ptr, 0, kBatchSlots * 4096u);
         std::memset(host_x_tilized.ptr, 0, 160u * 2048u);
 
@@ -1359,8 +1422,8 @@ struct P150Dsv41Engine::Impl {
         cq.enqueue_write_shard_to_sub_grid(ws1->x_decode.mesh_buffer(), host_x_tilized.ptr, all_devs, false, BufferRegion(0, 160u * 2048u));
         cq.enqueue_write_shard_to_sub_grid(ws1->x_tilized.mesh_buffer(), host_x_tilized.ptr, all_devs, false, BufferRegion(0, 160u * 2048u));
 
-        // Prewarm multi-slot (bcnt = 4, 8, 12, 16) decode + compact kernels before any trace capture!
-        for (uint32_t bcnt : {4u, 8u, 12u, kBatchSlots}) {
+        // Prewarm multi-slot decode + compact kernels before any trace capture!
+        for (uint32_t bcnt : {4u, 8u, 12u, 16u, 18u, 20u, 22u, kBatchSlots}) {
             enqueue_hlut2_projection(bank, ws1->x_decode, bank.gate_pages, ws1->up_partials, 0u, bcnt, 0u, 3u);
             enqueue_swiglu_wht128(bank, bcnt);
             enqueue_hlut2_projection(bank, ws1->z_rot_bf16, bank.down_pages, ws1->down_partials, 0u, bcnt, 36u, 2u);
@@ -1371,9 +1434,15 @@ struct P150Dsv41Engine::Impl {
 
         enqueue_zero_pages(arena128->y_accum_f32, 128u * 5u);
         enqueue_zero_pages(arena512->y_accum_f32, 512u * 5u);
-        enqueue_compact_gather_tilize(0u, kBatchSlots);
+        enqueue_zero_pages(arena2048->y_accum_f32, 2048u * 5u);
+        enqueue_zero_pages(arena4096->y_accum_f32, 4096u * 5u);
+        enqueue_compact_gather_tilize(*x_rm_l1, 0u, kBatchSlots);
+        enqueue_compact_gather_tilize(*x_rm_2048, 0u, kBatchSlots);
+        enqueue_compact_gather_tilize(*x_rm_4096, 0u, kBatchSlots);
         enqueue_compact_scatter_combine(arena128->y_accum_f32, 0u, kBatchSlots);
         enqueue_compact_scatter_combine(arena512->y_accum_f32, 0u, kBatchSlots);
+        enqueue_compact_scatter_combine(arena2048->y_accum_f32, 0u, kBatchSlots);
+        enqueue_compact_scatter_combine(arena4096->y_accum_f32, 0u, kBatchSlots);
         cq.finish();
     }
 
@@ -1654,7 +1723,9 @@ struct P150Dsv41Engine::Impl {
                     j.kb4_start * 4u,
                     j.num_sb * 4u,
                     batch_cnt,
-                    act_slot_stride});
+                    act_slot_stride,
+                    slot_start,
+                    num_proj});
             writer.runtime_args.emplace_back(
                 j.coord,
                 std::vector<uint32_t>{
@@ -1691,15 +1762,15 @@ struct P150Dsv41Engine::Impl {
 
             auto compute = make_kernel(kernels_dir + "/dsv41_hlut2_compute.cpp", grp_cores, cfg);
             for (const auto& c : coords) {
-                compute.runtime_args.emplace_back(c, std::vector<uint32_t>{sb_cnt, batch_cnt, num_proj, keep_act});
+                compute.runtime_args.emplace_back(c, std::vector<uint32_t>{sb_cnt, batch_cnt, num_proj, keep_act, slot_start});
             }
             prog.kernels.push_back(std::move(compute));
 
-            const uint32_t cb0_pages = (keep_act != 0u || is_down) ? (sb_cnt * 4u) : (2u * sb_cnt * 4u);
+            const uint32_t cb0_pages = (keep_act != 0u || is_down || sb_cnt >= 5u) ? (sb_cnt * 4u) : (2u * sb_cnt * 4u);
             prog.cbs.push_back(make_cb(0, cb0_pages, 2048u, tt::DataFormat::Float16_b, grp_cores));
             prog.cbs.push_back(make_cb(1, sb_cnt * 16u, 1088u, tt::DataFormat::Bfp8_b, grp_cores));
             prog.cbs.push_back(make_cb(4, 4u, 4096u, tt::DataFormat::UInt32, grp_cores));
-            prog.cbs.push_back(make_cb(5, 4u, 4096u, tt::DataFormat::Float32, grp_cores));
+            prog.cbs.push_back(make_cb(5, 4u, 4096u, tt::DataFormat::UInt32, grp_cores));
             prog.cbs.push_back(make_cb(6, 1u, 4096u, tt::DataFormat::UInt32, grp_cores));
             prog.cbs.push_back(make_cb(16, 8u, 4096u, tt::DataFormat::Float32, grp_cores));
         }
@@ -1840,7 +1911,7 @@ struct P150Dsv41Engine::Impl {
         ProgramDescriptor prog;
         prog.kernels = {std::move(reader), std::move(writer), std::move(compute)};
         prog.cbs = {
-            make_cb(0, 2u, 4096u, tt::DataFormat::Float32, cores),
+            make_cb(0, 2u * ws1->k_splits_down, 4096u, tt::DataFormat::Float32, cores),
             make_cb(1, 2u, 4096u, tt::DataFormat::Float32, cores),
             make_cb(2, 2u, 4096u, tt::DataFormat::Float32, cores),
             make_cb(16, 2u, 4096u, tt::DataFormat::Float32, cores),
@@ -1874,7 +1945,7 @@ struct P150Dsv41Engine::Impl {
         run_generic_preserving_topology({*dummy_hot_l1, y_accum}, prog);
     }
 
-    void enqueue_compact_gather_tilize(uint32_t slot_start, uint32_t batch_cnt) {
+    void enqueue_compact_gather_tilize(ttnn::Tensor& x_rm_buf, uint32_t slot_start, uint32_t batch_cnt) {
         constexpr uint32_t ncores = 80u;
         std::vector<CoreCoord> coords;
         coords.reserve(ncores);
@@ -1885,13 +1956,13 @@ struct P150Dsv41Engine::Impl {
             kernels_dir + "/dsv41_compact_gather_tilize.cpp",
             cores,
             WriterConfigDescriptor{},
-            make_accessor_args({&(*x_rm_l1), &(*slot_meta_l1), &ws1->x_tilized}));
+            make_accessor_args({&x_rm_buf, &(*slot_meta_l1), &ws1->x_tilized}));
 
         for (uint32_t i = 0; i < ncores; ++i) {
             writer.runtime_args.emplace_back(
                 coords[i],
                 std::vector<uint32_t>{
-                    x_rm_l1->buffer()->address(),
+                    x_rm_buf.buffer()->address(),
                     slot_meta_l1->buffer()->address(),
                     ws1->x_tilized.buffer()->address(),
                     slot_start,
@@ -1902,7 +1973,7 @@ struct P150Dsv41Engine::Impl {
         ProgramDescriptor prog;
         prog.kernels = {std::move(writer)};
         prog.cbs = {make_cb(0, 1u, 10240u, tt::DataFormat::UInt32, cores)};
-        run_generic_preserving_topology({*x_rm_l1, *slot_meta_l1, ws1->x_tilized}, prog);
+        run_generic_preserving_topology({x_rm_buf, *slot_meta_l1, ws1->x_tilized}, prog);
     }
 
     void enqueue_compact_scatter_combine(ttnn::Tensor& y_accum, uint32_t slot_start, uint32_t batch_cnt) {
@@ -1968,7 +2039,7 @@ struct P150Dsv41Engine::Impl {
             make_cb(2, 2u, 4096u, tt::DataFormat::Float32, cores),
             make_cb(5, 1u, 8448u, tt::DataFormat::UInt32, cores),
             make_cb(6, 1u, 8448u, tt::DataFormat::UInt32, cores),
-            make_cb(7, 16u, 64u,  tt::DataFormat::UInt32, cores),
+            make_cb(7, kBatchSlots, 64u, tt::DataFormat::UInt32, cores),
             make_cb(16, 2u, 4096u, tt::DataFormat::Float32, cores),
         };
         run_generic_preserving_topology({ws1->down_partials, ws1->weights_tiled, *slot_meta_l1, y_accum}, prog);
@@ -1986,10 +2057,16 @@ struct P150Dsv41Engine::Impl {
     {
         TraceStorageContextGuard trace_alloc_guard;
         auto& cq = mesh->mesh_command_queue();
-        const bool trace_this = enable_trace &&
-                                (mode <= 2u) &&
-                                (op_traces.size() < 64u);
-        TraceSlot* op_tr = trace_this ? &op_traces[{mode, scheduled_slots}] : nullptr;
+        TraceSlot* op_tr = nullptr;
+        if (enable_trace && mode <= 4u) {
+            const auto key = std::make_pair(mode, scheduled_slots);
+            auto it = op_traces.find(key);
+            if (it != op_traces.end()) {
+                op_tr = &it->second;
+            } else if (op_traces.size() < 256u) {
+                op_tr = &op_traces[key];
+            }
+        }
         TraceSlot* red_tr = enable_trace ? &reduce_traces[mode] : nullptr;
 
         const bool red_ready = (!red_tr) || red_tr->id.has_value() || red_tr->skipped;
@@ -2169,7 +2246,7 @@ struct P150Dsv41Engine::Impl {
 
         const uint32_t scheduled_slots = choose_decode_slot_bucket(p150_count);
         auto* slot_u16 = static_cast<uint16_t*>(host_slot_ids.ptr);
-        for (uint32_t i = 0; i < 288u; ++i) slot_u16[i] = 0xFFFFu;
+        for (uint32_t i = 0; i < kMaxCompactSlots; ++i) slot_u16[i] = 0xFFFFu;
         for (uint32_t i = 0; i < p150_count; ++i) slot_u16[i] = active_experts[i];
         write_layer_desc_to_slot_ids(bank);
 
@@ -2300,15 +2377,17 @@ struct P150Dsv41Engine::Impl {
             return;
         }
 
-        const uint32_t mode = (chunk_rows <= 128u) ? 1u : 2u;
-        const uint32_t zero_rows = (chunk_rows <= 128u) ? 128u : 512u;
+        const uint32_t mode = (chunk_rows <= 128u) ? 1u
+                            : (chunk_rows <= 512u) ? 2u
+                            : (chunk_rows <= 2048u) ? 3u : 4u;
+        const uint32_t zero_rows = (mode == 1u) ? 128u
+                                 : (mode == 2u) ? 512u
+                                 : (mode == 3u) ? 2048u : 4096u;
 
-        // Priority 2: Peel ONLY <= 6 single-token (n == 1) non-hot experts unless rem_slots > kMaxCompactSlots (288),
-        // eliminating the 42-expert DDR4 AVX2 stall during M = 1,024 CED prefill!
+        // Wave 9.4 Phase B: 100% pure Blackhole P150A execution (0 CPU NVMe tail peel unless rem_slots > kMaxCompactSlots!)
         uint32_t total_compact_slots = 0u;
         std::vector<uint16_t> tail_cands;
         tail_cands.reserve(DSV41_P150_NUM_EXPERTS);
-        const uint32_t max_tail_cnt = 1u;
         for (uint32_t eid = 0; eid < DSV41_P150_NUM_EXPERTS; ++eid) {
             const size_t n = buckets[eid].size();
             if (n == 0u) continue;
@@ -2325,16 +2404,10 @@ struct P150Dsv41Engine::Impl {
         std::array<bool, DSV41_P150_NUM_EXPERTS> is_tail{};
         std::vector<TailExpertDesc> tail_descs;
         uint32_t total_tail_pairs = 0u;
-        const uint32_t max_peel_experts = (mode == 1u) ? 4u : 6u;
         uint32_t rem_slots = total_compact_slots;
         for (uint16_t eid : tail_cands) {
             const uint32_t n = static_cast<uint32_t>(buckets[eid].size());
-            const bool force_fit = (rem_slots > kMaxCompactSlots);
-            if (!force_fit) {
-                if (rem_slots <= kBatchSlots) break;
-                if (n > max_tail_cnt || tail_descs.size() >= max_peel_experts) break;
-                if (is_hot_expert(bank, eid)) continue;
-            }
+            if (rem_slots <= kMaxCompactSlots) break;
             if (total_tail_pairs + n > 1024u) break;
             TailExpertDesc td{};
             td.eid = eid;
@@ -2354,20 +2427,23 @@ struct P150Dsv41Engine::Impl {
         auto* x_rot_f32 = static_cast<float*>(host_x_rot_f32.ptr);
         const size_t x_rm_bytes = size_t(chunk_rows) * DSV41_P150_H * sizeof(uint16_t);
 
-        // Parallel AVX2 WHT128 rotation into BOTH host_x_rm (BF16) and host_x_rot_f32 (FP32) BEFORE launching CPU tail!
-        avx_pool.parallel_rows(chunk_rows, [&](uint32_t r0, uint32_t r1) {
-            for (uint32_t r = r0; r < r1; ++r) {
-                const uint16_t* src_row = x_chunk_bf16 + size_t(r) * DSV41_P150_H;
-                uint16_t* row_bf16      = dst_rm + size_t(r) * DSV41_P150_H;
-                float* rot_dst          = use_tail ? (x_rot_f32 + size_t(r) * DSV41_P150_H) : nullptr;
-                if (!input_is_wht_rotated) {
-                    rotate_row_avx2_to_bf16(src_row, bank.signs_h.data(), row_bf16, rot_dst);
-                } else {
-                    std::memcpy(row_bf16, src_row, DSV41_P150_H * sizeof(uint16_t));
-                    if (rot_dst) bf16_row_to_f32_avx2(src_row, rot_dst);
+        if (input_is_wht_rotated && !use_tail) {
+            std::memcpy(dst_rm, x_chunk_bf16, x_rm_bytes);
+        } else {
+            avx_pool.parallel_rows(chunk_rows, [&](uint32_t r0, uint32_t r1) {
+                for (uint32_t r = r0; r < r1; ++r) {
+                    const uint16_t* src_row = x_chunk_bf16 + size_t(r) * DSV41_P150_H;
+                    uint16_t* row_bf16      = dst_rm + size_t(r) * DSV41_P150_H;
+                    float* rot_dst          = use_tail ? (x_rot_f32 + size_t(r) * DSV41_P150_H) : nullptr;
+                    if (!input_is_wht_rotated) {
+                        rotate_row_avx2_to_bf16(src_row, bank.signs_h.data(), row_bf16, rot_dst);
+                    } else {
+                        std::memcpy(row_bf16, src_row, DSV41_P150_H * sizeof(uint16_t));
+                        if (rot_dst) bf16_row_to_f32_avx2(src_row, rot_dst);
+                    }
                 }
-            }
-        });
+            });
+        }
 
         if (use_tail) {
             auto* tail_out_base = static_cast<float*>(host_tail_pairs_f32.ptr);
@@ -2382,93 +2458,133 @@ struct P150Dsv41Engine::Impl {
             });
         }
 
-        // Collect remaining P150A CompactSlots and greedily pack disjoint-row slots into each 16-slot batch!
-        struct PendingSlot {
+        // Wave 9.4 Phase B: Expert-Grouped Contiguous Multi-Tile Best-Fit Batch Packer!
+        // All tiles of the same expert are placed CONTIGUOUSLY inside each 16-slot batch so writer_b & compute
+        // stream/unpack that expert's weights ONCE into CB 1 and reuse them across all m_tiles (up to 7x fewer weight loads!).
+        // Furthermore, tiles of the same expert have 100% disjoint rows -> zero wait_barrier stalls across the run!
+        struct ExpertRun {
+            uint16_t eid;
+            uint16_t next_off;
+            uint16_t rem_tiles;
+        };
+        std::vector<ExpertRun> runs;
+        runs.reserve(DSV41_P150_NUM_EXPERTS);
+        for (uint32_t eid = 0; eid < DSV41_P150_NUM_EXPERTS; ++eid) {
+            if (is_tail[eid]) continue;
+            const size_t n = buckets[eid].size();
+            if (n == 0u) continue;
+            const uint16_t nt = static_cast<uint16_t>((n + 31u) / 32u);
+            runs.push_back(ExpertRun{static_cast<uint16_t>(eid), 0u, nt});
+        }
+        std::sort(runs.begin(), runs.end(), [](const ExpertRun& a, const ExpertRun& b) {
+            if (a.rem_tiles != b.rem_tiles) return a.rem_tiles > b.rem_tiles;
+            return a.eid < b.eid;
+        });
+
+        struct PlacedTile {
             uint16_t eid;
             uint16_t off;
             uint16_t cnt;
-            bool placed;
-            std::array<uint64_t, 16> mask;
         };
-        std::vector<PendingSlot> pending;
-        pending.reserve(rem_slots);
-        for (uint32_t eid = 0; eid < DSV41_P150_NUM_EXPERTS; ++eid) {
-            if (is_tail[eid]) continue;
-            const auto& vec = buckets[eid];
-            for (size_t off = 0; off < vec.size(); off += 32u) {
-                const uint16_t cnt = static_cast<uint16_t>(std::min<size_t>(32u, vec.size() - off));
-                PendingSlot ps{static_cast<uint16_t>(eid), static_cast<uint16_t>(off), cnt, false, {}};
-                for (uint16_t k = 0; k < cnt; ++k) {
-                    const uint16_t r = vec[off + k].row;
-                    ps.mask[r >> 6] |= (1ULL << (r & 63u));
+        std::vector<PlacedTile> placed;
+        placed.reserve(rem_slots);
+        uint32_t left_tiles = rem_slots;
+        while (left_tiles > 0u) {
+            uint32_t batch_rem = kBatchSlots;
+            while (batch_rem > 0u && left_tiles > 0u) {
+                int32_t best = -1;
+                // Best-fit: pick the largest expert run that fits entirely in batch_rem without splitting!
+                for (size_t idx = 0; idx < runs.size(); ++idx) {
+                    if (runs[idx].rem_tiles > 0u && runs[idx].rem_tiles <= batch_rem) {
+                        best = static_cast<int32_t>(idx);
+                        break;
+                    }
                 }
-                pending.push_back(ps);
+                if (best < 0) {
+                    // All remaining experts exceed batch_rem -> pick the largest remaining and fill batch_rem contiguously!
+                    uint16_t mx = 0u;
+                    for (size_t idx = 0; idx < runs.size(); ++idx) {
+                        if (runs[idx].rem_tiles > mx) {
+                            mx = runs[idx].rem_tiles;
+                            best = static_cast<int32_t>(idx);
+                        }
+                    }
+                }
+                if (best < 0) break;
+                auto& er = runs[uint32_t(best)];
+                const uint32_t take = std::min<uint32_t>(batch_rem, er.rem_tiles);
+                const size_t tot_n = buckets[er.eid].size();
+                for (uint32_t t = 0u; t < take; ++t) {
+                    const uint16_t cnt = static_cast<uint16_t>(std::min<size_t>(32u, tot_n - er.next_off));
+                    placed.push_back(PlacedTile{er.eid, er.next_off, cnt});
+                    er.next_off = static_cast<uint16_t>(er.next_off + cnt);
+                }
+                er.rem_tiles = static_cast<uint16_t>(er.rem_tiles - take);
+                batch_rem -= take;
+                left_tiles -= take;
             }
         }
-        std::sort(pending.begin(), pending.end(), [](const PendingSlot& a, const PendingSlot& b) {
-            if (a.cnt != b.cnt) return a.cnt > b.cnt;
-            return a.eid < b.eid;
-        });
 
         auto* slot_u16   = static_cast<uint16_t*>(host_slot_ids.ptr);
         auto* meta_bytes = static_cast<uint8_t*>(host_slot_meta.ptr);
         auto* w_f32      = static_cast<float*>(host_weights.ptr);
-        for (uint32_t i = 0; i < 288u; ++i) slot_u16[i] = 0xFFFFu;
+        for (uint32_t i = 0; i < kMaxCompactSlots; ++i) slot_u16[i] = 0xFFFFu;
         write_layer_desc_to_slot_ids(bank);
 
         const auto& t_lut = tile_offset_lut();
-        const uint32_t active_slots = static_cast<uint32_t>(pending.size());
-        std::array<uint64_t, 16> inflight_row_mask{};
-        uint32_t first_unplaced = 0u;
+        const uint32_t active_slots = static_cast<uint32_t>(placed.size());
+        const uint32_t mask_words = (chunk_rows + 63u) >> 6;
+        std::array<uint64_t, 64> inflight_row_mask{};
+        std::array<uint64_t, 64> tile_mask{};
 
         for (uint32_t s = 0; s < active_slots; ++s) {
-            if ((s % kBatchSlots) == 0u) inflight_row_mask.fill(0ULL);
-            while (first_unplaced < active_slots && pending[first_unplaced].placed) ++first_unplaced;
-
-            int32_t chosen = -1;
-            for (uint32_t idx = first_unplaced; idx < active_slots; ++idx) {
-                if (pending[idx].placed) continue;
-                const auto& m = pending[idx].mask;
-                uint64_t overlap = 0ULL;
-                for (int w = 0; w < 16; ++w) overlap |= (inflight_row_mask[w] & m[w]);
-                if (overlap == 0ULL) {
-                    chosen = static_cast<int32_t>(idx);
-                    break;
-                }
+            if ((s % kBatchSlots) == 0u) {
+                for (uint32_t w = 0u; w < mask_words; ++w) inflight_row_mask[w] = 0ULL;
             }
-
-            uint32_t wait_barrier = 0u;
-            if (chosen < 0) {
-                chosen = static_cast<int32_t>(first_unplaced);
-                wait_barrier = ((s % kBatchSlots) > 0u) ? 1u : 0u;
+            const auto& pt = placed[s];
+            const auto& vec = buckets[pt.eid];
+            for (uint32_t w = 0u; w < mask_words; ++w) tile_mask[w] = 0ULL;
+            uint64_t overlap = 0ULL;
+            for (uint32_t k = 0u; k < pt.cnt; ++k) {
+                const uint16_t r = vec[pt.off + k].row;
+                const uint32_t wi = r >> 6;
+                const uint64_t bit = 1ULL << (r & 63u);
+                tile_mask[wi] |= bit;
+                overlap |= (inflight_row_mask[wi] & bit);
             }
-            PendingSlot& ps = pending[uint32_t(chosen)];
-            ps.placed = true;
+            const uint32_t wait_barrier = ((s % kBatchSlots) > 0u && overlap != 0ULL) ? 1u : 0u;
             if (wait_barrier != 0u) {
-                inflight_row_mask = ps.mask;
+                for (uint32_t w = 0u; w < mask_words; ++w) inflight_row_mask[w] = tile_mask[w];
             } else {
-                for (int m = 0; m < 16; ++m) inflight_row_mask[m] |= ps.mask[m];
+                for (uint32_t w = 0u; w < mask_words; ++w) inflight_row_mask[w] |= tile_mask[w];
             }
 
-            slot_u16[s] = ps.eid;
+            slot_u16[s] = pt.eid;
             uint8_t* mptr = meta_bytes + size_t(s) * 128ULL;
             std::memset(mptr, 0, 128u);
-            reinterpret_cast<uint32_t*>(mptr)[0] = ps.cnt;
+            reinterpret_cast<uint32_t*>(mptr)[0] = pt.cnt;
             reinterpret_cast<uint32_t*>(mptr)[1] = wait_barrier;
             uint16_t* rptr = reinterpret_cast<uint16_t*>(mptr + 8u);
 
             float* wtile = w_f32 + size_t(s) * 1024ULL;
             std::memset(wtile, 0, 4096u);
-            const auto& vec = buckets[ps.eid];
-            for (uint32_t k = 0; k < ps.cnt; ++k) {
-                rptr[k] = vec[ps.off + k].row;
-                const float wk = vec[ps.off + k].weight;
+            for (uint32_t k = 0; k < pt.cnt; ++k) {
+                rptr[k] = vec[pt.off + k].row;
+                const float wk = vec[pt.off + k].weight;
                 const auto& row_off = t_lut[k];
                 for (int c = 0; c < 32; ++c) wtile[row_off[c]] = wk;
             }
         }
 
-        CompactPrefillArena& arena = (mode == 1u) ? *arena128 : *arena512;
+        CompactPrefillArena& arena = (mode == 1u) ? *arena128
+                                   : (mode == 2u) ? *arena512
+                                   : (mode == 3u) ? *arena2048 : *arena4096;
+        ttnn::Tensor& x_rm_src_cur = (mode <= 2u) ? *x_rm_src
+                                   : (mode == 3u) ? *x_rm_2048_src : *x_rm_4096_src;
+        ttnn::Tensor& x_rm_dst_cur = (mode <= 2u) ? *x_rm_l1
+                                   : (mode == 3u) ? *x_rm_2048 : *x_rm_4096;
+        const uint32_t x_bcast_idx = (mode <= 2u) ? 2u : (mode == 3u ? 3u : 4u);
+
         const uint32_t scheduled_slots = choose_compact_slot_bucket(active_slots, mode);
         if (scheduled_slots > active_slots) {
             std::memset(meta_bytes + size_t(active_slots) * 128ULL, 0, size_t(scheduled_slots - active_slots) * 128ULL);
@@ -2483,14 +2599,18 @@ struct P150Dsv41Engine::Impl {
         if (x16_relay) {
             TraceStorageContextGuard trace_alloc_guard;
             const distributed::MeshCoordinateRange card0_only(distributed::MeshCoordinate{0, 0}, distributed::MeshCoordinate{0, 0});
-            cq.enqueue_write_shard_to_sub_grid(x_rm_src->mesh_buffer(), host_x_rm.ptr, card0_only, false, BufferRegion(0, x_rm_bytes));
+            cq.enqueue_write_shard_to_sub_grid(x_rm_src_cur.mesh_buffer(), host_x_rm.ptr, card0_only, false, BufferRegion(0, x_rm_bytes));
             cq.enqueue_write_shard_to_sub_grid(ws1->slot_ids_src.mesh_buffer(), host_slot_ids.ptr, card0_only, false, BufferRegion(0, kSlotIdsBytes));
             cq.enqueue_write_shard_to_sub_grid(slot_meta_src->mesh_buffer(), host_slot_meta.ptr, card0_only, false, BufferRegion(0, size_t(scheduled_slots) * 128ULL));
             cq.enqueue_write_shard_to_sub_grid(ws1->weights_tiled_src.mesh_buffer(), host_weights.ptr, card0_only, false, BufferRegion(0, size_t(scheduled_slots) * 4096ULL));
-            if (bcast_traces[2].id.has_value()) {
-                mesh->replay_mesh_trace(cq, *bcast_traces[2].id, false);
-            } else {
+            if (bcast_traces[x_bcast_idx].id.has_value()) {
+                mesh->replay_mesh_trace(cq, *bcast_traces[x_bcast_idx].id, false);
+            } else if (x_bcast_idx == 2u) {
                 run_bcast_prefill_untraced();
+            } else if (x_bcast_idx == 3u) {
+                run_bcast_prefill2048_untraced();
+            } else {
+                run_bcast_prefill4096_untraced();
             }
             if (bcast_traces[1].id.has_value()) {
                 mesh->replay_mesh_trace(cq, *bcast_traces[1].id, false);
@@ -2505,7 +2625,7 @@ struct P150Dsv41Engine::Impl {
             dirty_mt0 = 32u;  // bcast_traces[0] refreshes x_decode from x_decode_src
         } else {
             const distributed::MeshCoordinateRange all_devs(mesh->shape());
-            cq.enqueue_write_shard_to_sub_grid(x_rm_l1->mesh_buffer(), host_x_rm.ptr, all_devs, false, BufferRegion(0, x_rm_bytes));
+            cq.enqueue_write_shard_to_sub_grid(x_rm_dst_cur.mesh_buffer(), host_x_rm.ptr, all_devs, false, BufferRegion(0, x_rm_bytes));
             cq.enqueue_write_shard_to_sub_grid(ws1->slot_ids.mesh_buffer(), host_slot_ids.ptr, all_devs, false, BufferRegion(0, kSlotIdsBytes));
             cq.enqueue_write_shard_to_sub_grid(slot_meta_l1->mesh_buffer(), host_slot_meta.ptr, all_devs, false, BufferRegion(0, size_t(scheduled_slots) * 128ULL));
             cq.enqueue_write_shard_to_sub_grid(ws1->weights_tiled.mesh_buffer(), host_weights.ptr, all_devs, false, BufferRegion(0, size_t(scheduled_slots) * 4096ULL));
@@ -2520,7 +2640,7 @@ struct P150Dsv41Engine::Impl {
                 enqueue_zero_pages(arena.y_accum_f32, zero_rows * 5u);
                 for (uint32_t s = 0; s < scheduled_slots; s += kBatchSlots) {
                     const uint32_t bcnt = std::min<uint32_t>(kBatchSlots, scheduled_slots - s);
-                    enqueue_compact_gather_tilize(s, bcnt);
+                    enqueue_compact_gather_tilize(x_rm_dst_cur, s, bcnt);
                     enqueue_hlut2_projection(bank, ws1->x_tilized, bank.gate_pages, ws1->up_partials, s, bcnt, 160u, 3u);
                     enqueue_swiglu_wht128(bank, bcnt);
                     enqueue_hlut2_projection(bank, ws1->z_rot_bf16, bank.down_pages, ws1->down_partials, s, bcnt, 36u, 2u);
@@ -2632,9 +2752,12 @@ uint64_t P150Dsv41Engine::forward_moe(
 
     if (rows <= 32u) {
         impl_->run_decode_small(bank, rows, input_is_wht_rotated, row_slots, row_weights, x_in_bf16, y_out_bf16);
+    } else if (rows <= 4096u) {
+        // Wave 9.4 Phase B: Single-pass expert-grouped multi-tile prefill up to M = 4,096!
+        impl_->run_prefill_compact(bank, rows, input_is_wht_rotated, row_slots, row_weights, x_in_bf16, y_out_bf16);
     } else {
-        for (uint32_t r0 = 0; r0 < rows; r0 += 512u) {
-            const uint32_t chunk = std::min<uint32_t>(512u, rows - r0);
+        for (uint32_t r0 = 0; r0 < rows; r0 += 4096u) {
+            const uint32_t chunk = std::min<uint32_t>(4096u, rows - r0);
             if (chunk <= 32u) {
                 impl_->run_decode_small(
                     bank,
@@ -2720,7 +2843,7 @@ bool P150Dsv41Engine::selfcheck_layer(uint32_t layer) {
     SafetensorsMmap st0(bank.tp0_path);
     SafetensorsMmap st1(bank.tp1_path);
 
-    const uint32_t test_batches[] = {1u, 6u, 8u, 16u, 64u, 512u, 1024u};
+    const uint32_t test_batches[] = {1u, 6u, 7u, 8u, 16u, 64u, 512u, 2048u, 4096u};
     bool all_ok = true;
     uint32_t stale_reads = 0u;
 
@@ -2851,6 +2974,75 @@ bool P150Dsv41Engine::selfcheck_layer(uint32_t layer) {
                     layer, M, nonfinite, stale_reads, cos_parity, cos_fp32, double(ns_first) / 1e6, double(ns_traced) / 1e6, pass ? "PASS" : "FAIL");
         std::fflush(stdout);
         all_ok = all_ok && pass;
+    }
+
+    // Optional per-op sub-stage timing breakdown when DSV41_P150_PROFILE=1
+    if (std::getenv("DSV41_P150_PROFILE") != nullptr) {
+        auto& cq = impl_->mesh->mesh_command_queue();
+        auto time_op = [&](auto&& fn) -> double {
+            cq.finish();
+            const auto t0 = std::chrono::steady_clock::now();
+            fn();
+            cq.finish();
+            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        };
+        // Profile M=7 decode (18 unique experts, 3 hot in L1 -> 20 slots = 16+4)
+        {
+            const uint32_t M = 7u;
+            std::vector<uint16_t> x(size_t(M) * DSV41_P150_H, 0x3C00u), y(size_t(M) * DSV41_P150_H, 0u);
+            std::vector<std::array<int32_t, DSV41_P150_MAX_SLOTS>> sv(M);
+            std::vector<std::array<float, DSV41_P150_MAX_SLOTS>> wv(M);
+            for (uint32_t r = 0; r < M; ++r) {
+                sv[r].fill(-1); wv[r].fill(0.0f);
+                for (uint32_t k = 0; k < 3u; ++k) {
+                    sv[r][k] = int32_t((r * 3u + k) % 18u);
+                    wv[r][k] = 0.33f;
+                }
+            }
+            const auto* sp = reinterpret_cast<const int32_t(*)[DSV41_P150_MAX_SLOTS]>(sv.data());
+            const auto* wp = reinterpret_cast<const float(*)[DSV41_P150_MAX_SLOTS]>(wv.data());
+            for (int w = 0; w < 3; ++w) (void)forward_moe(layer, M, true, sp, wp, x.data(), y.data());
+            const double t_tot = double(forward_moe(layer, M, true, sp, wp, x.data(), y.data())) / 1e6;
+            const double t_bcast = time_op([&]() { impl_->mesh->replay_mesh_trace(cq, *impl_->bcast_traces[0].id, false); });
+            const double t_gu19  = time_op([&]() { impl_->enqueue_hlut2_projection(bank, impl_->ws1->x_decode, bank.gate_pages, impl_->ws1->up_partials, 0u, kBatchSlots, 0u, 3u); });
+            const double t_sw19  = time_op([&]() { impl_->enqueue_swiglu_wht128(bank, kBatchSlots); });
+            const double t_dn19  = time_op([&]() { impl_->enqueue_hlut2_projection(bank, impl_->ws1->z_rot_bf16, bank.down_pages, impl_->ws1->down_partials, 0u, kBatchSlots, 36u, 2u); });
+            const double t_cb19  = time_op([&]() { impl_->enqueue_ksplit_combine_decode(0u, kBatchSlots, true); });
+            const double t_red   = time_op([&]() { impl_->mesh->replay_mesh_trace(cq, *impl_->reduce_traces[0].id, false); });
+            std::printf("[P150_PROF][DECODE M=7 18exp/20slots=2b] total=%.3fms (x40L=%.1fms) | bcast=%.3f | b0(%u): gu=%.3f sw=%.3f dn=%.3f cb=%.3f | red=%.3f\n",
+                        t_tot, t_tot * 40.0, t_bcast, kBatchSlots, t_gu19, t_sw19, t_dn19, t_cb19, t_red);
+        }
+        // Profile M=4096 prefill (168 experts, uniform 3/row -> ~24.4 rows/exp? Use realistic 168 experts x 3 tiles = 504 slots -> 1 batch of 16!)
+        {
+            const uint32_t M = 4096u;
+            std::vector<uint16_t> x(size_t(M) * DSV41_P150_H, 0x3C00u), y(size_t(M) * DSV41_P150_H, 0u);
+            std::vector<std::array<int32_t, DSV41_P150_MAX_SLOTS>> sv(M);
+            std::vector<std::array<float, DSV41_P150_MAX_SLOTS>> wv(M);
+            for (uint32_t r = 0; r < M; ++r) {
+                sv[r].fill(-1); wv[r].fill(0.0f);
+                // Coprime stride 5 hits ALL 168 experts -> 73 rows/exp -> 3 contiguous tiles/exp (504 slots = 32 batches)
+                sv[r][0] = int32_t((r * 5u + 0u) % DSV41_P150_NUM_EXPERTS);
+                sv[r][1] = int32_t((r * 5u + 56u) % DSV41_P150_NUM_EXPERTS);
+                sv[r][2] = int32_t((r * 5u + 112u) % DSV41_P150_NUM_EXPERTS);
+                wv[r][0] = 0.5f; wv[r][1] = 0.3f; wv[r][2] = 0.2f;
+            }
+            const auto* sp = reinterpret_cast<const int32_t(*)[DSV41_P150_MAX_SLOTS]>(sv.data());
+            const auto* wp = reinterpret_cast<const float(*)[DSV41_P150_MAX_SLOTS]>(wv.data());
+            for (int w = 0; w < 2; ++w) (void)forward_moe(layer, M, true, sp, wp, x.data(), y.data());
+            const double t_tot = double(forward_moe(layer, M, true, sp, wp, x.data(), y.data())) / 1e6;
+            const double t_b4  = time_op([&]() { impl_->mesh->replay_mesh_trace(cq, *impl_->bcast_traces[4].id, false); });
+            const double t_b1  = time_op([&]() { impl_->mesh->replay_mesh_trace(cq, *impl_->bcast_traces[1].id, false); });
+            const double t_zp  = time_op([&]() { impl_->enqueue_zero_pages(impl_->arena4096->y_accum_f32, 4096u * 5u); });
+            const double t_gt  = time_op([&]() { impl_->enqueue_compact_gather_tilize(*impl_->x_rm_4096, 0u, kBatchSlots); });
+            const double t_gu  = time_op([&]() { impl_->enqueue_hlut2_projection(bank, impl_->ws1->x_tilized, bank.gate_pages, impl_->ws1->up_partials, 0u, kBatchSlots, 160u, 3u); });
+            const double t_sw  = time_op([&]() { impl_->enqueue_swiglu_wht128(bank, kBatchSlots); });
+            const double t_dn  = time_op([&]() { impl_->enqueue_hlut2_projection(bank, impl_->ws1->z_rot_bf16, bank.down_pages, impl_->ws1->down_partials, 0u, kBatchSlots, 36u, 2u); });
+            const double t_sc  = time_op([&]() { impl_->enqueue_compact_scatter_combine(impl_->arena4096->y_accum_f32, 0u, kBatchSlots); });
+            const double t_red = time_op([&]() { impl_->mesh->replay_mesh_trace(cq, *impl_->reduce_traces[4].id, false); });
+            std::printf("[P150_PROF][PREFILL M=4096 168exp/504slots=32b] total=%.3fms (x40L=%.0fms) | bcast4=%.3f bcast1=%.3f zero=%.3f red=%.3f | 1-batch(%u): gather=%.3f gu=%.3f sw=%.3f dn=%.3f scatter=%.3f\n",
+                        t_tot, t_tot * 40.0, t_b4, t_b1, t_zp, t_red, kBatchSlots, t_gt, t_gu, t_sw, t_dn, t_sc);
+        }
+        std::fflush(stdout);
     }
 
     // Wave 8.4C A/B round-trip latency comparison (Card #1 PCIe x4 all_devs vs Card #0 PCIe x16 -> 4x800G FABRIC_1D relay)

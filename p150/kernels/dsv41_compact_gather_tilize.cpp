@@ -38,6 +38,9 @@ void kernel_main() {
 
         const volatile uint32_t* meta_u32 = reinterpret_cast<const volatile uint32_t*>(base_l1);
         const uint32_t cnt = meta_u32[0];
+        if (cnt == 0u) {
+            continue;
+        }
         const volatile uint16_t* row_idx = reinterpret_cast<const volatile uint16_t*>(base_l1 + 8u);
 
         for (uint32_t r = 0; r < cnt; ++r) {
@@ -45,42 +48,44 @@ void kernel_main() {
             noc_async_read(x_rm_acc.get_noc_addr(src_row * 5u + page_grp, byte_off), gather_l1 + r * 128u, 128u);
         }
 
-        uint32_t* dst0 = reinterpret_cast<uint32_t*>(tile0_l1);
-        uint32_t* dst1 = reinterpret_cast<uint32_t*>(tile1_l1);
+        uint64_t* dst0 = reinterpret_cast<uint64_t*>(tile0_l1);
+        uint64_t* dst1 = reinterpret_cast<uint64_t*>(tile1_l1);
         const uint32_t top_lim = (cnt < 16u) ? 16u : 32u;
         for (uint32_t r = cnt; r < top_lim; ++r) {
-            uint32_t* z = reinterpret_cast<uint32_t*>(gather_l1 + r * 128u);
-            for (uint32_t w = 0; w < 32u; ++w) z[w] = 0u;
+            uint64_t* z = reinterpret_cast<uint64_t*>(gather_l1 + r * 128u);
+            for (uint32_t w = 0; w < 16u; ++w) z[w] = 0ULL;
         }
         if (cnt > 0u) {
             noc_async_read_barrier();
         }
 
-        const uint32_t* src_u32 = reinterpret_cast<const uint32_t*>(gather_l1);
+        const uint64_t* src_u64 = reinterpret_cast<const uint64_t*>(gather_l1);
         for (uint32_t fr = 0; fr < 16u; ++fr) {
-            const uint32_t* s_top = src_u32 + fr * 32u;
-            const uint32_t d_off  = fr * 8u;
-            for (uint32_t c2 = 0; c2 < 8u; ++c2) {
-                dst0[0u   + d_off + c2] = s_top[0u  + c2];
-                dst0[128u + d_off + c2] = s_top[8u  + c2];
-                dst1[0u   + d_off + c2] = s_top[16u + c2];
-                dst1[128u + d_off + c2] = s_top[24u + c2];
+            const uint64_t* s_top = src_u64 + fr * 16u;
+            const uint32_t d_off  = fr * 4u;
+            #pragma GCC unroll 4
+            for (uint32_t c4 = 0; c4 < 4u; ++c4) {
+                dst0[0u   + d_off + c4] = s_top[0u  + c4];
+                dst0[64u  + d_off + c4] = s_top[4u  + c4];
+                dst1[0u   + d_off + c4] = s_top[8u  + c4];
+                dst1[64u  + d_off + c4] = s_top[12u + c4];
             }
         }
         if (cnt <= 16u) {
-            for (uint32_t w = 256u; w < 512u; ++w) {
-                dst0[w] = 0u;
-                dst1[w] = 0u;
+            for (uint32_t w = 128u; w < 256u; ++w) {
+                dst0[w] = 0ULL;
+                dst1[w] = 0ULL;
             }
         } else {
             for (uint32_t fr = 0; fr < 16u; ++fr) {
-                const uint32_t* s_bot = src_u32 + (16u + fr) * 32u;
-                const uint32_t d_off  = fr * 8u;
-                for (uint32_t c2 = 0; c2 < 8u; ++c2) {
-                    dst0[256u + d_off + c2] = s_bot[0u  + c2];
-                    dst0[384u + d_off + c2] = s_bot[8u  + c2];
-                    dst1[256u + d_off + c2] = s_bot[16u + c2];
-                    dst1[384u + d_off + c2] = s_bot[24u + c2];
+                const uint64_t* s_bot = src_u64 + (16u + fr) * 16u;
+                const uint32_t d_off  = fr * 4u;
+                #pragma GCC unroll 4
+                for (uint32_t c4 = 0; c4 < 4u; ++c4) {
+                    dst0[128u + d_off + c4] = s_bot[0u  + c4];
+                    dst0[192u + d_off + c4] = s_bot[4u  + c4];
+                    dst1[128u + d_off + c4] = s_bot[8u  + c4];
+                    dst1[192u + d_off + c4] = s_bot[12u + c4];
                 }
             }
         }

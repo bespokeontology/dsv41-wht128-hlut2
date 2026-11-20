@@ -1,6 +1,5 @@
-// Blackhole P150A down_proj K-Split Reduction + Weighted Expert Combine Reader (RISCV_1 / NOC_0)
-// Streams k_splits FP32 partial tiles (CB 0), per-row router weight tile (CB 1),
-// and optional previous expert accumulator tile (CB 2).
+// Blackhole P150A Wave 9.4 down_proj K-Split Reduction + Weighted Expert Combine Reader (RISCV_1 / NOC_0)
+// Batches all k_splits FP32 partial reads + router weight tile read per slot behind ONE noc_async_read_barrier() (3x fewer stalls!).
 
 #include "api/dataflow/dataflow_api.h"
 
@@ -10,11 +9,11 @@ void kernel_main() {
     const uint32_t combined_addr   = get_arg_val<uint32_t>(2);
     const uint32_t slot_start      = get_arg_val<uint32_t>(3);
     const uint32_t k_splits        = get_arg_val<uint32_t>(4);  // 2
-    const uint32_t m_tiles_ws      = get_arg_val<uint32_t>(5);  // 12
+    const uint32_t m_tiles_ws      = get_arg_val<uint32_t>(5);  // 16
     const uint32_t first_tile      = get_arg_val<uint32_t>(6);
     const uint32_t tile_cnt        = get_arg_val<uint32_t>(7);
     const uint32_t accumulate_prev = get_arg_val<uint32_t>(8);  // 0 on first batch, 1 thereafter
-    const uint32_t batch_cnt       = get_arg_val<uint32_t>(9);  // 1..12
+    const uint32_t batch_cnt       = get_arg_val<uint32_t>(9);  // 1..16
 
     constexpr auto p_args = TensorAccessorArgs<0>();
     constexpr auto w_args = TensorAccessorArgs<p_args.next_compile_time_args_offset(), p_args.next_common_runtime_args_offset()>();
@@ -30,17 +29,17 @@ void kernel_main() {
         const uint32_t nt = out_tile;
 
         for (uint32_t b = 0; b < batch_cnt; ++b) {
-            for (uint32_t ks = 0; ks < k_splits; ++ks) {
-                cb_reserve_back(0, 1);
-                const uint32_t p_tile = (ks * m_tiles_ws + b) * nt_total + nt;
-                noc_async_read_tile(p_tile, part_acc, get_write_ptr(0));
-                noc_async_read_barrier();
-                cb_push_back(0, 1);
-            }
-
+            cb_reserve_back(0, k_splits);
             cb_reserve_back(1, 1);
-            noc_async_read_tile(slot_start + b, wgt_acc, get_write_ptr(1));
+            const uint32_t p_wr = get_write_ptr(0);
+            const uint32_t w_wr = get_write_ptr(1);
+            for (uint32_t ks = 0; ks < k_splits; ++ks) {
+                const uint32_t p_tile = (ks * m_tiles_ws + b) * nt_total + nt;
+                noc_async_read_tile(p_tile, part_acc, p_wr + ks * 4096u);
+            }
+            noc_async_read_tile(slot_start + b, wgt_acc, w_wr);
             noc_async_read_barrier();
+            cb_push_back(0, k_splits);
             cb_push_back(1, 1);
         }
 

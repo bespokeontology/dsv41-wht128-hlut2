@@ -10,6 +10,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <pthread.h>
+#include <sched.h>
 #include <string>
 #include <thread>
 
@@ -119,6 +121,14 @@ int main(int argc, char** argv) {
                     shm_name.c_str(), int(::getpid()), initial_cnt, max_layers,
                     double(engine.persistent_l1_bytes_per_card()) / (1024.0 * 1024.0), int(reuse_shm));
         std::fflush(stdout);
+
+        // Wave 9.4 Phase B: Pin P150A /dev/shm doorbell poller to dedicated physical EPYC core 25
+        {
+            cpu_set_t cs;
+            CPU_ZERO(&cs);
+            CPU_SET(25, &cs);
+            (void)::pthread_setaffinity_np(::pthread_self(), sizeof(cs), &cs);
+        }
 
         uint32_t last_seq = shm.ptr->resp_seq.load(std::memory_order_acquire);
         uint64_t idle_spins = 0ULL;

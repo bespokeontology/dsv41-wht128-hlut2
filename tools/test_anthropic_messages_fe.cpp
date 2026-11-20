@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <filesystem>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -963,16 +964,133 @@ bool test_delta_8_3d_hostile_16kib_zero_injection(const Dsv41Tokenizer& tok) {
     return true;
 }
 
+bool test_wave9_4_prefix_preserving_effort_switching(const Dsv41Tokenizer& tok) {
+    // Wave 9.4 Phase E: Toggling reasoningEffort (max <-> high <-> medium <-> low) on a multi-turn session
+    // MUST preserve 100.0% bit-identical history prefix tokens [0 .. N_history] with zero cold re-prefill!
+    auto build_for_effort = [&](int base_effort, const char* req_effort, bool use_openai) {
+        if (!use_openai) {
+            const std::string j = std::string(R"JSON({
+                "system": "You are a systems kernel engineer working on gfx906 and Blackhole P150A.",
+                "output_config": {"effort": ")JSON") + req_effort + R"JSON("},
+                "tools": [{"name": "read_file", "description": "Read source", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}}],
+                "messages": [
+                    {"role": "user", "content": "Audit the Wave 9.4 CSA2 indexer pipeline."},
+                    {"role": "assistant", "content": [
+                        {"type": "thinking", "thinking": "Checked layers 2, 8, 14, 20, 24, 28, 32, 36."},
+                        {"type": "text", "text": "Confirmed mode==2 candidate block mask cuts compute by 21.25x at 340K."}
+                    ]},
+                    {"role": "user", "content": "Now summarize the remaining prefill bottleneck concisely."}
+                ]
+            })JSON";
+            const AnthropicTranslatedRequest tr = translate_anthropic_to_dsv41(parse_json(j), "dsv41", base_effort);
+            std::string tm;
+            int tb = 0;
+            return tok.encode_segments(build_dsv41_prompt_segments(tr, tm, tb));
+        } else {
+            const std::string j = std::string(R"JSON({
+                "reasoning_effort": ")JSON") + req_effort + R"JSON(",
+                "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}],
+                "messages": [
+                    {"role": "system", "content": "You are a systems kernel engineer."},
+                    {"role": "user", "content": "Audit the Wave 9.4 CSA2 indexer pipeline."},
+                    {"role": "assistant", "reasoning_content": "Checked all 8 indexer layers.", "content": "Done."},
+                    {"role": "user", "content": "Now summarize concisely."}
+                ]
+            })JSON";
+            const OpenAiTranslatedRequest oreq = translate_openai_to_dsv41(parse_json(j), "dsv41", base_effort);
+            std::string tm;
+            int tb = 0;
+            return tok.encode_segments(build_dsv41_openai_prompt_segments(oreq, tm, tb));
+        }
+    };
+
+    for (bool oai : {false, true}) {
+        for (int base_eff : {65, 100}) {
+            const auto ids_med  = build_for_effort(base_eff, "medium", oai);
+            const auto ids_low  = build_for_effort(base_eff, "low", oai);
+            const auto ids_high = build_for_effort(base_eff, "high", oai);
+            const auto ids_max  = build_for_effort(base_eff, "max", oai);
+            const auto& base_ids = (base_eff == 65) ? ids_med : ids_max;
+            for (const auto* other : {&ids_med, &ids_low, &ids_high, &ids_max}) {
+                CHECK_TRUE(other->size() >= base_ids.size(), "non-base effort must extend base prefix at turn boundary");
+                for (size_t i = 0; i < base_ids.size(); ++i) {
+                    CHECK_TRUE((*other)[i] == base_ids[i],
+                               "100.0% bit-identical history prefix tokens across effort switches");
+                }
+            }
+            // Verify non-base effort injects native <｜latest_reminder｜> (128828) right at the turn boundary
+            const auto& diff_ids = (base_eff == 65) ? ids_low : ids_med;
+            CHECK_TRUE(diff_ids.size() > base_ids.size() &&
+                       diff_ids[base_ids.size()] == Dsv41SpecialTokens::kLatestReminder,
+                       "active-turn effort override emitted via native <｜latest_reminder｜> at turn boundary");
+            const std::string tail_txt = tok.decode(
+                std::vector<int32_t>(diff_ids.begin() + ptrdiff_t(base_ids.size()), diff_ids.end()), false);
+            const std::string want_num = (base_eff == 65) ? "Reasoning Effort: 50" : "Reasoning Effort: 65";
+            CHECK_TRUE(tail_txt.find(want_num) != std::string::npos,
+                       "active-turn latest_reminder carries exact target Reasoning Effort budget");
+        }
+    }
+    std::printf("[PASS] Wave 9.4 Phase E: Prefix-preserving reasoningEffort switching (100.0%% history token identity across low/medium/high/max on Anthropic & OpenAI)\n");
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     const std::string root_env = (std::getenv("DSV41_ROOT") != nullptr)
                                      ? std::string(std::getenv("DSV41_ROOT"))
                                      : std::string(".");
+    const std::string wdir_env = (std::getenv("DSV41_WEIGHTS_DIR") != nullptr)
+                                     ? std::string(std::getenv("DSV41_WEIGHTS_DIR"))
+                                     : std::string();
     std::string tok_path = (std::getenv("DSV41_TOKENIZER_JSON") != nullptr)
                                ? std::string(std::getenv("DSV41_TOKENIZER_JSON"))
                                : (root_env + "/hf_meta/tokenizer.json");
     if (argc > 1) tok_path = argv[1];
+    if (!std::filesystem::exists(tok_path) && !wdir_env.empty()) {
+        const std::string alt = wdir_env + "/hf_meta/tokenizer.json";
+        if (std::filesystem::exists(alt)) tok_path = alt;
+    }
+
+    if (!std::filesystem::exists(tok_path)) {
+        // Standalone CI / clean-clone check without downloaded HF weights:
+        // verify segment-level Wave 9.4 Phase E prefix-preserving reasoningEffort switching directly!
+        for (bool oai : {false, true}) {
+            for (int base_eff : {65, 100}) {
+                auto segs_for = [&](const char* req_eff) {
+                    std::string tm;
+                    int tb = 0;
+                    if (!oai) {
+                        const std::string j = std::string(R"JSON({"system":"Sys","output_config":{"effort":")JSON") +
+                            req_eff + R"JSON("},"messages":[{"role":"user","content":"Q1"},{"role":"assistant","content":"A1"},{"role":"user","content":"Q2"}]})JSON";
+                        return build_dsv41_prompt_segments(translate_anthropic_to_dsv41(parse_json(j), "dsv41", base_eff), tm, tb);
+                    }
+                    const std::string j = std::string(R"JSON({"reasoning_effort":")JSON") +
+                        req_eff + R"JSON(","messages":[{"role":"system","content":"Sys"},{"role":"user","content":"Q1"},{"role":"assistant","content":"A1"},{"role":"user","content":"Q2"}]})JSON";
+                    return build_dsv41_openai_prompt_segments(translate_openai_to_dsv41(parse_json(j), "dsv41", base_eff), tm, tb);
+                };
+                const auto s_med  = segs_for("medium");
+                const auto s_low  = segs_for("low");
+                const auto s_high = segs_for("high");
+                const auto s_max  = segs_for("max");
+                const auto& s_base = (base_eff == 65) ? s_med : s_max;
+                for (const auto* other : {&s_med, &s_low, &s_high, &s_max}) {
+                    CHECK_TRUE(other->size() >= s_base.size(), "standalone Phase E: non-base effort extends base segments");
+                    for (size_t i = 0; i < s_base.size(); ++i) {
+                        CHECK_TRUE((*other)[i].kind == s_base[i].kind &&
+                                   (*other)[i].token_id == s_base[i].token_id &&
+                                   (*other)[i].repeat == s_base[i].repeat &&
+                                   (*other)[i].text == s_base[i].text,
+                                   "standalone Phase E: 100% identical history segments across effort toggles");
+                    }
+                }
+            }
+        }
+        std::printf("[PASS] Standalone Wave 9.4 Phase E segment prefix-preservation check passed "
+                    "(%s not present; set DSV41_TOKENIZER_JSON to also run full 129K tokenizer suite)\n",
+                    tok_path.c_str());
+        return 0;
+    }
 
     Dsv41Tokenizer tok;
     tok.load(tok_path);
@@ -983,7 +1101,8 @@ int main(int argc, char** argv) {
     if (!test_server_search_loop_and_radix_prefix(tok)) return 1;
     if (!test_stage3_multimodal_prompt_and_tool_result_sorting(tok)) return 1;
     if (!test_delta_8_3d_hostile_16kib_zero_injection(tok)) return 1;
+    if (!test_wave9_4_prefix_preserving_effort_switching(tok)) return 1;
 
-    std::printf("[TEST_ANTHROPIC_FE] ALL STAGE 1, TRACK 8E & DELTA 8.3D TESTS PASSED.\n");
+    std::printf("[TEST_ANTHROPIC_FE] ALL STAGE 1, TRACK 8E, DELTA 8.3D & WAVE 9.4 PHASE E TESTS PASSED.\n");
     return 0;
 }

@@ -35,14 +35,26 @@ void write_receipt_markdown(
     const std::string& out_md,
     const dsv41::Dsv411MGateReceipt& r,
     const std::string& overlay_path,
+    const std::string& dev3_overlay_path,
+    const std::string& tp3_overlay_path,
     double total_wall_s)
 {
     std::ofstream f(out_md, std::ios::trunc);
     CHECK_1M(f.is_open(), ("Failed to open receipt output: " + out_md).c_str());
 
-    f << "# Wave 8.5 — 1,048,576-Token (`1M`) End-to-End Silicon Verification Receipt\n\n";
-    f << "- **Runtime Topology**: `3x AMD Instinct MI50 32GB (gfx906 TP3)` + `2x Tenstorrent Blackhole P150A (TP2, 18/18 L1 + x16->FABRIC_1D)` + `188.83 GiB Locked DDR4 Engram` + `Dsv41VitEngine (tp=2)`\n";
+    f << "# Wave 9.2 / 8.5 — 1,048,576-Token (`1M`) End-to-End Silicon Verification Receipt\n\n";
+    if (r.mem_margin.dev3_active) {
+        f << "- **Runtime Topology**: `3x AMD Instinct MI50 32GB (gfx906 TP3)` + `1x AMD Instinct MI50 16GB (hlut3_dev=3 WHT128-HLUT3)` + `2x Tenstorrent Blackhole P150A (TP2, 18/18 L1 + x16->FABRIC_1D)` + `188.83 GiB Locked DDR4 Engram` + `Dsv41VitEngine (tp=2)`\n";
+    } else {
+        f << "- **Runtime Topology**: `3x AMD Instinct MI50 32GB (gfx906 TP3)` + `2x Tenstorrent Blackhole P150A (TP2, 18/18 L1 + x16->FABRIC_1D)` + `188.83 GiB Locked DDR4 Engram` + `Dsv41VitEngine (tp=2)`\n";
+    }
     f << "- **Active Overlay**: `" << overlay_path << "`\n";
+    if (!dev3_overlay_path.empty()) {
+        f << "- **Active `hlut3_dev=3` Overlay**: `" << dev3_overlay_path << "`\n";
+    }
+    if (!tp3_overlay_path.empty()) {
+        f << "- **Active `TP3` `HLUT3` Overlay**: `" << tp3_overlay_path << "`\n";
+    }
     f << "- **Context Ceiling (`max_seq_len`)**: `1,048,576` tokens (`8,192` x `128`-token Radix/NVMe blocks)\n";
     f << "- **Total E2E Gate Wall Time**: `" << std::fixed << std::setprecision(2) << total_wall_s << " s`\n\n";
 
@@ -50,10 +62,18 @@ void write_receipt_markdown(
     f << "| Rank | Device Role | Free HBM2 (`MiB`) | Total HBM2 (`MiB`) | `>= 200 MiB` Gate | `uint64_t` Pointer Audit |\n";
     f << "| :--- | :--- | ---: | ---: | :---: | :---: |\n";
     for (int tp = 0; tp < 3; ++tp) {
-        f << "| `tp=" << tp << "` | " << (tp == 2 ? "`Backbone + MTP + Dsv41VitEngine`" : "`Backbone + MTP`")
+        f << "| `tp=" << tp << "` | " << (tp == 2 ? "`Backbone + Dsv41VitEngine`" : "`Backbone`")
           << " | `" << std::fixed << std::setprecision(2) << r.mem_margin.free_mib[tp]
           << "` | `" << r.mem_margin.total_mib[tp]
           << "` | `" << (r.mem_margin.free_mib[tp] >= 200.0 ? "PASS" : "FAIL")
+          << "` | `" << (r.mem_margin.pointer_audit_64bit_ok ? "PASS" : "FAIL") << "` |\n";
+    }
+    if (r.mem_margin.dev3_active) {
+        const double used_dev3 = r.mem_margin.dev3_total_mib - r.mem_margin.dev3_free_mib;
+        f << "| `hlut3_dev=3` | `Unsharded MTP (384) + Backbone (720) WHT128-HLUT3`"
+          << " | `" << std::fixed << std::setprecision(2) << r.mem_margin.dev3_free_mib
+          << "` | `" << r.mem_margin.dev3_total_mib
+          << "` | `" << (used_dev3 <= 15360.0 && r.mem_margin.dev3_free_mib >= 1000.0 ? "PASS" : "FAIL")
           << "` | `" << (r.mem_margin.pointer_audit_64bit_ok ? "PASS" : "FAIL") << "` |\n";
     }
     f << "\n- **Tiered CSA2 Slot Partition (`tp=0..2`)**:\n";
@@ -131,6 +151,9 @@ int main(int argc, char** argv) {
                                      : std::string(".");
     bool link_check = false;
     std::string overlay = root_env + "/packed_rarebal_overlay_wave8_5/hot_experts_wave8_5.safetensors";
+    std::string dev3_overlay;
+    std::string tp3_overlay;
+    int dev3_id = 3;
     std::string nvme_tmp = root_env + "/tmp/verify_w85_1m_kv";
     std::string receipt_out = root_env + "/WAVE8_5_1M_E2E_RECEIPT.md";
 
@@ -138,6 +161,9 @@ int main(int argc, char** argv) {
         const std::string a(argv[i]);
         if (a == "--link-check") link_check = true;
         else if (a == "--overlay" && i + 1 < argc) overlay = argv[++i];
+        else if (a == "--hlut3-dev3-overlay" && i + 1 < argc) dev3_overlay = argv[++i];
+        else if (a == "--hlut3-dev3-id" && i + 1 < argc) dev3_id = std::atoi(argv[++i]);
+        else if (a == "--hlut3-tp3-overlay" && i + 1 < argc) tp3_overlay = argv[++i];
         else if (a == "--nvme-tmp" && i + 1 < argc) nvme_tmp = argv[++i];
         else if (a == "--receipt-out" && i + 1 < argc) receipt_out = argv[++i];
     }
@@ -160,6 +186,12 @@ int main(int argc, char** argv) {
 
     dsv41::Dsv41Runtime rt;
     rt.set_expert_perm_overlay(overlay);
+    if (!dev3_overlay.empty()) {
+        rt.set_hlut3_dev3_overlay(dev3_overlay, dev3_id);
+    }
+    if (!tp3_overlay.empty()) {
+        rt.set_hlut3_tp3_overlay(tp3_overlay);
+    }
     rt.set_csa2_shared_tree8(true);
     rt.set_fused_mhc_norm(true);
     rt.set_fused_dspark_epilogue(true);
@@ -178,19 +210,32 @@ int main(int argc, char** argv) {
     const dsv41::Dsv411MGateReceipt rec = rt.run_wave8_5_1m_e2e_gate(nvme_tmp);
     std::filesystem::remove_all(nvme_tmp, ec);
 
+    auto sanitize_path = [&](std::string p) {
+        if (!root_env.empty() && root_env != "." && p.find(root_env) == 0) {
+            p.replace(0, root_env.size(), "${DSV41_ROOT}");
+        }
+        return p;
+    };
+
     const double tot_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    write_receipt_markdown(receipt_out, rec, overlay, tot_s);
+    write_receipt_markdown(
+        receipt_out, rec,
+        sanitize_path(overlay),
+        dev3_overlay.empty() ? std::string() : "${DSV41_WAVE9_OVERLAY_DIR}/" + std::filesystem::path(dev3_overlay).filename().string(),
+        tp3_overlay.empty() ? std::string() : "${DSV41_WAVE9_OVERLAY_DIR}/" + std::filesystem::path(tp3_overlay).filename().string(),
+        tot_s);
 
     std::printf("[WAVE8_5_1M_E2E] Summary (%.2fs):\n"
-                "  Free HBM2 @ 1M + ViT : %.2f / %.2f / %.2f MiB (64-bit ptr audit=%d)\n"
-                "  Engram overlap       : M=512 %.4f ms (%d) | M=1024 %.4f ms (%d)\n"
+                "  Free HBM2 @ 1M + ViT : %.2f / %.2f / %.2f MiB | dev3_free=%.2f / %.2f MiB (64-bit ptr audit=%d)\n",
+                tot_s,
+                rec.mem_margin.free_mib[0], rec.mem_margin.free_mib[1], rec.mem_margin.free_mib[2],
+                rec.mem_margin.dev3_free_mib, rec.mem_margin.dev3_total_mib,
+                int(rec.mem_margin.pointer_audit_64bit_ok));
+    std::printf("  Engram overlap       : M=512 %.4f ms (%d) | M=1024 %.4f ms (%d)\n"
                 "  1M HSI & CSA2        : top64_overlap=%.3f%% | needles=%d/%d/%d | CSA2 cos=%.8f (max_abs=%.3e) | nonfinite=%zu\n"
                 "  1M Decode (32x M=8)  : final_pos=%d | %.2f ms/step | %.2f tok/s (%d bursts)\n"
                 "  1M NVMe .kvblk       : %zu B/blk (%zu B disk SWA) | CRC32C=%d | enc_cos=%.8f | dec_cos=%.8f\n"
                 "  Receipt written      : %s\n",
-                tot_s,
-                rec.mem_margin.free_mib[0], rec.mem_margin.free_mib[1], rec.mem_margin.free_mib[2],
-                int(rec.mem_margin.pointer_audit_64bit_ok),
                 rec.engram_prefetch_wait_m512_ms, int(rec.engram_prefetch_overlap_m512_ok),
                 rec.engram_prefetch_wait_m1024_ms, int(rec.engram_prefetch_overlap_m1024_ok),
                 rec.hsi_top64_overlap_pct,

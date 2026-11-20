@@ -297,6 +297,7 @@ struct AnthropicTranslatedRequest {
     uint64_t seed = 0;
     bool thinking_enabled = true;
     int reasoning_effort = kDsv41DefaultReasoningEffort;
+    int prefix_base_effort = kDsv41DefaultReasoningEffort;
     std::string thinking_mode = "thinking";
     JsonValue openai_messages = JsonValue::make_array();
     JsonValue openai_tools = JsonValue::make_array();
@@ -585,6 +586,9 @@ inline AnthropicTranslatedRequest translate_anthropic_to_dsv41(
     AnthropicTranslatedRequest out;
     out.model = req.get("model").as_str(default_model_id);
     if (out.model.empty()) out.model = default_model_id;
+    out.prefix_base_effort = (default_reasoning_effort > 0)
+        ? std::clamp(default_reasoning_effort, 1, 100)
+        : kDsv41DefaultReasoningEffort;
 
     const int cap = std::clamp(max_output_tokens_cap, 1, kDsv41ArchMaxOutputTokens);
     const int def_max = std::clamp(default_max_tokens, 1, cap);
@@ -1282,7 +1286,8 @@ inline std::vector<PromptSegment> build_dsv41_prompt_segments(
     const JsonValue* tools_ptr = treq.openai_tools.arr_val.empty() ? nullptr : &treq.openai_tools;
     return render_dsv41_chat_segments(
         treq.openai_messages, tools_ptr, nullptr, &effort_jv,
-        out_thinking_mode, out_thinking_budget, out_images);
+        out_thinking_mode, out_thinking_budget, out_images,
+        treq.prefix_base_effort);
 }
 
 using AnthropicGenerateStepFn = std::function<std::vector<int32_t>(
@@ -1615,6 +1620,7 @@ struct OpenAiTranslatedRequest {
     uint64_t seed = 0;
     bool thinking_enabled = true;
     int reasoning_effort = kDsv41DefaultReasoningEffort;
+    int prefix_base_effort = kDsv41DefaultReasoningEffort;
     std::string thinking_mode = "thinking";
     JsonValue messages = JsonValue::make_array();
     JsonValue tools = JsonValue::make_array();
@@ -1635,6 +1641,9 @@ inline OpenAiTranslatedRequest translate_openai_to_dsv41(
     OpenAiTranslatedRequest out;
     out.model = body.get("model").as_str(default_model_id);
     if (out.model.empty()) out.model = default_model_id;
+    out.prefix_base_effort = (default_reasoning_effort > 0)
+        ? std::clamp(default_reasoning_effort, 1, 100)
+        : kDsv41DefaultReasoningEffort;
 
     const int cap = std::clamp(max_output_tokens_cap, 1, kDsv41ArchMaxOutputTokens);
     const int def_max = std::clamp(default_max_tokens, 1, cap);
@@ -1765,7 +1774,8 @@ inline std::vector<PromptSegment> build_dsv41_openai_prompt_segments(
     const JsonValue* rf_ptr = oreq.has_response_format ? &oreq.response_format : nullptr;
     return render_dsv41_chat_segments(
         oreq.messages, tools_ptr, rf_ptr, &effort_jv,
-        out_thinking_mode, out_thinking_budget, out_images);
+        out_thinking_mode, out_thinking_budget, out_images,
+        oreq.prefix_base_effort);
 }
 
 inline JsonValue make_openai_usage_json(int64_t prompt_toks, int64_t completion_toks, int64_t cached_toks,

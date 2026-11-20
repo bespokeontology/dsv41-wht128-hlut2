@@ -841,6 +841,17 @@ int main(int argc, char** argv) {
         std::string rarebal_overlay;
         std::string expert_perm_overlay;
         std::string hlut3_mtp_overlay;
+        std::string hlut3_dev3_overlay;
+        std::string hlut3_tp3_overlay;
+        int hlut3_dev3_id = 3;
+        if (const char* w9_dir = std::getenv("DSV41_WAVE9_OVERLAY_DIR")) {
+            if (*w9_dir != '\0') {
+                const std::string c_dev3 = std::string(w9_dir) + "/wave9_2_dev3_hlut3.safetensors";
+                const std::string c_tp3  = std::string(w9_dir) + "/wave9_2_tp3_hlut3.safetensors";
+                if (std::ifstream(c_dev3, std::ios::binary).good()) hlut3_dev3_overlay = c_dev3;
+                if (std::ifstream(c_tp3, std::ios::binary).good())  hlut3_tp3_overlay  = c_tp3;
+            }
+        }
         bool disable_expert_perm = false;
         std::string capture_rarebal_dir;
         std::string vit_weights;
@@ -860,6 +871,12 @@ int main(int argc, char** argv) {
         bool csa2_shared_tree8   = true;
         bool fused_mhc_norm      = true;
         bool fused_dspark_epilogue = true;
+        bool rocblas_prefill     = true;
+        int rocblas_expert_thresh = 18;
+        int rocblas_hlut2_thresh  = 20;
+        int prefill_superchunk_m  = 2048;
+        float tree8_conf_thresh   = 0.72f;
+        int chain_max_b           = 5;
 
         FeServerConfig srv_cfg;
         for (const char* env_k : {"SEARCH_URL", "DSV41_SEARCH_URL", "DSV41_SEARXNG_URL"}) {
@@ -922,6 +939,30 @@ int main(int argc, char** argv) {
                 hlut3_mtp_overlay = argv[++i];
             } else if (arg == "--no-hlut3-mtp-overlay") {
                 hlut3_mtp_overlay.clear();
+            } else if (arg == "--hlut3-dev3-overlay" && i + 1 < argc) {
+                hlut3_dev3_overlay = argv[++i];
+            } else if (arg == "--no-hlut3-dev3-overlay") {
+                hlut3_dev3_overlay.clear();
+            } else if (arg == "--hlut3-dev3-id" && i + 1 < argc) {
+                hlut3_dev3_id = std::stoi(argv[++i]);
+            } else if (arg == "--hlut3-tp3-overlay" && i + 1 < argc) {
+                hlut3_tp3_overlay = argv[++i];
+            } else if (arg == "--no-hlut3-tp3-overlay") {
+                hlut3_tp3_overlay.clear();
+            } else if (arg == "--rocblas-prefill") {
+                rocblas_prefill = true;
+            } else if (arg == "--no-rocblas-prefill") {
+                rocblas_prefill = false;
+            } else if (arg == "--rocblas-expert-thresh" && i + 1 < argc) {
+                rocblas_expert_thresh = std::stoi(argv[++i]);
+            } else if (arg == "--rocblas-hlut2-thresh" && i + 1 < argc) {
+                rocblas_hlut2_thresh = std::stoi(argv[++i]);
+            } else if (arg == "--prefill-superchunk-m" && i + 1 < argc) {
+                prefill_superchunk_m = std::stoi(argv[++i]);
+            } else if (arg == "--tree8-conf-thresh" && i + 1 < argc) {
+                tree8_conf_thresh = std::stof(argv[++i]);
+            } else if (arg == "--chain-max-b" && i + 1 < argc) {
+                chain_max_b = std::stoi(argv[++i]);
             } else if (arg == "--csa2-shared-tree8") {
                 csa2_shared_tree8 = true;
             } else if (arg == "--no-csa2-shared-tree8") {
@@ -987,7 +1028,19 @@ int main(int argc, char** argv) {
         runtime.set_fused_mhc_norm(fused_mhc_norm);
         runtime.set_fused_dspark_epilogue(fused_dspark_epilogue);
         runtime.set_hlut3_mtp_overlay(hlut3_mtp_overlay);
+        if (!hlut3_dev3_overlay.empty()) {
+            runtime.set_hlut3_dev3_overlay(hlut3_dev3_overlay, hlut3_dev3_id);
+        }
+        if (!hlut3_tp3_overlay.empty()) {
+            runtime.set_hlut3_tp3_overlay(hlut3_tp3_overlay);
+        }
+        runtime.set_rocblas_prefill(rocblas_prefill);
+        runtime.set_rocblas_expert_thresh(rocblas_expert_thresh);
+        runtime.set_rocblas_hlut2_thresh(rocblas_hlut2_thresh);
+        runtime.set_dspark_tree8_conf_thresh(tree8_conf_thresh);
+        runtime.set_dspark_chain_max_b(chain_max_b);
         runtime.init(mi50_root, tok_path, p150_shm, srv_cfg.max_seq_len, rarebal_overlay, capture_rarebal_dir, vit_weights);
+        runtime.set_prefill_superchunk_m(prefill_superchunk_m);
         runtime.set_dual_stream_overlap(dual_overlap);
         runtime.set_dspark_tree_width(dspark_tree_width);
         runtime.set_dspark_tree16_max_context(dspark_tree16_max_ctx);

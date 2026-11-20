@@ -315,7 +315,9 @@ inline uint64_t fnv1a64_init() noexcept {
 inline RadixKey128 compute_model_overlay_uuid(
     const std::string& mi50_packed_root,
     const std::string& rarebal_overlay_path,
-    const std::string& expert_perm_overlay_path = "") noexcept
+    const std::string& expert_perm_overlay_path = "",
+    const std::string& hlut3_dev3_overlay_path = "",
+    const std::string& hlut3_tp3_overlay_path = "") noexcept
 {
     uint64_t h1 = 0xCBF29CE484222325ULL;
     uint64_t h2 = 0x84222325CBF29CE4ULL;
@@ -346,6 +348,18 @@ inline RadixKey128 compute_model_overlay_uuid(
         const size_t slash = expert_perm_overlay_path.find_last_of('/');
         mix_str(slash == std::string::npos ? expert_perm_overlay_path : expert_perm_overlay_path.substr(slash + 1));
         mix_stat(expert_perm_overlay_path);
+    }
+    if (!hlut3_dev3_overlay_path.empty()) {
+        const size_t slash = hlut3_dev3_overlay_path.find_last_of('/');
+        mix_str("hlut3_dev3:");
+        mix_str(slash == std::string::npos ? hlut3_dev3_overlay_path : hlut3_dev3_overlay_path.substr(slash + 1));
+        mix_stat(hlut3_dev3_overlay_path);
+    }
+    if (!hlut3_tp3_overlay_path.empty()) {
+        const size_t slash = hlut3_tp3_overlay_path.find_last_of('/');
+        mix_str("hlut3_tp3:");
+        mix_str(slash == std::string::npos ? hlut3_tp3_overlay_path : hlut3_tp3_overlay_path.substr(slash + 1));
+        mix_stat(hlut3_tp3_overlay_path);
     }
     if (h1 == 0ULL && h2 == 0ULL) h1 = 1ULL;
     return RadixKey128{h1, h2};
@@ -594,6 +608,24 @@ public:
         out_entry.key = key;
         out_entry.extra_salt = salt_out;
         return true;
+    }
+
+    // Wave 9.3 Phase C.2: Asynchronous kernel NVMe readahead hint for lookahead batch!
+    void prefetch_block_hint(RadixKey128 key) const noexcept {
+        if (!enabled_) return;
+        const std::string p = block_path(key);
+        int open_flags = O_RDONLY;
+#ifdef O_NOATIME
+        open_flags |= O_NOATIME;
+#endif
+        int fd = ::open(p.c_str(), open_flags);
+        if (fd < 0 && errno == EPERM) {
+            fd = ::open(p.c_str(), O_RDONLY);
+        }
+        if (fd >= 0) {
+            (void)::posix_fadvise(fd, 0, off_t(kBlockFileBytes), POSIX_FADV_WILLNEED);
+            (void)::close(fd);
+        }
     }
 
     void touch_blocks_mtime(const std::vector<RadixKey128>& keys) const {

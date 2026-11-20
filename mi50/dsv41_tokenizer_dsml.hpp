@@ -110,7 +110,8 @@ std::vector<PromptSegment> render_dsv41_chat_segments(
     const JsonValue* reasoning_effort_val,
     std::string& out_thinking_mode,
     int& out_budget,
-    std::vector<Dsv41ImageSource>* out_images = nullptr);
+    std::vector<Dsv41ImageSource>* out_images = nullptr,
+    int prefix_base_effort = 0);
 
 enum class ThinkEndClass {
     NeedMoreLookahead,

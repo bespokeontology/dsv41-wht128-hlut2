@@ -1,8 +1,9 @@
-// Blackhole P150A Two-Phase HLUT2 -> cb_w_b8 Pre-Unpack + Matmul Compute Kernel (Wave 4E)
-//   1. Uses Dest Tiles 6 (dst_reg[192..223]=codes) and 7 (dst_reg[224..255]=scales) so 6 output tiles (0..5)
-//      unpack per pass (3 passes 6+6+4 instead of 4 passes per superblock!).
-//   2. Unpacks all 4 KT_SUB rows of an NT_SUB together from ONE codes SFPLOAD (5 LRegs peak, 3.2x fewer SFPLOADs!),
-//      with 1-cycle branchless sfpi::copysgn sign copy and ONE _llk_math_eltwise_sfpu_start_(0) per pass!
+// Blackhole P150A Wave 9.4 Wrap-Safe Multi-Tile Weight-Stationary (rt_dim=2 FPU) HLUT2 Pre-Unpack + Matmul Compute Kernel
+//   1. Reads exact slot_ids run plan from CB 6 via get_tile_address(6, 0) (mailbox-synced UNPACK/MATH/PACK, 0 B extra L1).
+//   2. Skips empty 0xFFFF padding slots completely (0 unpacks, 0 matmuls).
+//   3. Unified UInt32 format across CB 4 & CB 5 eliminates 6x/superblock reconfig_data_format_srca + copy_init stalls.
+//   4. Wrap-safe rt_dim=2 (all 8 FP32 Dest tiles): tracks cb0_half so rt_dim=2 runs ONLY when CB 0 is at half 0,
+//      and packs CB 16 strictly in 4-tile halves (0 wrap overflow ever!).
 
 #include <cstdint>
 #include "api/compute/common.h"
@@ -116,20 +117,14 @@ __attribute__((noinline)) void unpack_nt_2kt() {
     MATH((::ckernel::sfpu::unpack_nt_2kt<NT_SUB, KT_BASE, OUT_BASE, 1, 0>())); \
     MATH((::ckernel::sfpu::unpack_nt_2kt<NT_SUB, KT_BASE, OUT_BASE, 1, 1>()))
 
-inline void copy_codes_and_scales_to_67() {
-    reconfig_data_format_srca(4);
-    copy_init(4);
+inline void copy_codes_and_scales_to_67_fast() {
     copy_tile(4, 0, 6);
-
-    reconfig_data_format_srca(5);
-    copy_init(5);
     copy_tile(5, 0, 7);
 }
 
 inline void unpack_superblock_16tiles(uint32_t sb_base) {
-    // Pass 0: NT_SUB=0 (KT 0..3 -> Dest 0..3) + NT_SUB=1 (KT 0..1 -> Dest 4..5)
     tile_regs_acquire();
-    copy_codes_and_scales_to_67();
+    copy_codes_and_scales_to_67_fast();
     MATH((_llk_math_eltwise_sfpu_start_(0)));
     CALL_4KT(0, 0);
     CALL_2KT(1, 0, 4);
@@ -145,9 +140,8 @@ inline void unpack_superblock_16tiles(uint32_t sb_base) {
     pack_tile<true>(5, 1, sb_base + 5u);
     tile_regs_release();
 
-    // Pass 1: NT_SUB=1 (KT 2..3 -> Dest 0..1) + NT_SUB=2 (KT 0..3 -> Dest 2..5)
     tile_regs_acquire();
-    copy_codes_and_scales_to_67();
+    copy_codes_and_scales_to_67_fast();
     MATH((_llk_math_eltwise_sfpu_start_(0)));
     CALL_2KT(1, 2, 0);
     CALL_4KT(2, 2);
@@ -163,9 +157,8 @@ inline void unpack_superblock_16tiles(uint32_t sb_base) {
     pack_tile<true>(5, 1, sb_base + 14u);
     tile_regs_release();
 
-    // Pass 2: NT_SUB=3 (KT 0..3 -> Dest 0..3)
     tile_regs_acquire();
-    copy_codes_and_scales_to_67();
+    copy_codes_and_scales_to_67_fast();
     MATH((_llk_math_eltwise_sfpu_start_(0)));
     CALL_4KT(3, 0);
     MATH((_llk_math_eltwise_sfpu_done_()));
@@ -184,66 +177,170 @@ void kernel_main() {
     const uint32_t batch_cnt     = get_arg_val<uint32_t>(1);
     const uint32_t num_projs     = get_arg_val<uint32_t>(2);  // 2 for fused gate+up, 1 for down
     const uint32_t keep_act      = get_arg_val<uint32_t>(3);  // 1 when act_slot_stride == 0
+    const uint32_t slot_start    = get_arg_val<uint32_t>(4);  // batch offset into slot_ids
     const uint32_t kt_core       = num_sb * 4u;
     const uint32_t total_w_tiles = num_sb * 16u;
 
-    compute_kernel_hw_startup(4, 4, 1);
-    MATH((SFPU_BINARY_INIT(unused)));
+    cb_wait_front(6, 1);
+    const uint32_t scratch_addr = get_tile_address(6, 0);
+    const volatile uint16_t* slot_u16 = reinterpret_cast<const volatile uint16_t*>(scratch_addr);
+    uint16_t local_eids[24];
+    bool any_valid = false;
+    for (uint32_t b = 0u; b < batch_cnt; ++b) {
+        const uint16_t e = slot_u16[slot_start + b];
+        local_eids[b] = e;
+        if (e < 0xFFFEu) any_valid = true;
+    }
+    if (!any_valid) {
+        return;
+    }
 
-    if (keep_act != 0u && batch_cnt > 0u) {
+    compute_kernel_hw_startup(4, 4, 1);
+    reconfig_data_format_srca(4);
+    copy_init(4);
+    MATH((SFPU_BINARY_INIT(unused)));
+    bool need_sfpu_reconfig = false;
+
+    if (keep_act != 0u) {
         cb_wait_front(0, kt_core);
     }
 
-    for (uint32_t b = 0; b < batch_cnt; ++b) {
-        if (keep_act == 0u) {
-            cb_wait_front(0, kt_core);
+    auto unpack_weights_to_cb1 = [&]() __attribute__((always_inline)) {
+        if (need_sfpu_reconfig) {
+            reconfig_full_operand(4, 4);
+            pack_reconfig_data_format(1);
+            reconfig_data_format_srca(4);
+            copy_init(4);
+            MATH((SFPU_BINARY_INIT(unused)));
+        }
+        cb_reserve_back(1, total_w_tiles);
+        for (uint32_t sb = 0u; sb < num_sb; ++sb) {
+            cb_wait_front(4, 1);
+            cb_wait_front(5, 1);
+            unpack_superblock_16tiles(sb * 16u);
+            cb_pop_front(4, 1);
+            cb_pop_front(5, 1);
+        }
+        cb_push_back(1, total_w_tiles);
+        cb_wait_front(1, total_w_tiles);
+    };
+
+    auto matmul_one_strip = [&]() __attribute__((always_inline)) {
+        tile_regs_acquire();
+        for (uint32_t inner_dim_idx = 0u; inner_dim_idx < kt_core; ++inner_dim_idx) {
+            matmul_block(0, 1, inner_dim_idx, inner_dim_idx * 4u, 0, 0, 4, 1, kt_core);
+        }
+        tile_regs_commit();
+
+        cb_reserve_back(16, 4);
+        tile_regs_wait();
+        pack_block(0, 16, 4);
+        tile_regs_release();
+        cb_push_back(16, 4);
+    };
+
+    // Pack strictly in two 4-tile halves into 8-tile CB 16 so CB 16 NEVER wraps mid-pack!
+    auto matmul_two_strips = [&]() __attribute__((always_inline)) {
+        tile_regs_acquire();
+        for (uint32_t inner_dim_idx = 0u; inner_dim_idx < kt_core; ++inner_dim_idx) {
+            matmul_block(0, 1, inner_dim_idx, inner_dim_idx * 4u, 0, 0, 4, 2, kt_core);
+        }
+        tile_regs_commit();
+
+        tile_regs_wait();
+        cb_reserve_back(16, 4);
+        pack_block(0, 16, 4);
+        cb_push_back(16, 4);
+        cb_reserve_back(16, 4);
+        pack_block(4, 16, 4);
+        cb_push_back(16, 4);
+        tile_regs_release();
+    };
+
+    const bool can_rt2 = (keep_act == 0u && num_projs == 2u);
+    uint32_t cb0_half = 0u;
+    uint32_t b0 = 0u;
+    while (b0 < batch_cnt) {
+        const uint32_t expert_slot = local_eids[b0];
+        if (expert_slot >= 0xFFFEu) {
+            ++b0;
+            continue;
+        }
+        uint32_t run_len = 1u;
+        while (b0 + run_len < batch_cnt && local_eids[b0 + run_len] == expert_slot) {
+            ++run_len;
         }
 
-        for (uint32_t p = 0; p < num_projs; ++p) {
-            if (b > 0u || p > 0u) {
-                reconfig_full_operand(4, 4);
-                pack_reconfig_data_format(1);
-                MATH((SFPU_BINARY_INIT(unused)));
-            }
+        const bool hold_2 = (can_rt2 && run_len == 2u && cb0_half == 0u);
+        if (keep_act == 0u && run_len == 1u) {
+            cb_wait_front(0, kt_core);
+        } else if (hold_2) {
+            cb_wait_front(0, 2u * kt_core);
+        }
 
-            cb_reserve_back(1, total_w_tiles);
-            for (uint32_t sb = 0; sb < num_sb; ++sb) {
-                cb_wait_front(4, 1);
-                cb_wait_front(5, 1);
-
-                unpack_superblock_16tiles(sb * 16u);
-
-                cb_pop_front(4, 1);
-                cb_pop_front(5, 1);
-            }
-            cb_push_back(1, total_w_tiles);
-            cb_wait_front(1, total_w_tiles);
+        for (uint32_t p = 0u; p < num_projs; ++p) {
+            unpack_weights_to_cb1();
 
             reconfig_full_operand<SrcOrder::Reverse>(0, 1);
             pack_reconfig_data_format(1, 16);
-            matmul_block_init(0, 1, 0, 4, 1, kt_core);
+            need_sfpu_reconfig = true;
 
-            tile_regs_acquire();
-            for (uint32_t inner_dim_idx = 0; inner_dim_idx < kt_core; ++inner_dim_idx) {
-                matmul_block(0, 1, inner_dim_idx, inner_dim_idx * 4u, 0, 0, 4, 1, kt_core);
+            if (keep_act != 0u || run_len == 1u) {
+                matmul_block_init(0, 1, 0, 4, 1, kt_core);
+                for (uint32_t r = 0u; r < run_len; ++r) {
+                    matmul_one_strip();
+                }
+            } else if (hold_2) {
+                matmul_block_init(0, 1, 0, 4, 2, kt_core);
+                matmul_two_strips();
+            } else if (can_rt2) {
+                uint32_t cur_rt = 0u;
+                uint32_t r = 0u;
+                while (r < run_len) {
+                    if (cb0_half == 0u && r + 2u <= run_len) {
+                        if (cur_rt != 2u) {
+                            matmul_block_init(0, 1, 0, 4, 2, kt_core);
+                            cur_rt = 2u;
+                        }
+                        cb_wait_front(0, 2u * kt_core);
+                        matmul_two_strips();
+                        cb_pop_front(0, 2u * kt_core);
+                        r += 2u;
+                    } else {
+                        if (cur_rt != 1u) {
+                            matmul_block_init(0, 1, 0, 4, 1, kt_core);
+                            cur_rt = 1u;
+                        }
+                        cb_wait_front(0, kt_core);
+                        matmul_one_strip();
+                        cb_pop_front(0, kt_core);
+                        cb0_half ^= 1u;
+                        r += 1u;
+                    }
+                }
+            } else {
+                matmul_block_init(0, 1, 0, 4, 1, kt_core);
+                for (uint32_t r = 0u; r < run_len; ++r) {
+                    cb_wait_front(0, kt_core);
+                    matmul_one_strip();
+                    cb_pop_front(0, kt_core);
+                }
             }
-            tile_regs_commit();
-
-            cb_reserve_back(16, 4);
-            tile_regs_wait();
-            pack_block(0, 16, 4);
-            tile_regs_release();
-            cb_push_back(16, 4);
 
             cb_pop_front(1, total_w_tiles);
         }
 
-        if (keep_act == 0u) {
+        if (keep_act == 0u && run_len == 1u) {
             cb_pop_front(0, kt_core);
+            if (can_rt2) cb0_half ^= 1u;
+        } else if (hold_2) {
+            cb_pop_front(0, 2u * kt_core);
         }
+
+        b0 += run_len;
     }
 
-    if (keep_act != 0u && batch_cnt > 0u) {
+    if (keep_act != 0u) {
         cb_pop_front(0, kt_core);
     }
 }

@@ -17,8 +17,10 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #ifdef _OPENMP
 #include <omp.h>
@@ -513,6 +515,94 @@ std::vector<int32_t> Dsv41Tokenizer::encode(const std::string& text, bool parse_
     return out;
 }
 
+namespace {
+
+struct TokSliceHashKey {
+    uint64_t h1 = 0;
+    uint64_t h2 = 0;
+    size_t len = 0;
+    bool operator==(const TokSliceHashKey& o) const noexcept {
+        return h1 == o.h1 && h2 == o.h2 && len == o.len;
+    }
+};
+
+struct TokSliceHashKeyFn {
+    size_t operator()(const TokSliceHashKey& k) const noexcept {
+        return static_cast<size_t>(k.h1 ^ (k.h2 * 0x9E3779B97F4A7C15ULL) ^ k.len);
+    }
+};
+
+struct TokSliceCacheEntry {
+    std::string text;
+    std::vector<int32_t> ids;
+};
+
+struct TokSliceCache {
+    static constexpr size_t kMaxEntries = 8192u;
+    std::mutex mtx;
+    std::unordered_map<TokSliceHashKey, TokSliceCacheEntry, TokSliceHashKeyFn> map;
+    std::deque<TokSliceHashKey> fifo;
+    const void* owner_tok = nullptr;
+
+    static TokSliceHashKey hash_sv(std::string_view sv) noexcept {
+        uint64_t h1 = 0xcbf29ce484222325ULL;
+        uint64_t h2 = 0x84222325cbf29ce4ULL ^ uint64_t(sv.size());
+        const auto* p = reinterpret_cast<const uint8_t*>(sv.data());
+        size_t i = 0;
+        const size_t n = sv.size();
+        for (; i + 8u <= n; i += 8u) {
+            uint64_t w = 0;
+            std::memcpy(&w, p + i, 8u);
+            h1 ^= w;
+            h1 *= 0x100000001b3ULL;
+            h2 ^= (w + 0x9e3779b97f4a7c15ULL);
+            h2 = (h2 << 13) | (h2 >> 51);
+            h2 *= 0xbf58476d1ce4e5b9ULL;
+        }
+        for (; i < n; ++i) {
+            h1 ^= uint64_t(p[i]);
+            h1 *= 0x100000001b3ULL;
+            h2 ^= uint64_t(p[i]) * 0x9e3779b97f4a7c15ULL;
+            h2 = (h2 << 7) | (h2 >> 57);
+        }
+        return TokSliceHashKey{h1, h2, n};
+    }
+
+    bool lookup_locked(const void* tok_ptr, const TokSliceHashKey& k, std::string_view sv, std::vector<int32_t>& out) {
+        if (owner_tok != tok_ptr) return false;
+        auto it = map.find(k);
+        if (it == map.end() || it->second.text.size() != sv.size()) return false;
+        if (std::memcmp(it->second.text.data(), sv.data(), sv.size()) != 0) return false;
+        out = it->second.ids;
+        return true;
+    }
+
+    void insert_locked(const void* tok_ptr, const TokSliceHashKey& k, std::string_view sv, const std::vector<int32_t>& ids) {
+        if (owner_tok != tok_ptr) {
+            map.clear();
+            fifo.clear();
+            owner_tok = tok_ptr;
+        }
+        if (map.find(k) != map.end()) return;
+        if (map.size() >= kMaxEntries && !fifo.empty()) {
+            map.erase(fifo.front());
+            fifo.pop_front();
+        }
+        TokSliceCacheEntry e;
+        e.text.assign(sv.data(), sv.size());
+        e.ids = ids;
+        map.emplace(k, std::move(e));
+        fifo.push_back(k);
+    }
+};
+
+TokSliceCache& global_tok_slice_cache() {
+    static TokSliceCache cache;
+    return cache;
+}
+
+}  // namespace
+
 std::vector<int32_t> Dsv41Tokenizer::encode_segments(const std::vector<PromptSegment>& segments) const {
     if (segments.empty()) return {};
 
@@ -523,6 +613,7 @@ std::vector<int32_t> Dsv41Tokenizer::encode_segments(const std::vector<PromptSeg
         }
     }
 
+    auto& scache = global_tok_slice_cache();
     if (total_ordinary_bytes < 8192u) {
         std::vector<int32_t> out;
         out.reserve(segments.size() + total_ordinary_bytes / 3u);
@@ -532,7 +623,21 @@ std::vector<int32_t> Dsv41Tokenizer::encode_segments(const std::vector<PromptSeg
                     out.insert(out.end(), size_t(seg.repeat), seg.token_id);
                 }
             } else if (!seg.text.empty()) {
-                std::vector<int32_t> sub = encode(seg.text, /*parse_special=*/false);
+                std::vector<int32_t> sub;
+                bool hit = false;
+                if (seg.text.size() >= 64u) {
+                    const auto hk = TokSliceCache::hash_sv(seg.text);
+                    std::lock_guard<std::mutex> lk(scache.mtx);
+                    hit = scache.lookup_locked(this, hk, seg.text, sub);
+                }
+                if (!hit) {
+                    sub = encode(seg.text, /*parse_special=*/false);
+                    if (seg.text.size() >= 64u) {
+                        const auto hk = TokSliceCache::hash_sv(seg.text);
+                        std::lock_guard<std::mutex> lk(scache.mtx);
+                        scache.insert_locked(this, hk, seg.text, sub);
+                    }
+                }
                 out.insert(out.end(), sub.begin(), sub.end());
             }
         }
@@ -541,9 +646,11 @@ std::vector<int32_t> Dsv41Tokenizer::encode_segments(const std::vector<PromptSeg
 
     struct WorkSlice {
         bool is_tok = false;
+        bool cache_hit = false;
         int32_t token_id = -1;
         int32_t repeat = 0;
         std::string_view sv;
+        TokSliceHashKey hk{};
     };
 
     std::vector<WorkSlice> slices;
@@ -553,20 +660,20 @@ std::vector<int32_t> Dsv41Tokenizer::encode_segments(const std::vector<PromptSeg
     for (const auto& seg : segments) {
         if (seg.kind == PromptSegment::Kind::TokenId) {
             if (seg.token_id >= 0 && seg.repeat > 0) {
-                slices.push_back(WorkSlice{true, seg.token_id, seg.repeat, {}});
+                slices.push_back(WorkSlice{true, false, seg.token_id, seg.repeat, {}, {}});
             }
             continue;
         }
         const std::string& s = seg.text;
         if (s.empty()) continue;
         if (s.size() <= kTargetSliceBytes * 2u) {
-            slices.push_back(WorkSlice{false, -1, 0, std::string_view(s)});
+            slices.push_back(WorkSlice{false, false, -1, 0, std::string_view(s), {}});
             continue;
         }
         size_t start = 0;
         while (start < s.size()) {
             if (s.size() - start <= kTargetSliceBytes) {
-                slices.push_back(WorkSlice{false, -1, 0, std::string_view(s.data() + start, s.size() - start)});
+                slices.push_back(WorkSlice{false, false, -1, 0, std::string_view(s.data() + start, s.size() - start), {}});
                 break;
             }
             size_t p = start + kTargetSliceBytes;
@@ -577,17 +684,50 @@ std::vector<int32_t> Dsv41Tokenizer::encode_segments(const std::vector<PromptSeg
                 }
                 ++p;
             }
-            slices.push_back(WorkSlice{false, -1, 0, std::string_view(s.data() + start, p - start)});
+            slices.push_back(WorkSlice{false, false, -1, 0, std::string_view(s.data() + start, p - start), {}});
             start = p;
         }
     }
 
     std::vector<std::vector<int32_t>> encoded_slices(slices.size());
     const int n_slices = static_cast<int>(slices.size());
-    #pragma omp parallel for schedule(dynamic, 1)
-    for (int i = 0; i < n_slices; ++i) {
-        if (!slices[size_t(i)].is_tok && !slices[size_t(i)].sv.empty()) {
-            encoded_slices[size_t(i)] = encode(std::string(slices[size_t(i)].sv), /*parse_special=*/false);
+    int miss_cnt = 0;
+    {
+        for (int i = 0; i < n_slices; ++i) {
+            auto& ws = slices[size_t(i)];
+            if (!ws.is_tok && ws.sv.size() >= 32u && ws.sv.size() <= 16384u) {
+                ws.hk = TokSliceCache::hash_sv(ws.sv);
+            }
+        }
+        std::lock_guard<std::mutex> lk(scache.mtx);
+        for (int i = 0; i < n_slices; ++i) {
+            auto& ws = slices[size_t(i)];
+            if (!ws.is_tok && ws.sv.size() >= 32u && ws.sv.size() <= 16384u) {
+                if (scache.lookup_locked(this, ws.hk, ws.sv, encoded_slices[size_t(i)])) {
+                    ws.cache_hit = true;
+                } else {
+                    ++miss_cnt;
+                }
+            } else if (!ws.is_tok && !ws.sv.empty()) {
+                ++miss_cnt;
+            }
+        }
+    }
+
+    if (miss_cnt > 0) {
+        #pragma omp parallel for schedule(dynamic, 1) if(miss_cnt >= 2)
+        for (int i = 0; i < n_slices; ++i) {
+            const auto& ws = slices[size_t(i)];
+            if (!ws.is_tok && !ws.cache_hit && !ws.sv.empty()) {
+                encoded_slices[size_t(i)] = encode(std::string(ws.sv), /*parse_special=*/false);
+            }
+        }
+        std::lock_guard<std::mutex> lk(scache.mtx);
+        for (int i = 0; i < n_slices; ++i) {
+            const auto& ws = slices[size_t(i)];
+            if (!ws.is_tok && !ws.cache_hit && ws.sv.size() >= 32u && ws.sv.size() <= 16384u) {
+                scache.insert_locked(this, ws.hk, ws.sv, encoded_slices[size_t(i)]);
+            }
         }
     }
 
@@ -1067,7 +1207,8 @@ std::vector<PromptSegment> render_dsv41_chat_segments(
     const JsonValue* reasoning_effort_val,
     std::string& out_thinking_mode,
     int& out_budget,
-    std::vector<Dsv41ImageSource>* out_images)
+    std::vector<Dsv41ImageSource>* out_images,
+    int prefix_base_effort)
 {
     if (out_images) out_images->clear();
 
@@ -1208,7 +1349,9 @@ std::vector<PromptSegment> render_dsv41_chat_segments(
 
         std::string effort_prefix;
         if (index == 0 && out_thinking_mode == "thinking") {
-            effort_prefix = "Reasoning Effort: " + std::to_string(out_budget) +
+            const int hdr_effort = (prefix_base_effort >= 1 && prefix_base_effort <= 100)
+                ? prefix_base_effort : out_budget;
+            effort_prefix = "Reasoning Effort: " + std::to_string(hdr_effort) +
                             " (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
         }
         if (index == 0 && (!effort_prefix.empty() || role == "system")) {
@@ -1332,6 +1475,24 @@ std::vector<PromptSegment> render_dsv41_chat_segments(
             } else {
                 bld.push_tok(Dsv41SpecialTokens::kThinkEnd);
             }
+        }
+    }
+
+    // Wave 9.4 Phase E: Prefix-preserving active-turn Reasoning Effort override via native <｜latest_reminder｜>
+    // when effort differs from the fixed index==0 header (keeps tokens [0..N_history] 100.0% bit-identical across
+    // max <-> high <-> medium <-> low toggles -> >99% RadixBlockCache hit rate, 0 cold re-prefill!).
+    if (out_thinking_mode == "thinking" &&
+        prefix_base_effort >= 1 && prefix_base_effort <= 100 &&
+        out_budget != prefix_base_effort && !merged.empty())
+    {
+        const std::string effort_tail =
+            "Reasoning Effort: " + std::to_string(out_budget) +
+            " (range 1-100, the higher the value, the more thorough the reasoning)";
+        if (merged.back().get("role").as_str() == "latest_reminder") {
+            bld.push_txt("\n" + effort_tail);
+        } else {
+            bld.push_tok(Dsv41SpecialTokens::kLatestReminder);
+            bld.push_txt(effort_tail);
         }
     }
 

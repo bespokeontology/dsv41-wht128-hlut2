@@ -468,6 +468,83 @@ inline Hlut3Mi50Packed pack_hlut3_for_mi50(const Hlut3QuantMatrix& q) {
     return p;
 }
 
+// ---- Wave 9.2 Unsharded Single-GPU (13.1836 MiB/expert) & TP3-Sharded (4.3945 MiB/rank) Expert Packers ----
+inline constexpr int      kHlut3ModelHidden             = 5120;
+inline constexpr int      kHlut3ModelMoeInter           = 2304;
+inline constexpr int      kHlut3ModelTp3Inter           = 768;
+inline constexpr size_t   kHlut3UnshardedProjTiles      = (kHlut3ModelMoeInter / 32) * (kHlut3ModelHidden / 32); // 72 * 160 = 11,520
+inline constexpr uint64_t kHlut3UnshardedProjBytes      = kHlut3UnshardedProjTiles * uint64_t(kHlut3TileBytes);  // 4,608,000 B
+inline constexpr uint64_t kHlut3UnshardedExpertBytes    = 3ULL * kHlut3UnshardedProjBytes;                       // 13,824,000 B (13.18359375 MiB)
+inline constexpr size_t   kHlut3Tp3ProjTiles            = (kHlut3ModelTp3Inter / 32) * (kHlut3ModelHidden / 32); // 24 * 160 = 3,840
+inline constexpr uint64_t kHlut3Tp3ProjBytes            = kHlut3Tp3ProjTiles * uint64_t(kHlut3TileBytes);        // 1,536,000 B
+inline constexpr uint64_t kHlut3Tp3RankExpertBytes      = 3ULL * kHlut3Tp3ProjBytes;                             // 4,608,000 B (4.39453125 MiB)
+
+static_assert(kHlut3UnshardedProjBytes == 4'608'000ULL, "Unsharded HLUT3 projection must be 4,608,000 B");
+static_assert(kHlut3UnshardedExpertBytes == 13'824'000ULL, "Unsharded HLUT3 expert must be 13,824,000 B (13.18359375 MiB)");
+static_assert(kHlut3Tp3ProjBytes == 1'536'000ULL, "TP3-sharded HLUT3 projection must be 1,536,000 B");
+static_assert(kHlut3Tp3RankExpertBytes == 4'608'000ULL, "TP3-sharded HLUT3 rank expert must be 4,608,000 B (4.39453125 MiB)");
+
+struct Hlut3UnshardedExpertPacked {
+    std::vector<Hlut3Tile32x32> gate_tiles; // [72, 160] = 11,520 tiles (4,608,000 B)
+    std::vector<Hlut3Tile32x32> up_tiles;   // [72, 160] = 11,520 tiles (4,608,000 B)
+    std::vector<Hlut3Tile32x32> down_tiles; // [160, 72] = 11,520 tiles (4,608,000 B)
+};
+
+struct Hlut3Tp3RankExpertPacked {
+    std::vector<Hlut3Tile32x32> gate_tiles; // [24, 160] = 3,840 tiles (1,536,000 B)
+    std::vector<Hlut3Tile32x32> up_tiles;   // [24, 160] = 3,840 tiles (1,536,000 B)
+    std::vector<Hlut3Tile32x32> down_tiles; // [160, 24] = 3,840 tiles (1,536,000 B)
+};
+
+inline Hlut3UnshardedExpertPacked pack_hlut3_expert_unsharded(
+    const Hlut3QuantMatrix& q_gate,
+    const Hlut3QuantMatrix& q_up,
+    const Hlut3QuantMatrix& q_down)
+{
+    if (q_gate.N != kHlut3ModelMoeInter || q_gate.K != kHlut3ModelHidden ||
+        q_up.N   != kHlut3ModelMoeInter || q_up.K   != kHlut3ModelHidden ||
+        q_down.N != kHlut3ModelHidden   || q_down.K != kHlut3ModelMoeInter) {
+        throw std::invalid_argument("pack_hlut3_expert_unsharded geometry mismatch");
+    }
+    Hlut3UnshardedExpertPacked out;
+    out.gate_tiles = q_gate.tiles;
+    out.up_tiles   = q_up.tiles;
+    out.down_tiles = q_down.tiles;
+    return out;
+}
+
+inline std::array<Hlut3Tp3RankExpertPacked, 3> pack_hlut3_expert_tp3_sharded(
+    const Hlut3QuantMatrix& q_gate,
+    const Hlut3QuantMatrix& q_up,
+    const Hlut3QuantMatrix& q_down)
+{
+    if (q_gate.N != kHlut3ModelMoeInter || q_gate.K != kHlut3ModelHidden ||
+        q_up.N   != kHlut3ModelMoeInter || q_up.K   != kHlut3ModelHidden ||
+        q_down.N != kHlut3ModelHidden   || q_down.K != kHlut3ModelMoeInter) {
+        throw std::invalid_argument("pack_hlut3_expert_tp3_sharded geometry mismatch");
+    }
+    std::array<Hlut3Tp3RankExpertPacked, 3> out;
+    constexpr int kNtGateRank = kHlut3ModelTp3Inter / 32; // 24
+    constexpr int kKtGate     = kHlut3ModelHidden / 32;   // 160
+    constexpr int kNtDown     = kHlut3ModelHidden / 32;   // 160
+    constexpr int kKtDownRank = kHlut3ModelTp3Inter / 32; // 24
+    for (int tp = 0; tp < 3; ++tp) {
+        auto& dst = out[size_t(tp)];
+        dst.gate_tiles.resize(kHlut3Tp3ProjTiles);
+        dst.up_tiles.resize(kHlut3Tp3ProjTiles);
+        dst.down_tiles.resize(kHlut3Tp3ProjTiles);
+        const size_t gu_off = size_t(tp) * size_t(kNtGateRank) * size_t(kKtGate);
+        std::memcpy(dst.gate_tiles.data(), q_gate.tiles.data() + gu_off, kHlut3Tp3ProjBytes);
+        std::memcpy(dst.up_tiles.data(),   q_up.tiles.data()   + gu_off, kHlut3Tp3ProjBytes);
+        for (int nt = 0; nt < kNtDown; ++nt) {
+            const Hlut3Tile32x32* src_row = q_down.tiles.data() + size_t(nt) * size_t(3 * kKtDownRank) + size_t(tp * kKtDownRank);
+            Hlut3Tile32x32*       dst_row = dst.down_tiles.data() + size_t(nt) * size_t(kKtDownRank);
+            std::memcpy(dst_row, src_row, size_t(kKtDownRank) * sizeof(Hlut3Tile32x32));
+        }
+    }
+    return out;
+}
+
 // ---- Reference forward/inverse WHT128 (production signs are Rademacher from make_wht_signs) ----
 inline void hlut3_wht128_forward_block(float* v, const uint64_t* sign_bits_block2) {
     wht128_block(v, sign_bits_block2);

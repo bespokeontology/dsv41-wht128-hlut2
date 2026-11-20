@@ -159,6 +159,35 @@ void launch_host_ring_allreduce_f32(
     size_t n_elems,
     hipStream_t stream);
 
+// Wave 9.4 Phase D: TP0-only FP32 reduction (3x less PCIe traffic: tp1,2 write only, tp0 reads only!)
+void launch_host_ring_reduce_tp0_f32(
+    const float* d_src,
+    float* d_dst,
+    HostRingAllReduceSlot* d_mapped_slot,
+    int rank,
+    uint64_t seq,
+    size_t n_elems,
+    hipStream_t stream);
+
+// Wave 9.4 Phase D.2: TP0-only FP16-wire reduction (6x less PCIe traffic: tp1,2 pack 2xFP16/word, tp0 sums in FP32!)
+void launch_host_ring_reduce_tp0_f16_wire(
+    const float* d_src,
+    float* d_dst,
+    HostRingAllReduceSlot* d_mapped_slot,
+    int rank,
+    uint64_t seq,
+    size_t n_elems,
+    hipStream_t stream);
+
+// Wave 9.4 Phase D: TP0->TP1,2 tiny uint32 broadcast (for top-512 indices & compact cand_block_ids!)
+void launch_host_ring_bcast_tp0_u32(
+    uint32_t* d_buf,
+    HostRingAllReduceSlot* d_mapped_slot,
+    int rank,
+    uint64_t seq,
+    size_t n_words,
+    hipStream_t stream);
+
 struct alignas(64) Dsv41GpuStageRtc {
     uint64_t last_stamp;
     uint64_t att_ticks;
@@ -212,7 +241,10 @@ void launch_host_ring_finish_f32_hc_post(
     hipStream_t stream,
     const uint32_t* d_p150_resp_seq = nullptr,
     uint32_t p150_req_seq = 0u,
-    Dsv41GpuStageRtc* d_stage_rtc = nullptr);
+    Dsv41GpuStageRtc* d_stage_rtc = nullptr,
+    const float* d_dev3_f32 = nullptr,
+    const uint32_t* d_dev3_done_seq = nullptr,
+    uint32_t dev3_req_seq = 0u);
 
 // Wave 8.5B: Cross-sublayer fused HostRing TP3 AllReduce + mHC post + next-sublayer H_pre contraction +
 // RMSNorm + optional UE8M0/32 FP8 quant + optional WHT128 (M <= 16 decode fast path, ScratchSize == 0).
@@ -264,7 +296,52 @@ void launch_host_ring_finish_f32_mhc_fused(
     hipStream_t stream,
     const uint32_t* d_p150_resp_seq = nullptr,
     uint32_t p150_req_seq = 0u,
-    Dsv41GpuStageRtc* d_stage_rtc = nullptr);
+    Dsv41GpuStageRtc* d_stage_rtc = nullptr,
+    const float* d_dev3_f32 = nullptr,
+    const uint32_t* d_dev3_done_seq = nullptr,
+    uint32_t dev3_req_seq = 0u);
+
+void launch_add_f32_inplace(
+    float* d_dst_f32,
+    const float* d_src_f32,
+    size_t n_elems,
+    hipStream_t stream);
+
+void prewarm_host_ring_and_dev3_local_ctas();
+
+// Wave 9.2 Zero-TP3-AllReduce MTP FFN epilogues: each rank waits on hlut3_dev=3 done_seq,
+// reads single-GPU FFN output y_out_f32 [M, 5120] from coherent DDR4, runs mHC post (+ optional
+// fused next RMSNorm / UE8M0 FP8), and marks rank_done_seq[rank] with 0 cross-rank all-reduce.
+void launch_dev3_finish_f32_hc_post(
+    const float* d_dev3_y_f32,
+    const uint32_t* d_dev3_done_seq,
+    uint32_t* d_rank_done_seq,
+    uint32_t dev3_req_seq,
+    const uint16_t* d_res_bf16,
+    const float* d_post_f32,
+    const float* d_comb_f32,
+    uint16_t* d_out_h_bf16,
+    int M,
+    hipStream_t stream);
+
+void launch_dev3_finish_f32_mhc_fused(
+    const float* d_dev3_y_f32,
+    const uint32_t* d_dev3_done_seq,
+    uint32_t* d_rank_done_seq,
+    uint32_t dev3_req_seq,
+    const uint16_t* d_res_bf16,
+    const float* d_post_f32,
+    const float* d_comb_f32,
+    uint16_t* d_out_h_bf16,
+    const float* d_next_pre_f32,
+    const uint16_t* d_next_norm_w,
+    uint16_t* d_out_norm_bf16,
+    uint16_t* d_out_raw_bf16,
+    uint8_t* d_out_fp8,
+    uint8_t* d_out_ue8m0,
+    float norm_eps,
+    int M,
+    hipStream_t stream);
 
 // Wave 8.5B standalone zero-scratch FP32 4-stream mHC update + H_pre contraction + RMSNorm + INT8 quant (+ optional BF16 norm):
 // 1 CTA/token row (M <= 16), 256 threads (20 channels/thread), ScratchSize == 0, VGPRs <= 64.
@@ -504,6 +581,32 @@ void launch_indexer_candidates_and_topk(
     int M, int T_comp, int start_pos, int ratio,
     int mode,                       // 0 = plain topk, 1 = layer 20 candidate source + topk, 2 = candidate consumer + topk
     int K_out,                      // min(512, T_comp)
+    hipStream_t stream,
+    TreeAncMask256 tree_anc_mask = {},
+    uint64_t tree_depth_nibbles = 0ULL,
+    int q_row_offset = 0,
+    int32_t* d_cand_block_ids = nullptr,   // Optional Wave 9.4 compact [M, 2048] ascending candidate block IDs
+    int32_t* d_cand_block_cnt = nullptr);  // Optional Wave 9.4 [M] count of valid candidate blocks (<= 2048)
+
+// Wave 9.4 Phase D: Candidate-masked mode==2 indexer score (scores ONLY <= 16,384 candidate keys = 21x faster @ 340K, 64x @ 1M!)
+void launch_w94_indexer_score_cand(
+    const uint16_t* d_q_bf16,
+    const uint8_t*  d_k_fp4,
+    const uint8_t*  d_k_ue8m0,
+    const uint16_t* d_weights_bf16,
+    const int32_t*  d_cand_block_ids,  // [M, 2048]
+    const int32_t*  d_cand_block_cnt,  // [M]
+    float* d_out_score_f32,            // [M, K_cand]
+    int M, int ih_cnt, int T_comp, int K_cand,
+    hipStream_t stream);
+
+// Wave 9.4 Phase D: Compact mode==2 top-K over [M, K_cand] -> exact global ascending top-512 indices!
+void launch_w94_indexer_cand_topk(
+    float* d_score_f32,                // [M, K_cand]
+    const int32_t* d_cand_block_ids,   // [M, 2048]
+    const int32_t* d_cand_block_cnt,   // [M]
+    int32_t* d_out_comp_idxs,          // [M, K_out]
+    int M, int T_comp, int K_cand, int start_pos, int ratio, int K_out,
     hipStream_t stream,
     TreeAncMask256 tree_anc_mask = {},
     uint64_t tree_depth_nibbles = 0ULL,

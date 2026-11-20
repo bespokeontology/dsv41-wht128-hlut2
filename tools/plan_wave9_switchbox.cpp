@@ -181,8 +181,64 @@ int main() {
 
     dsv41::p150_hlut3_geometry_report();
 
+    // ---- Wave 9.2 Heterogeneous SB-M4-P2-176G (3x 32 GiB + 1x 16 GiB MI50 + 2x 32 GiB P150A = 176 GiB) ----
+    // Exact DeepSeek-V4.1-Flash-1017 geometry: H = 5120, I = 2304, TP3 I_tp = 768.
+    constexpr uint64_t kUnshardedHlut3ExpBytes = dsv41::kHlut3UnshardedExpertBytes; // 13,824,000 B (13.18359375 MiB)
+    constexpr uint64_t kTp3ShardedHlut3Bytes   = dsv41::kHlut3Tp3RankExpertBytes;   //  4,608,000 B ( 4.39453125 MiB)
+    constexpr uint64_t kTp3ShardedHlut2Bytes   = 3ULL * (983'040ULL + 61'440ULL + 8ULL); // 3,133,464 B (2.988304 MiB)
+    constexpr uint64_t kMtpSharedTp3RankBytes  = 2ULL * 768ULL * 5120ULL + 2ULL * 24ULL * 160ULL +
+                                                 5120ULL * 768ULL + 160ULL * 24ULL;      // 11,809,280 B (11.262207 MiB/blk)
+    constexpr uint64_t kMtpSharedUnshardBytes  = 3ULL * kMtpSharedTp3RankBytes;          // 35,427,840 B (33.786621 MiB/blk)
+    constexpr uint64_t kDev3TotalBytes         = 16'368ULL * 1024ULL * 1024ULL;          // 16,368.0 MiB (0000:85:00.0)
+    constexpr uint64_t kDev3HardCapBytes       = 15'360ULL * 1024ULL * 1024ULL;          // 15,360.0 MiB hard guard
+    constexpr uint64_t kDev3TargetCapBytes     = 15'000ULL * 1024ULL * 1024ULL;          // 15,000.0 MiB target ceiling
+    constexpr uint64_t kDev3ScratchAndRocrBytes= (37ULL + 90ULL) * 1024ULL * 1024ULL;    // 37 MiB M=512 scratch + 90 MiB ROCr
+    constexpr uint64_t kTp3Hlut3ScratchBytes   = 2ULL * 512ULL * 768ULL * 4ULL + 512ULL * 6ULL * 16ULL; // ~3.05 MiB
+
+    const uint64_t dev3_mtp_bytes  = 384ULL * kUnshardedHlut3ExpBytes + 3ULL * kMtpSharedUnshardBytes;
+    const uint64_t dev3_bb_bytes   = 720ULL * kUnshardedHlut3ExpBytes;
+    const uint64_t dev3_used_bytes = dev3_mtp_bytes + dev3_bb_bytes + kDev3ScratchAndRocrBytes;
+    const uint64_t dev3_free_bytes = kDev3TotalBytes - dev3_used_bytes;
+
+    const uint64_t tp3_mtp_reclaim_bytes   = 384ULL * kTp3ShardedHlut2Bytes + 3ULL * kMtpSharedTp3RankBytes;
+    const uint64_t tp3_tier1_compact_bytes = 720ULL * kTp3ShardedHlut2Bytes;
+    const uint64_t tp3_tier2_delta_bytes   = 600ULL * (kTp3ShardedHlut3Bytes - kTp3ShardedHlut2Bytes) + kTp3Hlut3ScratchBytes;
+
+    // Measured Wave 8.5 1,048,576-ctx + ViT free HBM2 baselines (MiB):
+    const double base_free_tp0 = 266.0; // 0000:C7:00.0 (32 GiB)
+    const double base_free_tp1 = 268.0; // 0000:88:00.0 (32 GiB switchbox)
+    const double base_free_tp2_smi = 87.1; // 0000:03:00.0 actual rocm-smi free (display + ViT)
+
+    const double opt_a_delta_mib = bytes_to_mib(tp3_mtp_reclaim_bytes + tp3_tier1_compact_bytes);
+    const double opt_b_uncomp_delta_mib = bytes_to_mib(tp3_mtp_reclaim_bytes) - bytes_to_mib(tp3_tier2_delta_bytes);
+    const double opt_b_comp_delta_mib   = bytes_to_mib(tp3_mtp_reclaim_bytes + tp3_tier1_compact_bytes) - bytes_to_mib(tp3_tier2_delta_bytes);
+
+    const bool sb176_dev3_ok = (dev3_used_bytes <= kDev3TargetCapBytes) && (dev3_used_bytes <= kDev3HardCapBytes) &&
+                               (bytes_to_mib(dev3_free_bytes) >= 1350.0);
+    const bool sb176_tp_ok   = (base_free_tp0 + opt_b_comp_delta_mib >= 500.0) &&
+                               (base_free_tp1 + opt_b_comp_delta_mib >= 500.0) &&
+                               (base_free_tp2_smi + opt_b_comp_delta_mib >= 350.0);
+
+    std::printf("\n=== WAVE 9.2 ASYMMETRIC HETEROGENEOUS SKU: SB-M4-P2-176G (1M CTX + ViT) ===\n");
+    std::printf("[SB-M4-P2-176G] Topology : 3x 32 GiB MI50 (C7/88/03 TP3) + 1x 16 GiB MI50 (85:00.0 dev3) + 2x 32 GiB P150A (TP2) = 176 GiB\n");
+    std::printf("[SB-M4-P2-176G] Option A : 1,104 HLUT3 experts (384 MTP + 720 dev3 BB) | TP3 delta = +%.2f MiB/rank\n", opt_a_delta_mib);
+    std::printf("[SB-M4-P2-176G] Option B : 1,704 HLUT3 experts (384 MTP + 720 dev3 BB + 600 TP3 BB)\n");
+    std::printf("  - dev3 (0000:85:00.0, 16 GiB) : used=%.2f MiB (<= 15,000 target / 15,360 hard cap) free=%.2f MiB (>= 1,350) -> %s\n",
+                bytes_to_mib(dev3_used_bytes), bytes_to_mib(dev3_free_bytes), sb176_dev3_ok ? "PASS" : "FAIL");
+    std::printf("  - TP3 Option B (uncompacted)  : net=+%.2f MiB/rank -> C7=%.1f MiB, 88=%.1f MiB, 03(smi)=%.1f MiB\n",
+                opt_b_uncomp_delta_mib,
+                base_free_tp0 + opt_b_uncomp_delta_mib,
+                base_free_tp1 + opt_b_uncomp_delta_mib,
+                base_free_tp2_smi + opt_b_uncomp_delta_mib);
+    std::printf("  - TP3 Option B (compacted)    : net=+%.2f MiB/rank -> C7=%.1f MiB, 88=%.1f MiB, 03(smi)=%.1f MiB -> %s\n",
+                opt_b_comp_delta_mib,
+                base_free_tp0 + opt_b_comp_delta_mib,
+                base_free_tp1 + opt_b_comp_delta_mib,
+                base_free_tp2_smi + opt_b_comp_delta_mib,
+                sb176_tp_ok ? "PASS" : "FAIL");
+
     const bool ok =
-        (rows.size() == 8u) && all_fit &&
+        (rows.size() == 8u) && all_fit && sb176_dev3_ok && sb176_tp_ok &&
         (dsv41::kP150Hlut3MaxHotShards == 11u) &&
         (dsv41::kP150Hlut3BankBytesAt11 == 1'413'248u) &&
         (dsv41::kP150L1Fabric1DBankBytes == 1'459'200u) &&

@@ -36,17 +36,18 @@ void kernel_main() {
         cb_wait_front(16, 2);
         if (cnt > 0u) {
             const uint32_t rd_l1 = get_read_ptr(16);
-            const uint32_t* tile0 = reinterpret_cast<const uint32_t*>(rd_l1);
-            const uint32_t* tile1 = reinterpret_cast<const uint32_t*>(rd_l1 + 4096u);
+            const uint64_t* tile0 = reinterpret_cast<const uint64_t*>(rd_l1);
+            const uint64_t* tile1 = reinterpret_cast<const uint64_t*>(rd_l1 + 4096u);
 
             for (uint32_t r = 0; r < cnt; ++r) {
-                uint32_t* row_out = reinterpret_cast<uint32_t*>(scatter_l1 + r * 256u);
-                const uint32_t f_base = ((r >= 16u) ? 512u : 0u) + (r & 15u) * 16u;
-                for (uint32_t c = 0; c < 16u; ++c) {
+                uint64_t* row_out = reinterpret_cast<uint64_t*>(scatter_l1 + r * 256u);
+                const uint32_t f_base = ((r >= 16u) ? 256u : 0u) + (r & 15u) * 8u;
+                #pragma GCC unroll 8
+                for (uint32_t c = 0; c < 8u; ++c) {
                     row_out[0u  + c] = tile0[f_base + c];
-                    row_out[16u + c] = tile0[f_base + 256u + c];
-                    row_out[32u + c] = tile1[f_base + c];
-                    row_out[48u + c] = tile1[f_base + 256u + c];
+                    row_out[8u  + c] = tile0[f_base + 128u + c];
+                    row_out[16u + c] = tile1[f_base + c];
+                    row_out[24u + c] = tile1[f_base + 128u + c];
                 }
                 const uint32_t dst_row = row_idx[r];
                 noc_async_write(scatter_l1 + r * 256u, y_acc.get_noc_addr(dst_row * 5u + page_grp, byte_off), 256u);

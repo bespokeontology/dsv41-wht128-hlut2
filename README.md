@@ -1,140 +1,106 @@
-# `WHT128-HLUT2` + `2,182`-Expert `TARQ RAREBAL-LDLQ` (`2.125 bpw → FP32`) on `2× Custom TSMC 6nm Tenstorrent Blackhole P150A` ASICs: `1M`-Context Multimodal C++ Engine for 763B `DeepSeek-V4.1-Flash-1017` (`v1.5.0-wave8.5`)
+# `WHT128-HLUT3` (`3.125 bpw`, `1,704` `TARQ RAREBAL-LDLQ` Experts) + `WHT128-HLUT2` on `4× MI50` + `2× Blackhole P150A` (`176 GiB` Switchbox): `1M`-Context Multimodal Pure-C++ Engine for 763B `DeepSeek-V4.1-Flash-1017` (`v2.0.0-wave9.4-hlut3`)
 
-**Authors:** [**`bespokeontology`**](https://github.com/bespokeontology) — Heterogeneous Silicon & Quantization Co-Design Engineering · **100% Pure [`TT-Metal`](https://github.com/tenstorrent/tt-metal) C++20 / `gfx906` HIP / Host C++17 (`0` Python Files, `-Werror`)**  
-📄 **[4-Page Illustrated Whitepaper (PDF)](docs/WHT128_HLUT2_Blackhole_P150A_Whitepaper.pdf)** · 📘 **[Full `v1.5.0-wave8.5` Engineering Report (`docs/WHT128_HLUT2_ENGINEERING_REPORT.md`)](docs/WHT128_HLUT2_ENGINEERING_REPORT.md)** · 🧾 **[`1M` E2E Silicon Receipt (`docs/WAVE8_5_1M_E2E_RECEIPT.md`)](docs/WAVE8_5_1M_E2E_RECEIPT.md)** · 🧪 **[Self-Hosted Wave 9 `WHT128-HLUT3` Report (`docs/WAVE9_HLUT3_SELFHOST_REPORT.md`)](docs/WAVE9_HLUT3_SELFHOST_REPORT.md)** · 🚀 **[`v1.4.0-wave8.4` Release](https://github.com/bespokeontology/dsv41-wht128-hlut2/releases/tag/v1.4.0-wave8.4)**
-
----
-
-## `v1.5.0-wave8.5` Release Highlights (Wave 8.5 Canonical + Self-Hosted Wave 9 `WHT128-HLUT3` Foundation)
-
-* **Wave 8.5 — `2,182`-Expert Starvation-Safe [`TARQ RAREBAL-LDLQ`](https://arxiv.org/pdf/2605.27808) (`99.47%` `DSpark` Hit Coverage), Cross-Sublayer `mHC` + `DSpark` Epilogue Fusion (`116/116` Zero-Scratch `gfx906`), & Full `1M` E2E Silicon Gate:** Expands [`TARQ RAREBAL-LDLQ`](https://arxiv.org/pdf/2605.27808) over a `2.05M`-token zero-PII multimodal (`DeepSeek-ViT`) + C++20/HIP/TT-Metal + formal math + DSML corpus (`M_cal >= 10,240`, `M_eval = 512`) to **`2,182` calibrated experts** (`1,996` main backbone + **`186` [`DSpark`](https://rocm.docs.amd.com/projects/atom/en/latest/deepseek_v41_dspark.html) `mtp.0..2` drafters = `99.47%` draft hit coverage** + **`18/18` (`36/36` TP2) `P150A` L1 shards**; `dual_receipt_violations = 0`, mean SwiGLU cosine `0.88344 → 0.95456`, **`+4.63 dB`** mean SNR gain, `0 B` extra VRAM). Fuses `HostRingAllReduce + mHC post/res + next-sublayer H_pre contraction + RMSNorm + FP8/INT8/WHT128`, 1-launch `20,480 → 24 + 20-iter Sinkhorn`, `inv_rope_tail64 + UE8M0/32`, `DSpark ConfidenceHead` projection, `L1v` `__ATOMIC_RELEASE`/`__ATOMIC_ACQUIRE` cache-key fences, and `DSML` bare-parameter quarantine (`116/116` compiled `gfx906` kernels at `ScratchSize == 0`), cutting short-context backbone latency **`-9.81 ms/step` (`97.39 → 87.58 ms/step`)** and delivering **`58.58 tok/s`** (`95.0%` `DSpark` acc, `τ = 5.70`) at `23.2K` ctx, **`623.0 tok/s`** fresh prefill, **`45.88 tok/s`** at `230.8K` ctx, **`42.05 tok/s`** at `288.2K` ctx, **`40.11 tok/s`** at `360.0K` ctx, **`34.26 tok/s`** at `390.2K` ctx, **`451,094 tok/s`** cold NVMe `.kvblk` hydration of **`391,936` tokens in `0.869 s`** (`0 B` disk SWA), and full **`1,048,576`-token (`1M`) E2E silicon verification in `59.06 s`** (`268 / 270 / 696 MiB` free HBM2 w/ ViT, `100.000%` `HSI` top-64 overlap across `8,192` blocks, `CSA2` `cosine = 1.00000000`, `3/3` needles, `32` `M = 8` bursts to `pos = 1,048,575`, `6.74 ms` cold `.kvblk` hydration + `128`-tok SWA replay `enc_cos = 1.00000000` / `dec_cos = 1.00000000`).
-* **Self-Hosted Wave 9 — `WHT128-HLUT3` (`3.125 bpw`, `400 B` Tile / `6,400 B` `P150A` Superblock) Built Live by `DeepSeek-V4.1-Flash-1017` (`177` Tool Steps to `395.7K` Context):** Authored, debugged, compiled under `-Werror`, and verified on live `gfx906` silicon by the live Wave 8.5 engine itself across **`177` cumulative agentic tool steps** up to **`395,743` active context tokens** spanning two mid-campaign cold NVMe `.kvblk` restarts (`232.1K` and `391.9K` tokens). Solves the exact 8-level symmetric [Gaussian Lloyd-Max](https://web.stanford.edu/class/ee398a/handouts/papers/Max%20-%20Quantizing%20for%20Min%20Distortion.pdf) fixed point (`c = {0.24509418, 0.75600528, 1.34390928, 2.15194570}`, `SQNR_3 = 14.6158 dB`, **`+5.3155 dB`** over `HLUT2`), achieves **`0.98541` held-out SwiGLU cosine (`15.38 dB` SNR, `+5.16 dB` over `HLUT2+RAREBAL`)** and **`0.999999999` GPU-vs-CPU parity** on real Layer-6 routed `MXFP4` weights, fits **`11` hot shards/card (`1,413,248 B <= 1,459,200 B`, `+45,952 B` margin)** in `P150A` `FABRIC_1D` L1 SRAM, adds opt-in `--hlut3-mtp-overlay <path>` (`0 B` HBM2 delta when unset), and provides deterministic `4×–7× MI50` + `2×–3× P150A` PCIe switchbox planning (`plan_wave9_switchbox`).
-* **Wave 8.4 — Cross-Tier `384`-Expert Minimax Balancer (`445` Swaps), `18/18` `P150A` L1 Shards + `x16 -> FABRIC_1D` Relay, & `v_dot2_f32_f16` `CSA2`:** Rebalances all `40 × 384` sparse routed experts across `P150A` L1 SRAM (`18` hottest/layer = `161.37 MiB`), `3× MI50` `3.07 TB/s` HBM2 (`216` warm-hot/layer), and `2× P150A` GDDR6 (`150` coldest long-tail/layer) via bit-exact `TP3 <-> TP2` repacking (`445` swapped pairs, logical-first `k_moe_gate` bias invariance `cos = 1.000000000`), relays Card `#1` traffic through Card `#0` `PCIe x16 -> 4× 800G FABRIC_1D` (`7/7` `MeshTrace` `parity_cos == 1.0000000`), and pairs pre-`dlopen` [ROCm `GPU_MAX_HW_QUEUES=8`](https://codimd.web.cern.ch/G3gNEdGjQEaH8_QcpW3bMQ/slide) with [`gfx906` `v_dot2_f32_f16`](https://rocm.docs.amd.com/projects/llvm-project/en/latest/LLVM/llvm/html/AMDGPU/AMDGPUAsmGFX906.html) `HSI` scoring and 10-split register-Q [`CSA2`](https://zartbot.github.io/blog/model_arch/dsv41flash_arch/en.html) `shared-tree8`.
-* **Wave 8.3 — Single-Pass `ConfidenceHead` `Dynamic DeepSelect8` (`M = 8` SGPR Causal Tree Across `0–1M` Context):** `deep_select_top7_confidence_tree8` (`Dsv41DeepSelectPlan8`) scores a `16`-node (`depths 0..5`) single-pass `DSpark` candidate pool (`4` MTP micro-batches `B = 3, 2, 1, 1` = `7` rows, `+0.34 ms` drafter cost, `0 B` extra HBM2) via `confidence_head.proj.weight` (`[1, 5,376]`) and compiles dynamic `64`-bit SGPR `anc_mask64`, `depth_nibbles32`, `parent_nibbles32`, and `valid_node_mask` (`0` invalid filler acceptances across `100,000` shortage sweeps, **`max_TV_M8 = 2.463e-16 < 1e-14`**).
-* **Wave 8.1 & 8.2 — Native Pure-C++/HIP `DeepSeek-ViT` (`253.45 MiB`), [`DeepInfer`](https://github.com/deepseek-ai/DeepInfer/blob/main/doc/inference_deployment_qa.md) Pure-Block Cold NVMe `CSA2` KV (`0 B` Disk SWA), & `PromptSegment` Anti-Injection:** Streams `BF16` `DeepSeek-ViT` on `tp = 2` (`268.0 / 270.0 / 696.0 MiB` free HBM2 at `1M`), persists `114,496 B` `.kvblk` records (`0 B` disk SWA, `128`-token bounded `Encoder SWA` cold replay `enc_cos = 1.00000000`, `dec_cos = 1.00000000`), enforces `PromptSegment` type-level anti-injection (`0` structural ID leaks on `18,476 B` hostile C++ payloads), and cuts host sampling `smp` **`-81%`**.
+**Authors:** [**`bespokeontology`**](https://github.com/bespokeontology) — Heterogeneous Silicon & Quantization Co-Design Engineering · **100% Pure [`TT-Metal`](https://github.com/tenstorrent/tt-metal) C++20 / `gfx906` HIP / Host C++17 (`0` Python Files, `-Wall -Wextra -Werror`, `164/164` Zero-Scratch `gfx906` Kernels)**  
+🚀 **[Wave 9.4 Ultra Engineering Report (`docs/WAVE9_4_ULTRA_PERF_REPORT.md`)](docs/WAVE9_4_ULTRA_PERF_REPORT.md)** · 🧾 **[Wave 9.4 `1M` E2E Silicon Receipt (`docs/WAVE9_4_1M_E2E_RECEIPT.md`)](docs/WAVE9_4_1M_E2E_RECEIPT.md)** · ⚙️ **[Wave 9.2 `176G` Switchbox Report (`docs/WAVE9_2_176G_SWITCHBOX_REPORT.md`)](docs/WAVE9_2_176G_SWITCHBOX_REPORT.md)** · ⚡ **[Wave 9.3 Perf Report (`docs/WAVE9_3_OVERNIGHT_PERF_REPORT.md`)](docs/WAVE9_3_OVERNIGHT_PERF_REPORT.md)** · 📄 **[Illustrated Whitepaper PDF (`docs/WHT128_HLUT2_Blackhole_P150A_Whitepaper.pdf`)](docs/WHT128_HLUT2_Blackhole_P150A_Whitepaper.pdf)** · 🏷️ **[`v1.5.0-wave8.5` Baseline](https://github.com/bespokeontology/dsv41-wht128-hlut2/releases/tag/v1.5.0-wave8.5)**
 
 ---
 
-## Heterogeneous Silicon Architecture (`2× Blackhole P150A` + `3× MI50` + `EPYC` Dual-NVMe)
+## `v2.0.0-wave9.4-hlut3` Release Highlights (Waves 9.2 → 9.4 Ultra)
 
-This repository contains the clean-room, zero-Python production multimodal inference engine and custom **`WHT128-HLUT2` + `2,182`-Expert `TARQ RAREBAL-LDLQ` (`2.125 bpw → IEEE FP32`)** quantization & cross-tier MoE balancer stack for **[`deepseek-ai/DeepSeek-V4.1-Flash-1017`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)** up to **`1,048,576` (`1M`) active context tokens**:
-
-1. **[`2× Tenstorrent Blackhole P150A`](https://docs.tenstorrent.com/aibs/blackhole/index.html) Custom TSMC `6nm` (`N6`) Spatial Dataflow ASICs (Lead L1-Hot & Long-Tail Sparse MoE Tier):** `220` compute Tensix cores (`2 × 110`, each with `5` RISC-V baby cores + `32×32` `HiFi2`/`FP32` Matrix Engine + `32`-lane Vector `SFPU` + dual `NoC` routers), `64 GiB` GDDR6 (`MP`), and **`2× 180 MB = 360 MB` on-die Tensix L1 SRAM** (**`18/18` pinned hot shards/card = `36/36` TP2 shards = `161.37 MiB` pure L1 weights** with **`+11,264 B` bank `0-0` margin** alongside `100%` L1-resident `x_decode` and `finish_decode[0..1]`; `7/7` `MeshTrace` shapes `parity_cos == 1.0000000` at `0.72 ms` `M = 1`, `2.18 ms` `M = 6`, `3.47 ms` `M = 8`, `4.59 ms` `M = 16`), cross-wired via **`4× 800G` QSFP-DD cables** (`3.2 Tbps` `FABRIC_1D` TP2) with **Card `#0` `PCIe x16 -> FABRIC_1D` relay (`--p150-x16-relay`)** bypassing Card `#1`'s narrow `PCIe x4` host riser (`623.0 tok/s` fresh prefill).
-2. **`3× AMD Instinct MI50` (Warm-Hot `216`-Expert MoE, Fused `mHC` Backbone, `DeepSeek-ViT`, `1M` Tiered `CSA2`, `Dynamic DeepSelect8`, & Opt-In `HLUT3` Tier):** `96 GiB` HBM2 (`3.07 TB/s` aggregate, `Vega20 gfx906` TP3, **`116/116` compiled `gfx906` kernels [`106` runtime+ViT + `5` `HLUT3` + `5` verifiers] at `ScratchSize == 0`**, pre-`dlopen` `GPU_MAX_HW_QUEUES=8`, `0` PCIe BAR P2P reads via coherent pinned-`DDR4` `FP32` `HostRingAllReduce`, cross-sublayer fused `mHC` + `RMSNorm` + `DSpark` epilogue [`87.58 ms/step`], logical-first `d_expert_perm[40 * 384]` router remap [`445` cross-tier swaps, `cos = 1.000000000`], `55`-VGPR `v_dot2_f32_f16` `k_indexer_score_msplit<8>`, 10-split register-Q `CSA2` `shared-tree8`, `253.45 MiB` streamed `BF16` `DeepSeek-ViT` on `tp = 2`, `Dynamic DeepSelect8` backed by **`186` `RAREBAL` `mtp.0..2` drafter experts [`99.47%` hit coverage]**, and opt-in `--hlut3-mtp-overlay` `400 B/tile` decode kernels).
-3. **`AMD EPYC` + Dual NVMe (`Engram`, Sub-Second `392K` Cold NVMe `.kvblk` Persistence, `1M` Warm KV Ring, & SSE Tier):** `384 GiB` DDR4 hosting `188.83 GiB` pre-faulted native `FP8 E4M3` `Engram` tables (`207.69 GB/s` warm hydration in `0.98 s`, `0.0009 ms/chunk` `M = 512` double-buffered prefill overlap), `114,496 B` `.kvblk` pure-block cold NVMe `CSA2` persistence (`0 B` disk SWA, **`391,936` tokens hydrated in `0.869 s` at `451,094 tok/s`**), `64`-block (`86.371 MiB`) RAM `EncoderStateBlock` ring, coherent mapped pinned-DDR4 warm `CSA2` KV (**`1,048,576` (`1M`) verified end-to-end on silicon**; **`395,743` multimodal + C++20/HIP agentic & `417,556` text verified live context**), and pure-C++ `/v1/chat/completions` + `/anthropic/v1/messages` SSE + POSIX search sidecar.
-
----
-
-## Repository Structure (`p150/` Lead Hierarchy)
-
-```text
-├── p150/                  # 2x Custom TSMC 6nm Tenstorrent Blackhole P150A TT-Metal C++20 FABRIC_1D TP2 engine
-│   ├── kernels/           # 13 Tensix compute/NoC kernels (O(1) l1_slot_lut, x16->FABRIC_1D relay, HiFi2 -> FP32 Dst)
-│   ├── dsv41_p150_l1.hpp  # Tier-2 FABRIC_1D per-bank L1 budget (18/18 hot shards = 161.37 MiB + +11,264 B margin)
-│   ├── dsv41_p150_hlut3_spec.hpp # Wave 9: 6,400 B HLUT3 superblock & 11-shard (1,413,248 B <= 1,459,200 B) L1 spec
-│   ├── dsv41_p150_shm.hpp # Lock-free 4-slot 25,680 KiB /dev/shm fast ring + M=1..1024 mailbox
-│   ├── p150_dsv41_engine.cpp
-│   └── p150_dsv41_worker.cpp
-├── src/                   # WHT128-HLUT2 (2.125 bpw), Wave 9 WHT128-HLUT3 (3.125 bpw), RAREBAL-LDLQ, & mmap
-│   ├── hlut2_pack.hpp
-│   ├── hlut3_pack.hpp
-│   ├── dsv41_hlut3_rarebal.hpp
-│   ├── dsv41_pack_format.hpp
-│   ├── dsv41_rarebal.hpp
-│   ├── dsv41_wave8_4_repack.hpp
-│   └── safetensors_mmap.hpp
-├── mi50/                  # 3x MI50 (gfx906 TP3) 111/111 runtime+HLUT3 zero-scratch HIP kernels, ViT, NVMe KV, & SSE
-│   ├── dsv41_mi50_kernels.hip              # Fused mHC/Sinkhorn/DSpark + v_dot2_f32_f16 HSI + 10-split CSA2 tree8
-│   ├── dsv41_hlut3_kernels.{hpp,hip}       # Wave 9: Zero-scratch 400 B/tile WHT128-HLUT3 TP3 decode kernels
-│   ├── dsv41_vit.{hpp,cpp}                 # Wave 8.1: Pure-C++/HIP DeepSeek-ViT + 2D-RoPE + 3x3 unshuffle + Aligner
-│   ├── dsv41_nvme_kv_cache.hpp             # Wave 8.2: 114,496 B .kvblk pure-block cold NVMe CSA2 KV (0 B disk SWA)
-│   ├── dsv41_kolmogorov_tree_verifier.hpp  # Wave 8.3: Dynamic DeepSelect8 + valid_node_mask (max_TV = 2.463e-16)
-│   ├── dsv41_tree_spec.hpp                 # Dynamic 64-bit SGPR M=8 & TreeAncMask256 M=16 causal-tree topologies
-│   ├── dsv41_anthropic_messages.hpp        # PromptSegment anti-injection + /anthropic/v1/messages + multimodal spans
-│   ├── dsv41_runtime.cpp
-│   ├── dsv41_engram_cpu.cpp
-│   ├── dsv41_think_loop_guard.hpp
-│   ├── dsv41_tokenizer_dsml.cpp
-│   └── dsv41_fe.cpp
-├── tools/                 # Pure-C++17 packers, 2,182-expert FP64 RAREBAL solver, & 1M silicon self-tests
-│   ├── build_wave8_5_rarebal.cpp           # Wave 8.5A: 2,182-expert starvation-safe FP64 TARQ RAREBAL-LDLQ solver
-│   ├── build_wave8_4_expert_perm.cpp       # Wave 8.4: Cross-tier 384-expert minimax balancer (445 swaps)
-│   ├── harvest_rarebal_wave8.cpp           # Zero-PII 2.05M-token multimodal + C++20/HIP/math/DSML harvester
-│   ├── verify_wave8_5.cpp                  # Wave 8.5: 2,182-expert audit + fused mHC / Sinkhorn / DSpark parity
-│   ├── verify_wave8_5_1m_e2e.cpp           # Wave 8.5C: Full 1,048,576-token (1M) E2E silicon verification suite
-│   ├── verify_wave9_hlut3.cpp              # Wave 9: Analytic Lloyd-Max + 400B/6400B pack + MI50 HLUT3 parity
-│   ├── bench_hlut3_mi50.cpp                # Wave 9: 5-baseline real MXFP4 SwiGLU Dual Receipt + MI50 bench
-│   ├── plan_wave9_switchbox.cpp            # Wave 9: Deterministic 4x-7x MI50 + 2x-3x P150A switchbox planner
-│   ├── verify_wave8_4.cpp
-│   ├── pack_dsv41_hlut2.cpp
-│   ├── pack_dsv41_vit.cpp
-│   ├── repack_hot_experts_rarebal.cpp
-│   ├── dsv41_search_sidecar.cpp
-│   ├── verify_wave5_all.cpp
-│   ├── verify_wave6_math.cpp
-│   ├── verify_wave7_opt.cpp
-│   ├── verify_wave8_opt.cpp
-│   ├── verify_wave8_1_nvme_kv.cpp
-│   ├── verify_wave8_1_vit.cpp
-│   ├── verify_wave8_2_deepinfer.cpp
-│   └── test_anthropic_messages_fe.cpp
-├── scripts/               # Parameterized production launchers (GPU_MAX_HW_QUEUES=8, --p150-x16-relay, fused mHC)
-│   ├── run_p150_worker.sh
-│   └── run_dsv41_fe.sh
-├── docs/
-│   ├── WHT128_HLUT2_Blackhole_P150A_Whitepaper.pdf
-│   ├── WHT128_HLUT2_ENGINEERING_REPORT.md
-│   ├── WAVE8_5_1M_E2E_RECEIPT.md
-│   └── WAVE9_HLUT3_SELFHOST_REPORT.md
-└── manifests/
-    ├── wave8_5_receipt_manifest.txt
-    ├── WAVE8_5_RELEASE_RECEIPT.md
-    ├── wave9_verify.log
-    ├── wave9_bench_hlut3.log
-    ├── wave9_switchbox.log
-    ├── wave8_4_receipt_manifest.txt
-    ├── WAVE8_4_RELEASE_RECEIPT.md
-    ├── CANONICAL_RELEASE.json
-    └── SHA256SUMS.txt
-```
+* **`WHT128-HLUT3` (`3.125 bpw`, `400 B` `32×32` Tile, `+5.3 to +6.1 dB` SNR over `HLUT2`) on `SB-M4-P2-176G` (`4× MI50` + `2× Blackhole P150A` = `176 GiB`):** Promotes **`1,704`** hottest experts calibrated via `FP64` [`TARQ RAREBAL-LDLQ`](https://arxiv.org/pdf/2605.27808) (`602K`-token multi-domain + `DeepSeek-ViT` corpus) into exact 8-level symmetric Gaussian Lloyd-Max `WHT128-HLUT3` (`c = {0.24509418, 0.75600528, 1.34390928, 2.15194570}`, `+5.32 dB` theoretical / `+5.3 to +6.1 dB` empirical SNR over `HLUT2`):
+  - **Tier-0 Asymmetric `dev3` MTP Offload (`384/384` `DSpark` drafters = `100%` coverage):** Moves all `384` MTP routed experts unsharded onto a dedicated 4th `16 GiB` MI50 (`dev3`, e.g. `0000:85:00.0`), reclaiming `+1,204 MiB/rank` on every `32 GiB` TP3 card and eliminating TP3 all-reduce on MTP MoE.
+  - **Tier-1 Parallel `dev3` Backbone Offload (`720` hottest MI50 backbone experts):** Runs concurrently with TP3 + P150A MoE over a per-128-block **`INT8 + FP16-scale` H2D** and **`BF16` D2H** wire (`cos = 0.99995590`, `0 B` extra HBM2).
+  - **Tier-2 In-Place TP3 Backbone Promotion (`600` sharded TP3 backbone experts):** Packed cleanly into freed TP3 HBM2 alongside `7,320` compacted `HLUT2` MI50 experts and `6,720` `P150A` `HLUT2` experts (`[216..383]` invariant).
+* **Zero-PCIe-AtomicOp Broadcom `PEX88048` Switchbox Stability:** Eliminates `100%` of GPU-side `__HIP_MEMORY_SCOPE_SYSTEM` RMW atomics / `slc` atomics targeting pinned host DDR4. Every `HostRingAllReduce` CTA barrier (`d_write_cta`/`d_read_cta`) runs exclusively in each GPU's local HBM2 with `__HIP_MEMORY_SCOPE_AGENT`, delivering **`0` `ERREVENT_ATHUB_INTERRUPT` / `0` `CmpltAbrt` / `0` AER errors** across two MI50s hosted behind a non-AtomicOpsRouting Broadcom `PEX88048` PCIe switchbox throughout `544K`-token live sessions and full `1M` E2E runs.
+* **Wave 9.4 Ultra Throughput Stack (`P150A` + `MI50` + `CSA2` + Prefix-Preserving Effort):**
+  - **`2× Blackhole P150A` (`2.15×` device / `74×` host-wait speedup at `M=4096`):** `DSV41_P150_MAX_ROWS=4096` (`SHM_VERSION=4`), `kBatchSlots=24`, Expert-Grouped Contiguous Best-Fit Batch Packer, and fixed `op_traces` MeshTrace cache eviction (`9/9` silicon self-checks `parity_cos = 1.0000000`, `1,241.7 ms` P150A device time / `7.6 ms` wait at `M=4096`).
+  - **`4× MI50` `HHHS` `B=8` Strided-Batched `rocBLAS` & `128`-Aligned CED Chunking:** `FP16`-out / `FP32` `v_dot2_f32_f16` `HHHS` dispatch (`rocblas_expert_thresh=18`, `rocblas_hlut2_thresh=20`), `kMaxChunkM=4096`, `128`-aligned single-chunk tail collapse, cutting `COLD M=4096` wall latency **`5,882.9 → 4,604.1 ms` (`889.6 tok/s`, peak `913.9 tok/s` live cold GUI prefill)**.
+  - **Sub-Second `340K` Interactive Tool-Tail & `2.17×` Faster `340K` Decode Attention:** Compact `mode == 2` candidate scoring (`21.25×` less compute at `340K`, `64×` at `1M`), 60-CU Split-KV exact block-max + radix select, and TP0-only FP16-wire reduction (`6×` less PCIe traffic) with **100.000% bit-exact parity (`0/4096` diffs)** — cutting **`M=256 @ 340K` from `1,731.2 → 991.0 ms` (`1.75×`, `258.3 tok/s`)** and **`340K` decode attention from `78.53 → 36.23 ms` (`2.17×`, `HSI = 0.24–0.31 ms/step`)**.
+  - **Prefix-Preserving `reasoningEffort` Switching:** Fixed `prefix_base_effort` header (`index == 0`) paired with active-turn `<｜latest_reminder｜>` (`128828`) overrides preserves **`100.00%` (`Medium → Low` @ `266K`)** and **`99.73%` (`Low → Medium` @ `543K`)** KV prefix reuse with **zero cold re-prefill** on both OpenAI `/v1/chat/completions` and Anthropic `/anthropic/v1/messages`.
 
 ---
 
-## Build, Self-Test (`116/116` Zero-Scratch `gfx906`), & Launch (`1M` Multimodal Context)
+## Verified Wave 9.4 Ultra Benchmarks (`SB-M4-P2-176G`, Stock `225 W` MI50 Power Cap)
+
+### 1. Prefill & Interactive Tool-Tail Comparison (Wave 9.3 vs. Wave 9.4 Ultra)
+
+| Scenario | Cached KV | Fresh `M` | Wave 9.3 Wall (`ms` / `tok/s`) | Wave 9.4 Ultra Wall (`ms` / `tok/s`) | Speedup | Key Stage Reduction |
+| :--- | ---: | ---: | :---: | :---: | :---: | :--- |
+| **Tool-Tail `M=256 @ 340K`** | `348,160` | `256` | `1,731.2 ms` / `147.9 tok/s` | **`991.0 ms` / `258.3 tok/s`** | **`1.75×`** | HSI `725.1 → 174.3 ms` (`4.16×`), `dev3` wait `205.2 → 34.4 ms` |
+| **Cold Prefill `M=2048`** | `0` | `2,048` | `3,358.8 ms` / `609.7 tok/s` | **`2,744.6 ms` / `746.2 tok/s`** | **`1.22×`** | P150A dev `1,704.0 → 846.4 ms`, wait `363.2 → 5.2 ms` (`70×`) |
+| **Cold Prefill `M=4096`** | `0` | `4,096` | `5,882.9 ms` / `696.3 tok/s` | **`4,604.1 ms` / `889.6 tok/s`** | **`1.28×`** | P150A `2,665.8 → 1,241.7 ms` (`2.15×`), `dev3` `2,306.5 → 1,207.5 ms` |
+| **Live Cold GUI Prefill** | `0` | `8,981` | `~700 tok/s` | **`9.83 s` / `913.9 tok/s`** | **`1.31×`** | Full live SSE prompt ingestion |
+
+### 2. Decode Scaling (`T_step` / `Attn` Across `8K → 1M`) & Live `544K` GUI Stopwatch Telemetry
+
+Both **honest end-to-end wall-clock throughput** (`generated_tokens / generation_elapsed_s` over **`135,548` real generated tokens** across **`108` LLM steps / `152` tool calls** in the live `:3081` GUI) and **internal step latency (`T_step`, `Attn/step`, `tau`)** are reported side-by-side:
+
+| Regime / Context Band | Measurement Source | True Wall-Clock Avg (`tok/s`) | Peak (`tok/s`) | `T_step` (`ms`) | `Attn/step` (`ms`) | Avg `tau` | Notes |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :--- |
+| **`8K` Synthetic Burst** | `profile_wave9_4_breakdown` | **`52.15 tok/s`** | `52.15` | `102.27 ms` | `27.87 ms` | `5.25` | `94.4%` DSpark acc |
+| **`<= 160K` Live GUI** (`12.8K` gen) | `:3081` GUI (`15` reqs) | **`31.69 tok/s`** | **`54.46 tok/s`** (`11K`) | `108.54 ms` | `30.84 ms` (`64K`) | `3.44` | Peak cold ingest **`913.9 tok/s`** |
+| **`160K–350K` Live GUI** (`77.5K` gen) | `:3081` GUI (`26` reqs) | **`35.86 tok/s`** | **`56.00 tok/s`** (`230K`) | `113.43 ms` | **`36.23 ms`** (`340K`, **`2.17×`**) | `4.07` | Includes **`29,546`-tok** single-shot C++ gen @ **`44.74 tok/s`** & **`54.14 tok/s`** @ `319K` |
+| **`350K–544K` Live GUI** (`45.2K` gen) | `:3081` GUI (`67` reqs) | **`31.95 tok/s`** | **`52.37 tok/s`** (`408K`) | `121.05 ms` | `~38 ms` | `3.87` | **`51.37 tok/s`** @ `487K`, **`50.26 tok/s`** @ `533K`, `HSI = 0.25 ms/step` |
+| **Cold NVMe `.kvblk` + Live `DeepSeek-ViT`** | `:3081` Turn 4 (`544,210` ctx) | **`37.73 tok/s`** | `37.73` | `114.4 ms` | `37.7 ms` | `4.32` | **`543,744` tok reloaded cold from NVMe in `366.15 ms` (`1.49M tok/s` raw / `384K tok/s` full HBM2+SWA)** + `516.9 ms` ViT (`4/4` chart bars read exact!) |
+| **`1,048,576` (`1M`) E2E Silicon Gate** | `verify_wave8_5_1m_e2e` | **PASS** | `~41.5` (`tau=5.4`) | **`131.0 ms`** | **`51.0 ms`** | — | Free HBM2: **`1,738 / 1,740 / 2,164 MiB`** + `dev3` **`1,134 MiB`**; `100.000%` HSI recall; `3/3` needles HIT; `CSA2 cos=1.00000000`; `CRC32C=PASS` |
+
+---
+
+## Download, Reassemble, Verify, Build & Launch (`v2.0.0-wave9.4-hlut3`)
+
+### 1. Download & Reassemble Sanitized `WHT128-HLUT3` (`1,704`-Expert) Release Overlays
 
 ```bash
-# 1. Build offline tools, self-tests, 3x MI50 + ViT + HLUT3 runtime/server, and (when TT_METAL_HOME is set) 2x P150A worker
-export DSV41_ROOT=/path/to/dsv41-model-workspace
-export TT_METAL_HOME=/opt/tt-metal   # Tenstorrent Blackhole TT-Metal SDK install
+export DSV41_WEIGHTS_DIR=/path/to/dsv41-weights
+export DSV41_OVERLAY_DIR="$DSV41_WEIGHTS_DIR/wave9_2_overlays"
+mkdir -p "$DSV41_OVERLAY_DIR" && cd "$DSV41_OVERLAY_DIR"
+
+# Download all release assets for v2.0.0-wave9.4-hlut3
+gh release download v2.0.0-wave9.4-hlut3 --repo bespokeontology/dsv41-wht128-hlut2
+
+# Reassemble <1.90 GiB split chunks into canonical safetensors overlays
+cat wave9_2_dev3_hlut3.safetensors.part-* > wave9_2_dev3_hlut3.safetensors
+cat wave9_2_tp3_hlut3.safetensors.part-*  > wave9_2_tp3_hlut3.safetensors
+
+# Verify cryptographic SHA-256 integrity of every split part, reassembled overlay, and manifest
+sha256sum -c SHA256SUMS.txt
+```
+
+### 2. Clean Pure-C++ Build & Verification (`164/164` Zero-Scratch `gfx906`, `0` Python, `0` PII)
+
+```bash
+export DSV41_ROOT="$(pwd)"
+export ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
+export TT_METAL_HOME="${TT_METAL_HOME:-/opt/tt-metal}"
+
+# Build MI50 runtime/server, all pure-C++17 tools, and (when TT_METAL_HOME is present) 2x P150A worker
 make -j12
 
-# 2. Run pure host-CPU mathematical, Tier-2 L1 geometry, switchbox planner, & 116/116 zero-scratch gfx906 audits
-make check
-make audit-gfx906
-# Optional hardware-on-device PCIe coherency, ViT parity, Cold NVMe .kvblk, fused mHC, & 1M E2E GPU suite (when GPUs are idle):
-# make check-gpu
-# GPU_MAX_HW_QUEUES=8 ./bin/verify_wave8_5_1m_e2e
+# Run complete host verification, 164/164 zero-scratch gfx906 ISA audit, engine invariant audit, & zero-PII self-tests
+make -j12 check
+./bin/audit_zero_pii --self-test
+./bin/audit_zero_pii --root .
+```
 
-# 3. Pack contiguous BF16 DeepSeek-ViT weights once (lossless BF16, 0 Python)
-./bin/pack_dsv41_vit --packed-mi50-dir "$DSV41_ROOT/packed_mi50" --out-dir "$DSV41_ROOT/packed_vit"
+### 3. Launch `SB-M4-P2-176G` (`4× MI50` + `2× Blackhole P150A`) on `:8042`
 
-# 4. Launch 2x Blackhole P150A TP2 worker (18/18 L1 shards + x16->FABRIC_1D relay), search sidecar, and 1M multimodal server
-export GPU_MAX_HW_QUEUES="${GPU_MAX_HW_QUEUES:-8}"
+```bash
+export DSV41_ROOT="$(pwd)"
+export DSV41_WEIGHTS_DIR=/path/to/dsv41-weights
+export DSV41_OVERLAY_DIR="$DSV41_WEIGHTS_DIR/wave9_2_overlays"
+export DSV41_KV_CACHE_DIR="$DSV41_WEIGHTS_DIR/nvme_kv_cache"
+export DSV41_PORT=8042
+export DSV41_DEFAULT_EFFORT=65       # Prefix-preserving default effort (65 = Medium)
+export GPU_MAX_HW_QUEUES=8
 
-./bin/p150_dsv41_worker --model-dir "$DSV41_ROOT" \
-  --rarebal-overlay "$DSV41_ROOT/packed_rarebal_overlay_wave8_5/hot_experts_wave8_5.safetensors" \
-  --p150-l1-shards 18 --p150-x16-relay --reuse-shm &
+# 1. Start 2x Blackhole P150A TP2 worker (40/40 layers, kBatchSlots=24, x16->FABRIC_1D relay)
+./scripts/run_p150_worker.sh &
 
-./bin/dsv41_search_sidecar --host 127.0.0.1 --port "${DSV41_SEARCH_PORT:-8080}" &
+# 2. Start optional pure-C++ POSIX search sidecar
+./bin/dsv41_search_sidecar --host 127.0.0.1 --port "${DSV41_SEARCH_PORT:-8888}" &
 
-OMP_WAIT_POLICY=PASSIVE ./bin/dsv41_fe --model-dir "$DSV41_ROOT" \
-  --rarebal-overlay "$DSV41_ROOT/packed_rarebal_overlay_wave8_5/hot_experts_wave8_5.safetensors" \
-  --expert-perm-overlay "$DSV41_ROOT/packed_rarebal_overlay_wave8_5/hot_experts_wave8_5.safetensors" \
-  --vit-weights "$DSV41_ROOT/packed_vit/dsv41_vit_bf16.safetensors" \
-  --nvme-kv-cache-dir "$DSV41_ROOT/nvme_kv_cache" --nvme-kv-cache-gb 32 \
-  --search-url "${SEARCH_URL:-http://127.0.0.1:8080}" \
-  --port "${DSV41_PORT:-8000}" --max-seq-len 1048576 \
-  --dual-stream-overlap --csa2-shared-tree8 --fused-mhc-norm --fused-dspark-epilogue --dspark-tree-width auto
+# 3. Start 4x MI50 + DeepSeek-ViT + 1M NVMe CSA2 KV + OpenAI/Anthropic SSE server
+./scripts/run_dsv41_fe.sh
 ```
 
 ---

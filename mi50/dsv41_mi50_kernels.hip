@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -3049,7 +3050,9 @@ void k_indexer_candidates_and_topk(
     float* __restrict__ block_scores_scratch, // [M, ceil(T_comp/8)] when mode==1
     TreeAncMask256 tree_anc_mask,
     uint64_t tree_depth_nibbles,
-    int q_row_offset)
+    int q_row_offset,
+    int32_t* __restrict__ cand_block_ids,     // Optional [M, 2048] compact candidate block IDs
+    int32_t* __restrict__ cand_block_cnt)     // Optional [M] count of valid candidate blocks
 {
     __shared__ uint32_t s_hist[256];
     __shared__ uint32_t s_scalar[4];
@@ -3113,7 +3116,9 @@ void k_indexer_candidates_and_topk(
         float* bscores = block_scores_scratch + size_t(m) * size_t(num_blocks);
 
         uint32_t* cblk = cand_block_mask + size_t(m) * size_t(cand_block_stride);
-        for (int w = tid; w < num_words; w += 256) cblk[w] = 0u;
+        if (cand_block_mask != nullptr) {
+            for (int w = tid; w < num_words; w += 256) cblk[w] = 0u;
+        }
 
         for (int b = tid; b < num_blocks; b += 256) {
             if (last_blk0 >= 0 && b >= last_blk0 && b <= last_blk1) {
@@ -3130,15 +3135,29 @@ void k_indexer_candidates_and_topk(
         }
         __syncthreads();
 
+        int32_t* cid_row = (cand_block_ids != nullptr) ? (cand_block_ids + size_t(m) * 2048u) : nullptr;
         const int k_blk = min(2048, num_blocks);
         if (num_blocks <= 2048) {
+            if (tid == 0) s_scalar[0] = 0u;
+            __syncthreads();
             for (int b = tid; b < num_blocks; b += 256) {
-                if (bscores[b] > neg_inf) atomicOr(&cblk[b >> 5], 1u << (b & 31));
+                if (bscores[b] > neg_inf) {
+                    if (cand_block_mask != nullptr) atomicOr(&cblk[b >> 5], 1u << (b & 31));
+                    if (cid_row != nullptr) {
+                        const uint32_t pos = atomicAdd(&s_scalar[0], 1u);
+                        if (pos < 2048u) cid_row[pos] = b;
+                    }
+                }
+            }
+            __syncthreads();
+            if (tid == 0 && cand_block_cnt != nullptr) {
+                cand_block_cnt[m] = int32_t(min(2048u, s_scalar[0]));
             }
         } else {
             const uint32_t kth_u = d_radix_kth_largest(bscores, num_blocks, k_blk, s_hist, s_scalar);
             const uint32_t neg_inf_u = d_float_to_ordered_u32(neg_inf);
             if (tid == 0) {
+                s_scalar[0] = 0u;  // cid_row write cursor
                 s_scalar[2] = 0u;  // count strictly greater
             }
             __syncthreads();
@@ -3162,7 +3181,17 @@ void k_indexer_candidates_and_topk(
                         if (int(prev) > 0) keep = true;
                     }
                 }
-                if (keep) atomicOr(&cblk[b >> 5], 1u << (b & 31));
+                if (keep) {
+                    if (cand_block_mask != nullptr) atomicOr(&cblk[b >> 5], 1u << (b & 31));
+                    if (cid_row != nullptr) {
+                        const uint32_t pos = atomicAdd(&s_scalar[0], 1u);
+                        if (pos < 2048u) cid_row[pos] = b;
+                    }
+                }
+            }
+            __syncthreads();
+            if (tid == 0 && cand_block_cnt != nullptr) {
+                cand_block_cnt[m] = int32_t(min(2048u, s_scalar[0]));
             }
         }
         __syncthreads();
@@ -3244,6 +3273,607 @@ void k_indexer_candidates_and_topk(
                         s_sel[tid2] = b2;
                         s_sel[ixj2] = a2;
                     }
+                }
+                __syncthreads();
+            }
+        }
+    }
+
+    int32_t* dst = out_comp_idxs + size_t(m) * size_t(K_out);
+    for (int k = tid; k < K_out; k += 256) {
+        const int32_t v = s_sel[k];
+        dst[k] = (v < scan_len) ? v : -1;
+    }
+}
+
+// ============================================================================
+// Wave 9.4 Phase D: 60-CU Split-KV Indexer + Compact mode==2 Candidate Scoring
+// ============================================================================
+
+// Zero-scratch candidate-only v_dot2_f32_f16 indexer score for mode==2 (Layers 24, 28, 32, 36):
+// Scores ONLY <= 16,384 keys from Layer 20's top-2048 candidate blocks (21.25x faster @ 340K, 64x @ 1M!).
+__global__ __launch_bounds__(256, 4)
+void k_w94_indexer_score_cand(
+    const uint16_t* __restrict__ q_bf16,        // [M, ih_cnt, 128]
+    const uint8_t*  __restrict__ k_fp4,         // [T_comp, 64]
+    const uint8_t*  __restrict__ k_ue8m0,       // [T_comp, 4]
+    const uint16_t* __restrict__ weights_bf16,  // [M, ih_cnt]
+    const int32_t*  __restrict__ cand_block_ids,// [M, 2048]
+    const int32_t*  __restrict__ cand_block_cnt,// [M]
+    float*          __restrict__ out_score,     // [M, K_cand]
+    int ih_cnt, int T_comp, int K_cand)
+{
+    __shared__ uint4    s_q4[11][16];
+    __shared__ float    s_q_gsc[11][4];
+    __shared__ float    s_w[11];
+    __shared__ uint32_t s_fp4x2_lut[256];
+
+    const int i   = int(blockIdx.x) * 256 + int(threadIdx.x);
+    const int m   = int(blockIdx.y);
+    const int tid = int(threadIdx.x);
+
+    {
+        const float v_lo = d_fp4_e2m1_to_f32(uint8_t(tid & 0xFu));
+        const float v_hi = d_fp4_e2m1_to_f32(uint8_t((tid >> 4) & 0xFu));
+        s_fp4x2_lut[tid] = uint32_t(d_f32_to_fp16_bits(v_lo)) | (uint32_t(d_f32_to_fp16_bits(v_hi)) << 16);
+    }
+
+    const int total_grps = ih_cnt * 4;
+    if (tid < total_grps) {
+        const int g = tid & 3;
+        const int h = tid >> 2;
+        const uint4* qp4 = reinterpret_cast<const uint4*>(
+            q_bf16 + (size_t(m) * size_t(ih_cnt) + size_t(h)) * 128u + size_t(g) * 32u);
+        const uint4 raw[4] = {qp4[0], qp4[1], qp4[2], qp4[3]};
+        float amax = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            const uint32_t bw[4] = {raw[w].x, raw[w].y, raw[w].z, raw[w].w};
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                amax = fmaxf(amax, fabsf(__uint_as_float(bw[c] << 16)));
+                amax = fmaxf(amax, fabsf(__uint_as_float(bw[c] & 0xFFFF0000u)));
+            }
+        }
+        float gsc = 1.0f;
+        float inv_gsc = 1.0f;
+        if (amax > 0.0f) {
+            uint32_t eb = __float_as_uint(amax) & 0x7F800000u;
+            eb = max(0x01000000u, min(0x7E800000u, eb));
+            gsc     = __uint_as_float(eb);
+            inv_gsc = __uint_as_float(0x7F000000u - eb);
+        }
+        s_q_gsc[h][g] = gsc;
+        #pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            const uint32_t bw[4] = {raw[w].x, raw[w].y, raw[w].z, raw[w].w};
+            uint32_t pk[4];
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                const float f0 = __uint_as_float(bw[c] << 16) * inv_gsc;
+                const float f1 = __uint_as_float(bw[c] & 0xFFFF0000u) * inv_gsc;
+                pk[c] = uint32_t(d_f32_to_fp16_bits(f0)) | (uint32_t(d_f32_to_fp16_bits(f1)) << 16);
+            }
+            s_q4[h][g * 4 + w] = make_uint4(pk[0], pk[1], pk[2], pk[3]);
+        }
+    }
+    if (tid < ih_cnt) {
+        s_w[tid] = d_bf16_to_f32(weights_bf16[size_t(m) * size_t(ih_cnt) + size_t(tid)]) * 0.015625f;
+    }
+    __syncthreads();
+
+    if (i >= K_cand) return;
+
+    const int blk_pos = i >> 3;
+    const int cnt     = cand_block_cnt[m];
+    if (blk_pos >= cnt) {
+        out_score[size_t(m) * size_t(K_cand) + size_t(i)] = -INFINITY;
+        return;
+    }
+    const int t = cand_block_ids[size_t(m) * 2048u + size_t(blk_pos)] * 8 + (i & 7);
+    if (t < 0 || t >= T_comp) {
+        out_score[size_t(m) * size_t(K_cand) + size_t(i)] = -INFINITY;
+        return;
+    }
+
+    const uint32_t sc4 = *reinterpret_cast<const uint32_t*>(k_ue8m0 + size_t(t) * 4u);
+    const uint4* kp4   = reinterpret_cast<const uint4*>(k_fp4 + size_t(t) * 64u);
+    const uint4 kr0 = kp4[0], kr1 = kp4[1], kr2 = kp4[2], kr3 = kp4[3];
+
+    float dots[11];
+    #pragma unroll
+    for (int h = 0; h < 11; ++h) dots[h] = 0.0f;
+
+    #pragma unroll 1
+    for (int g = 0; g < 4; ++g) {
+        const float k_sc = d_ue8m0_to_f32(uint8_t((sc4 >> (g * 8)) & 0xFFu));
+        const uint4 q16  = (g == 0) ? kr0 : ((g == 1) ? kr1 : ((g == 2) ? kr2 : kr3));
+        const uint32_t kw[4] = {q16.x, q16.y, q16.z, q16.w};
+        f16x2_t kv[16];
+        #pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            const uint32_t u0 = s_fp4x2_lut[ kw[w]        & 0xFFu];
+            const uint32_t u1 = s_fp4x2_lut[(kw[w] >>  8) & 0xFFu];
+            const uint32_t u2 = s_fp4x2_lut[(kw[w] >> 16) & 0xFFu];
+            const uint32_t u3 = s_fp4x2_lut[(kw[w] >> 24) & 0xFFu];
+            __builtin_memcpy(&kv[w * 4 + 0], &u0, 4);
+            __builtin_memcpy(&kv[w * 4 + 1], &u1, 4);
+            __builtin_memcpy(&kv[w * 4 + 2], &u2, 4);
+            __builtin_memcpy(&kv[w * 4 + 3], &u3, 4);
+        }
+        #pragma unroll
+        for (int h = 0; h < 11; ++h) {
+            if (h < ih_cnt) {
+                float sub = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < 4; ++w) {
+                    const uint4 qv4 = s_q4[h][g * 4 + w];
+                    f16x2_t qv0, qv1, qv2, qv3;
+                    __builtin_memcpy(&qv0, &qv4.x, 4);
+                    __builtin_memcpy(&qv1, &qv4.y, 4);
+                    __builtin_memcpy(&qv2, &qv4.z, 4);
+                    __builtin_memcpy(&qv3, &qv4.w, 4);
+                    sub = __builtin_amdgcn_fdot2(qv0, kv[w * 4 + 0], sub, false);
+                    sub = __builtin_amdgcn_fdot2(qv1, kv[w * 4 + 1], sub, false);
+                    sub = __builtin_amdgcn_fdot2(qv2, kv[w * 4 + 2], sub, false);
+                    sub = __builtin_amdgcn_fdot2(qv3, kv[w * 4 + 3], sub, false);
+                }
+                dots[h] += sub * (k_sc * s_q_gsc[h][g]);
+            }
+        }
+    }
+
+    float total = 0.0f;
+    #pragma unroll
+    for (int h = 0; h < 11; ++h) {
+        if (h < ih_cnt) total += fmaxf(dots[h], 0.0f) * s_w[h];
+    }
+    out_score[size_t(m) * size_t(K_cand) + size_t(i)] = total;
+}
+
+// Device helper: 4-pass radix kth-largest over compact 8-key candidate blocks (<= 16,384 keys instead of 348K/1M!)
+__device__ uint32_t d_radix_kth_largest_cand(
+    const float* __restrict__ row,
+    const int32_t* __restrict__ cid_row,
+    int n_kept_blocks,
+    int scan_len,
+    int k_keep,
+    uint32_t* s_hist,
+    uint32_t* s_scalar)
+{
+    const int tid = int(threadIdx.x);
+    const int n_keys = n_kept_blocks * 8;
+    const uint32_t neg_inf_u = d_float_to_ordered_u32(-INFINITY);
+    uint32_t prefix = 0u;
+    uint32_t mask = 0u;
+    int rem_k = k_keep;
+
+    for (int pass = 0; pass < 4; ++pass) {
+        const int shift = 24 - pass * 8;
+        s_hist[tid] = 0u;
+        __syncthreads();
+
+        for (int idx = tid; idx < n_keys; idx += 256) {
+            const int t = cid_row[idx >> 3] * 8 + (idx & 7);
+            const uint32_t u = (t < scan_len) ? d_float_to_ordered_u32(row[t]) : neg_inf_u;
+            if ((u & mask) == prefix) {
+                atomicAdd(&s_hist[(u >> shift) & 0xFFu], 1u);
+            }
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            int acc = 0;
+            uint32_t chosen_bucket = 0u;
+            for (int b = 255; b >= 0; --b) {
+                const int cnt = int(s_hist[b]);
+                if (acc + cnt >= rem_k) {
+                    chosen_bucket = uint32_t(b);
+                    rem_k -= acc;
+                    break;
+                }
+                acc += cnt;
+            }
+            s_scalar[0] = chosen_bucket;
+            s_scalar[1] = uint32_t(rem_k);
+        }
+        __syncthreads();
+
+        prefix |= (s_scalar[0] << shift);
+        mask |= (0xFFu << shift);
+        rem_k = int(s_scalar[1]);
+    }
+    return prefix;
+}
+
+// Wave 9.4 Phase D Stage 1: 60-CU Split-KV causal mask + 8-key block-max reduction!
+// Grid: (split_x, M) where split_x saturates all 60 CUs even for M=1..8 decode!
+__global__ __launch_bounds__(256, 4)
+void k_w94_indexer_causal_and_blockmax(
+    float* __restrict__ score_f32,
+    float* __restrict__ block_scores_scratch, // [M, num_blocks]
+    int T_comp, int start_pos, int ratio, int mode,
+    TreeAncMask256 tree_anc_mask,
+    uint64_t tree_depth_nibbles,
+    int q_row_offset)
+{
+    const int m          = int(blockIdx.y);
+    const int num_blocks = (T_comp + 7) >> 3;
+    const int b0         = int(blockIdx.x) * 256 + int(threadIdx.x);
+    const int b_stride   = int(gridDim.x) * 256;
+    float* row           = score_f32 + size_t(m) * size_t(T_comp);
+    float* bscores       = block_scores_scratch + size_t(m) * size_t(num_blocks);
+    const float neg_inf  = -INFINITY;
+    const float pos_inf  = INFINITY;
+
+    const bool has_tree  = tree_anc_mask.active();
+    int compress_len = 0;
+    int base_comp    = 0;
+    int tree_M       = 0;
+    uint32_t anc_row = 0u;
+    int last_blk0    = -1;
+    int last_blk1    = -1;
+
+    if (has_tree) {
+        const int gm = q_row_offset + m;
+        anc_row      = d_tree_anc_row16(tree_anc_mask, gm);
+        base_comp    = start_pos / ratio;
+        tree_M       = max(0, T_comp - base_comp);
+        int valid_tree = 0;
+        for (int j = 0; j < tree_M; ++j) {
+            bool ok = (((anc_row >> j) & 1u) != 0u);
+            if (ok && ratio == 2) ok = (((start_pos + d_tree_nibble64(tree_depth_nibbles, j)) & 1) == 1);
+            if (ok) ++valid_tree;
+        }
+        if (base_comp + valid_tree > 0) {
+            last_blk0 = (base_comp > 0 && valid_tree == 0) ? ((base_comp - 1) >> 3) : (base_comp >> 3);
+            last_blk1 = (valid_tree > 0) ? ((base_comp + gm) >> 3) : last_blk0;
+        }
+    } else {
+        compress_len = (start_pos + m + 1) / ratio;
+        last_blk0    = (compress_len > 0) ? ((compress_len - 1) >> 3) : -1;
+        last_blk1    = last_blk0;
+    }
+
+    for (int b = b0; b < num_blocks; b += b_stride) {
+        const int base = b * 8;
+        float mx = neg_inf;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int t = base + j;
+            if (t < T_comp) {
+                bool ok = true;
+                if (has_tree) {
+                    if (t >= base_comp) {
+                        const int tj = t - base_comp;
+                        ok = (tj >= 0 && tj < tree_M) && (((anc_row >> tj) & 1u) != 0u);
+                        if (ok && ratio == 2) ok = (((start_pos + d_tree_nibble64(tree_depth_nibbles, tj)) & 1) == 1);
+                    }
+                } else {
+                    ok = (t < compress_len);
+                }
+                if (!ok) {
+                    row[t] = neg_inf;
+                } else {
+                    mx = fmaxf(mx, row[t]);
+                }
+            }
+        }
+        if (mode == 1 && last_blk0 >= 0 && b >= last_blk0 && b <= last_blk1) {
+            bscores[b] = pos_inf;
+        } else {
+            bscores[b] = mx;
+        }
+    }
+}
+
+// Wave 9.4 Phase D Stage 2: Exact Top-2048 Block Select + Exact Top-512 over <= 16,384 candidate keys!
+// Mathematically 100.000% exact by pigeonhole (top-512 keys ALWAYS lie inside top-2048 8-key blocks!).
+__global__ __launch_bounds__(256)
+void k_w94_indexer_splitkv_select(
+    const float* __restrict__ score_f32,
+    const float* __restrict__ block_scores_scratch,
+    uint32_t*    __restrict__ cand_block_mask, // non-null when mode==1
+    int cand_block_stride,
+    int32_t*     __restrict__ cand_block_ids,  // [M, 2048] (used as scratch for mode==0, output for mode==1!)
+    int32_t*     __restrict__ cand_block_cnt,  // [M]
+    int32_t*     __restrict__ out_comp_idxs,   // [M, K_out]
+    int T_comp, int start_pos, int ratio, int mode, int K_out,
+    TreeAncMask256 tree_anc_mask,
+    uint64_t tree_depth_nibbles,
+    int q_row_offset)
+{
+    __shared__ uint32_t s_hist[256];
+    __shared__ uint32_t s_scalar[4];
+    __shared__ int32_t  s_sel[512];
+
+    const int m          = int(blockIdx.x);
+    const int tid        = int(threadIdx.x);
+    const int num_blocks = (T_comp + 7) >> 3;
+    const int num_words  = (num_blocks + 31) >> 5;
+    const float* row     = score_f32 + size_t(m) * size_t(T_comp);
+    const float* bscores = block_scores_scratch + size_t(m) * size_t(num_blocks);
+    int32_t* cid_row     = cand_block_ids + size_t(m) * 2048u;
+    const float neg_inf  = -INFINITY;
+    const uint32_t neg_inf_u = d_float_to_ordered_u32(neg_inf);
+
+    int scan_len  = 0;
+    int valid_cnt = 0;
+    if (tree_anc_mask.active()) {
+        const int gm = q_row_offset + m;
+        const uint32_t anc_row = d_tree_anc_row16(tree_anc_mask, gm);
+        const int base_comp = start_pos / ratio;
+        const int tree_M = max(0, T_comp - base_comp);
+        int valid_tree = 0;
+        for (int j = 0; j < tree_M; ++j) {
+            bool ok = (((anc_row >> j) & 1u) != 0u);
+            if (ok && ratio == 2) ok = (((start_pos + d_tree_nibble64(tree_depth_nibbles, j)) & 1) == 1);
+            if (ok) ++valid_tree;
+        }
+        scan_len = T_comp;
+        valid_cnt = base_comp + valid_tree;
+    } else {
+        const int compress_len = (start_pos + m + 1) / ratio;
+        scan_len = compress_len;
+        valid_cnt = compress_len;
+    }
+
+    uint32_t* cblk = (mode == 1 && cand_block_mask != nullptr)
+        ? (cand_block_mask + size_t(m) * size_t(cand_block_stride))
+        : nullptr;
+    if (cblk != nullptr) {
+        for (int w = tid; w < num_words; w += 256) cblk[w] = 0u;
+    }
+
+    // 1. Exact top-2048 block selection over num_blocks (= T_comp/8 -> 8x faster than scanning T_comp!)
+    const int k_blk = min(2048, num_blocks);
+    const uint32_t b_kth_u = d_radix_kth_largest(bscores, num_blocks, k_blk, s_hist, s_scalar);
+    if (tid == 0) {
+        s_scalar[0] = 0u;  // cid_row write cursor
+        s_scalar[2] = 0u;  // count strictly greater blocks
+    }
+    __syncthreads();
+    for (int b = tid; b < num_blocks; b += 256) {
+        const uint32_t u = d_float_to_ordered_u32(bscores[b]);
+        if (u > b_kth_u && u > neg_inf_u) atomicAdd(&s_scalar[2], 1u);
+    }
+    __syncthreads();
+    if (tid == 0) {
+        s_scalar[3] = (k_blk > int(s_scalar[2])) ? uint32_t(k_blk - int(s_scalar[2])) : 0u;
+    }
+    __syncthreads();
+    for (int b = tid; b < num_blocks; b += 256) {
+        const uint32_t u = d_float_to_ordered_u32(bscores[b]);
+        bool keep = false;
+        if (u > neg_inf_u) {
+            if (u > b_kth_u) {
+                keep = true;
+            } else if (u == b_kth_u) {
+                const uint32_t prev = atomicAdd(&s_scalar[3], 0xFFFFFFFFu);
+                if (int(prev) > 0) keep = true;
+            }
+        }
+        if (keep) {
+            if (cblk != nullptr) atomicOr(&cblk[b >> 5], 1u << (b & 31));
+            const uint32_t pos = atomicAdd(&s_scalar[0], 1u);
+            if (pos < 2048u) cid_row[pos] = b;
+        }
+    }
+    __syncthreads();
+    const int n_kept = int(min(2048u, s_scalar[0]));
+    if (tid == 0 && cand_block_cnt != nullptr) {
+        cand_block_cnt[m] = n_kept;
+    }
+
+    // 2. Exact top-K over ONLY the <= 16,384 keys in the kept blocks (21x-64x faster!) + ascending bitonic sort!
+    if (K_out <= 0) return;
+    const int valid_k = min(K_out, valid_cnt);
+    s_sel[tid] = 0x7FFFFFFF;
+    s_sel[256 + tid] = 0x7FFFFFFF;
+    __syncthreads();
+
+    if (valid_k > 0 && n_kept > 0) {
+        const int n_keys = n_kept * 8;
+        const uint32_t kth_u = d_radix_kth_largest_cand(row, cid_row, n_kept, scan_len, valid_k, s_hist, s_scalar);
+
+        if (tid == 0) {
+            s_scalar[0] = 0u;
+            s_scalar[1] = 0u;
+        }
+        __syncthreads();
+
+        for (int idx = tid; idx < n_keys; idx += 256) {
+            const int t = cid_row[idx >> 3] * 8 + (idx & 7);
+            if (t < scan_len) {
+                const uint32_t u = d_float_to_ordered_u32(row[t]);
+                if (u > kth_u && u > neg_inf_u) {
+                    const uint32_t pos = atomicAdd(&s_scalar[0], 1u);
+                    if (pos < 512u) s_sel[pos] = t;
+                }
+            }
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            const int have = int(s_scalar[0]);
+            s_scalar[2] = (valid_k > have) ? uint32_t(valid_k - have) : 0u;
+        }
+        __syncthreads();
+
+        if (s_scalar[2] > 0u) {
+            for (int idx = tid; idx < n_keys; idx += 256) {
+                const int t = cid_row[idx >> 3] * 8 + (idx & 7);
+                if (t < scan_len) {
+                    const uint32_t u = d_float_to_ordered_u32(row[t]);
+                    if (u == kth_u && u > neg_inf_u) {
+                        const uint32_t rem = atomicAdd(&s_scalar[2], 0xFFFFFFFFu);
+                        if (int(rem) > 0) {
+                            const uint32_t pos = atomicAdd(&s_scalar[0], 1u);
+                            if (pos < 512u) s_sel[pos] = t;
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+        }
+
+        for (int k = 2; k <= 512; k <<= 1) {
+            for (int j = k >> 1; j > 0; j >>= 1) {
+                const int ixj = tid ^ j;
+                if (ixj > tid) {
+                    const bool asc = ((tid & k) == 0);
+                    const int32_t a = s_sel[tid];
+                    const int32_t b = s_sel[ixj];
+                    if ((a > b) == asc) { s_sel[tid] = b; s_sel[ixj] = a; }
+                }
+                const int tid2 = tid + 256;
+                const int ixj2 = tid2 ^ j;
+                if (ixj2 > tid2) {
+                    const bool asc2 = ((tid2 & k) == 0);
+                    const int32_t a2 = s_sel[tid2];
+                    const int32_t b2 = s_sel[ixj2];
+                    if ((a2 > b2) == asc2) { s_sel[tid2] = b2; s_sel[ixj2] = a2; }
+                }
+                __syncthreads();
+            }
+        }
+    }
+
+    int32_t* dst = out_comp_idxs + size_t(m) * size_t(K_out);
+    for (int k = tid; k < K_out; k += 256) {
+        const int32_t v = s_sel[k];
+        dst[k] = (v < scan_len) ? v : -1;
+    }
+}
+
+// Wave 9.4 Phase D Compact mode==2 Top-K over ONLY K_cand <= 16,384 candidate scores -> exact ascending global indices!
+__global__ __launch_bounds__(256)
+void k_w94_indexer_cand_topk(
+    float*         __restrict__ score_f32,      // [M, K_cand]
+    const int32_t* __restrict__ cand_block_ids, // [M, 2048]
+    const int32_t* __restrict__ cand_block_cnt, // [M]
+    int32_t*       __restrict__ out_comp_idxs,  // [M, K_out]
+    int T_comp, int K_cand, int start_pos, int ratio, int K_out,
+    TreeAncMask256 tree_anc_mask,
+    uint64_t tree_depth_nibbles,
+    int q_row_offset)
+{
+    __shared__ uint32_t s_hist[256];
+    __shared__ uint32_t s_scalar[4];
+    __shared__ int32_t  s_sel[512];
+
+    const int m          = int(blockIdx.x);
+    const int tid        = int(threadIdx.x);
+    float* row           = score_f32 + size_t(m) * size_t(K_cand);
+    const int32_t* cid   = cand_block_ids + size_t(m) * 2048u;
+    const int cnt        = cand_block_cnt[m];
+    const int n_cand     = min(K_cand, cnt * 8);
+    const float neg_inf  = -INFINITY;
+    const uint32_t neg_inf_u = d_float_to_ordered_u32(neg_inf);
+
+    const bool has_tree  = tree_anc_mask.active();
+    int compress_len = 0;
+    int base_comp    = 0;
+    int tree_M       = 0;
+    uint32_t anc_row = 0u;
+    int scan_len     = 0;
+
+    if (has_tree) {
+        const int gm = q_row_offset + m;
+        anc_row      = d_tree_anc_row16(tree_anc_mask, gm);
+        base_comp    = start_pos / ratio;
+        tree_M       = max(0, T_comp - base_comp);
+        scan_len     = T_comp;
+    } else {
+        compress_len = (start_pos + m + 1) / ratio;
+        scan_len     = compress_len;
+    }
+
+    // Apply exact causal/tree mask and count valid candidate keys
+    if (tid == 0) s_scalar[0] = 0u;
+    __syncthreads();
+    for (int i = tid; i < n_cand; i += 256) {
+        const int t = cid[i >> 3] * 8 + (i & 7);
+        bool ok = (t >= 0 && t < T_comp);
+        if (ok) {
+            if (has_tree) {
+                if (t >= base_comp) {
+                    const int tj = t - base_comp;
+                    ok = (tj >= 0 && tj < tree_M) && (((anc_row >> tj) & 1u) != 0u);
+                    if (ok && ratio == 2) ok = (((start_pos + d_tree_nibble64(tree_depth_nibbles, tj)) & 1) == 1);
+                }
+            } else {
+                ok = (t < compress_len);
+            }
+        }
+        if (!ok) {
+            row[i] = neg_inf;
+        } else {
+            atomicAdd(&s_scalar[0], 1u);
+        }
+    }
+    __syncthreads();
+
+    const int valid_cnt = int(s_scalar[0]);
+    const int valid_k   = min(K_out, valid_cnt);
+    s_sel[tid] = 0x7FFFFFFF;
+    s_sel[256 + tid] = 0x7FFFFFFF;
+    __syncthreads();
+
+    if (valid_k > 0 && n_cand > 0) {
+        const uint32_t kth_u = d_radix_kth_largest(row, n_cand, valid_k, s_hist, s_scalar);
+
+        if (tid == 0) {
+            s_scalar[0] = 0u;
+            s_scalar[1] = 0u;
+        }
+        __syncthreads();
+
+        for (int i = tid; i < n_cand; i += 256) {
+            const uint32_t u = d_float_to_ordered_u32(row[i]);
+            if (u > kth_u && u > neg_inf_u) {
+                const uint32_t pos = atomicAdd(&s_scalar[0], 1u);
+                if (pos < 512u) s_sel[pos] = cid[i >> 3] * 8 + (i & 7);
+            }
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            const int have = int(s_scalar[0]);
+            s_scalar[2] = (valid_k > have) ? uint32_t(valid_k - have) : 0u;
+        }
+        __syncthreads();
+
+        if (s_scalar[2] > 0u) {
+            for (int i = tid; i < n_cand; i += 256) {
+                const uint32_t u = d_float_to_ordered_u32(row[i]);
+                if (u == kth_u && u > neg_inf_u) {
+                    const uint32_t rem = atomicAdd(&s_scalar[2], 0xFFFFFFFFu);
+                    if (int(rem) > 0) {
+                        const uint32_t pos = atomicAdd(&s_scalar[0], 1u);
+                        if (pos < 512u) s_sel[pos] = cid[i >> 3] * 8 + (i & 7);
+                    }
+                }
+            }
+            __syncthreads();
+        }
+
+        for (int k = 2; k <= 512; k <<= 1) {
+            for (int j = k >> 1; j > 0; j >>= 1) {
+                const int ixj = tid ^ j;
+                if (ixj > tid) {
+                    const bool asc = ((tid & k) == 0);
+                    const int32_t a = s_sel[tid];
+                    const int32_t b = s_sel[ixj];
+                    if ((a > b) == asc) { s_sel[tid] = b; s_sel[ixj] = a; }
+                }
+                const int tid2 = tid + 256;
+                const int ixj2 = tid2 ^ j;
+                if (ixj2 > tid2) {
+                    const bool asc2 = ((tid2 & k) == 0);
+                    const int32_t a2 = s_sel[tid2];
+                    const int32_t b2 = s_sel[ixj2];
+                    if ((a2 > b2) == asc2) { s_sel[tid2] = b2; s_sel[ixj2] = a2; }
                 }
                 __syncthreads();
             }
@@ -3469,10 +4099,105 @@ void k_sparse_attn(
     }
 }
 
-// 8-Head High-Occupancy Prefill Sparse Attention (M > 16, 256 threads = 8 heads/CTA, 3 CTAs/CU = 12 waves/CU, ScratchSize == 0!):
-// Uses 4-key batched ILP online softmax (1 acc_o rescale per 4 keys instead of 4!) and zero idle warps on h_cnt = 16 / 24!
-__device__ __forceinline__ void d_sparse_attn_step_4kv_pak(
-    const float (&q_reg)[16],
+// Wave 9.3 Phase B: 8-Head High-Occupancy Full-fdot2 (BOTH Q*K^T AND P*V!) Prefill Sparse Attention
+// 256 threads = 8 heads/CTA x 32 lanes/head, 3 CTAs/CU (12 waves/CU), 4-key batched ILP online softmax, ScratchSize == 0!
+__device__ __forceinline__ uint32_t d_bf16x2_to_f16x2_u32(uint32_t bf_pair) {
+    const float f0 = fmaxf(-65504.0f, fminf(65504.0f, __uint_as_float(bf_pair << 16)));
+    const float f1 = fmaxf(-65504.0f, fminf(65504.0f, __uint_as_float(bf_pair & 0xFFFF0000u)));
+    const uint32_t h0 = uint32_t(__half_as_ushort(__float2half_rn(f0)));
+    const uint32_t h1 = uint32_t(__half_as_ushort(__float2half_rn(f1)));
+    return h0 | (h1 << 16);
+}
+
+__device__ __forceinline__ void d_load_win_kv_f16_pak(
+    const uint16_t* src, int d_lane, uint32_t* kv_pak_slot)
+{
+    const uint4 v0 = *reinterpret_cast<const uint4*>(src + 0);
+    const uint4 v1 = *reinterpret_cast<const uint4*>(src + 8);
+    kv_pak_slot[0 * 32 + d_lane] = d_bf16x2_to_f16x2_u32(v0.x);
+    kv_pak_slot[1 * 32 + d_lane] = d_bf16x2_to_f16x2_u32(v0.y);
+    kv_pak_slot[2 * 32 + d_lane] = d_bf16x2_to_f16x2_u32(v0.z);
+    kv_pak_slot[3 * 32 + d_lane] = d_bf16x2_to_f16x2_u32(v0.w);
+    kv_pak_slot[4 * 32 + d_lane] = d_bf16x2_to_f16x2_u32(v1.x);
+    kv_pak_slot[5 * 32 + d_lane] = d_bf16x2_to_f16x2_u32(v1.y);
+    kv_pak_slot[6 * 32 + d_lane] = d_bf16x2_to_f16x2_u32(v1.z);
+    kv_pak_slot[7 * 32 + d_lane] = d_bf16x2_to_f16x2_u32(v1.w);
+}
+
+__device__ __forceinline__ void d_load_comp_kv_f16_pak(
+    const uint8_t* comp_fp4, const uint8_t* comp_e4m3,
+    const uint8_t* ext_comp_fp4, const uint8_t* ext_comp_e4m3, int hot_comp_cap,
+    const uint16_t* s_lut,
+    int32_t kv_idx, int d_lane, uint32_t* kv_pak_slot)
+{
+    const bool is_ext = (kv_idx >= hot_comp_cap) && (ext_comp_fp4 != nullptr);
+    const uint8_t* src_fp4  = is_ext ? ext_comp_fp4  : comp_fp4;
+    const uint8_t* src_e4m3 = is_ext ? ext_comp_e4m3 : comp_e4m3;
+    const size_t slot = is_ext ? size_t(kv_idx - hot_comp_cap) : size_t(kv_idx);
+    const float sc = d_fp16_bits_to_f32(s_lut[src_e4m3[slot * 32u + size_t(d_lane)]]);
+    const uint2 pb8 = *reinterpret_cast<const uint2*>(src_fp4 + slot * 256u + d_lane * 8);
+    const uint32_t words[2] = {pb8.x, pb8.y};
+    #pragma unroll
+    for (int w = 0; w < 2; ++w) {
+        const uint32_t wd = words[w];
+        #pragma unroll
+        for (int b = 0; b < 4; ++b) {
+            const uint32_t byte = (wd >> (b * 8)) & 0xFFu;
+            const float f0 = fmaxf(-65504.0f, fminf(65504.0f, d_fp4_e2m1_to_f32(uint8_t(byte & 0xFu)) * sc));
+            const float f1 = fmaxf(-65504.0f, fminf(65504.0f, d_fp4_e2m1_to_f32(uint8_t(byte >> 4)) * sc));
+            const uint32_t lo = uint32_t(__half_as_ushort(__float2half_rn(f0)));
+            const uint32_t hi = uint32_t(__half_as_ushort(__float2half_rn(f1)));
+            kv_pak_slot[(w * 4 + b) * 32 + d_lane] = lo | (hi << 16);
+        }
+    }
+}
+
+__device__ __forceinline__ void d_sparse_attn_step_kv_f16_fdot2(
+    const f16x2_t (&q_h2)[8],
+    float (&acc_o)[16],
+    float& m_max,
+    float& l_sum,
+    const uint32_t* kv_pak_slot,
+    int d_lane)
+{
+    constexpr float kScale = 0.04419417382415922f;
+    float dot = 0.0f;
+    uint32_t kv_u[8];
+    #pragma unroll
+    for (int p = 0; p < 8; ++p) {
+        kv_u[p] = kv_pak_slot[p * 32 + d_lane];
+        f16x2_t kh;
+        __builtin_memcpy(&kh, &kv_u[p], 4);
+        dot = __builtin_amdgcn_fdot2(q_h2[p], kh, dot, false);
+    }
+    dot = d_subwave_sum32(dot) * kScale;
+
+    if (dot <= m_max) {
+        const float p = __expf(dot - m_max);
+        l_sum += p;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float v0 = __half2float(__ushort_as_half(uint16_t(kv_u[j] & 0xFFFFu)));
+            const float v1 = __half2float(__ushort_as_half(uint16_t(kv_u[j] >> 16)));
+            acc_o[2 * j + 0] += p * v0;
+            acc_o[2 * j + 1] += p * v1;
+        }
+    } else {
+        const float alpha = __expf(m_max - dot);
+        l_sum = l_sum * alpha + 1.0f;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float v0 = __half2float(__ushort_as_half(uint16_t(kv_u[j] & 0xFFFFu)));
+            const float v1 = __half2float(__ushort_as_half(uint16_t(kv_u[j] >> 16)));
+            acc_o[2 * j + 0] = acc_o[2 * j + 0] * alpha + v0;
+            acc_o[2 * j + 1] = acc_o[2 * j + 1] * alpha + v1;
+        }
+        m_max = dot;
+    }
+}
+
+__device__ __forceinline__ void d_sparse_attn_step_4kv_f16_fdot2(
+    const f16x2_t (&q_h2)[8],
     float (&acc_o)[16],
     float& m_max,
     float& l_sum,
@@ -3485,16 +4210,19 @@ __device__ __forceinline__ void d_sparse_attn_step_4kv_pak(
     #pragma unroll
     for (int p = 0; p < 8; ++p) {
         const int idx = p * 32 + d_lane;
-        const float q0 = q_reg[2 * p + 0];
-        const float q1 = q_reg[2 * p + 1];
         const uint32_t u0 = kv_pak[t0 + 0][idx];
         const uint32_t u1 = kv_pak[t0 + 1][idx];
         const uint32_t u2 = kv_pak[t0 + 2][idx];
         const uint32_t u3 = kv_pak[t0 + 3][idx];
-        d0 += q0 * __uint_as_float(u0 << 16) + q1 * __uint_as_float(u0 & 0xFFFF0000u);
-        d1 += q0 * __uint_as_float(u1 << 16) + q1 * __uint_as_float(u1 & 0xFFFF0000u);
-        d2 += q0 * __uint_as_float(u2 << 16) + q1 * __uint_as_float(u2 & 0xFFFF0000u);
-        d3 += q0 * __uint_as_float(u3 << 16) + q1 * __uint_as_float(u3 & 0xFFFF0000u);
+        f16x2_t k0, k1, k2, k3;
+        __builtin_memcpy(&k0, &u0, 4);
+        __builtin_memcpy(&k1, &u1, 4);
+        __builtin_memcpy(&k2, &u2, 4);
+        __builtin_memcpy(&k3, &u3, 4);
+        d0 = __builtin_amdgcn_fdot2(q_h2[p], k0, d0, false);
+        d1 = __builtin_amdgcn_fdot2(q_h2[p], k1, d1, false);
+        d2 = __builtin_amdgcn_fdot2(q_h2[p], k2, d2, false);
+        d3 = __builtin_amdgcn_fdot2(q_h2[p], k3, d3, false);
     }
     d0 = d_subwave_sum32(d0) * kScale;
     d1 = d_subwave_sum32(d1) * kScale;
@@ -3516,10 +4244,14 @@ __device__ __forceinline__ void d_sparse_attn_step_4kv_pak(
     const float p3 = __expf(d3 - m_max);
     l_sum += (p0 + p1) + (p2 + p3);
 
-    const float w0 = d_bf16_to_f32(d_f32_to_bf16_rne(p0));
-    const float w1 = d_bf16_to_f32(d_f32_to_bf16_rne(p1));
-    const float w2 = d_bf16_to_f32(d_f32_to_bf16_rne(p2));
-    const float w3 = d_bf16_to_f32(d_f32_to_bf16_rne(p3));
+    const uint32_t uw01 = uint32_t(__half_as_ushort(__float2half_rn(p0))) |
+                          (uint32_t(__half_as_ushort(__float2half_rn(p1))) << 16);
+    const uint32_t uw23 = uint32_t(__half_as_ushort(__float2half_rn(p2))) |
+                          (uint32_t(__half_as_ushort(__float2half_rn(p3))) << 16);
+    f16x2_t w01, w23;
+    __builtin_memcpy(&w01, &uw01, 4);
+    __builtin_memcpy(&w23, &uw23, 4);
+
     #pragma unroll
     for (int p = 0; p < 8; ++p) {
         const int idx = p * 32 + d_lane;
@@ -3527,14 +4259,23 @@ __device__ __forceinline__ void d_sparse_attn_step_4kv_pak(
         const uint32_t u1 = kv_pak[t0 + 1][idx];
         const uint32_t u2 = kv_pak[t0 + 2][idx];
         const uint32_t u3 = kv_pak[t0 + 3][idx];
-        acc_o[2 * p + 0] += w0 * __uint_as_float(u0 << 16) + w1 * __uint_as_float(u1 << 16) +
-                            w2 * __uint_as_float(u2 << 16) + w3 * __uint_as_float(u3 << 16);
-        acc_o[2 * p + 1] += w0 * __uint_as_float(u0 & 0xFFFF0000u) + w1 * __uint_as_float(u1 & 0xFFFF0000u) +
-                            w2 * __uint_as_float(u2 & 0xFFFF0000u) + w3 * __uint_as_float(u3 & 0xFFFF0000u);
+        const uint32_t ue01 = (u0 & 0xFFFFu) | ((u1 & 0xFFFFu) << 16);
+        const uint32_t ue23 = (u2 & 0xFFFFu) | ((u3 & 0xFFFFu) << 16);
+        const uint32_t uo01 = (u0 >> 16)     | (u1 & 0xFFFF0000u);
+        const uint32_t uo23 = (u2 >> 16)     | (u3 & 0xFFFF0000u);
+        f16x2_t e01, e23, o01, o23;
+        __builtin_memcpy(&e01, &ue01, 4);
+        __builtin_memcpy(&e23, &ue23, 4);
+        __builtin_memcpy(&o01, &uo01, 4);
+        __builtin_memcpy(&o23, &uo23, 4);
+        acc_o[2 * p + 0] = __builtin_amdgcn_fdot2(w01, e01, acc_o[2 * p + 0], false);
+        acc_o[2 * p + 0] = __builtin_amdgcn_fdot2(w23, e23, acc_o[2 * p + 0], false);
+        acc_o[2 * p + 1] = __builtin_amdgcn_fdot2(w01, o01, acc_o[2 * p + 1], false);
+        acc_o[2 * p + 1] = __builtin_amdgcn_fdot2(w23, o23, acc_o[2 * p + 1], false);
     }
 }
 
-__global__ __launch_bounds__(256, 2)
+__global__ __launch_bounds__(256, 3)
 void k_sparse_attn_allheads(
     const uint16_t* __restrict__ q_bf16,
     const float*    __restrict__ attn_sink,
@@ -3566,12 +4307,25 @@ void k_sparse_attn_allheads(
     s_lut[tid] = d_fp8_e4m3_to_fp16_bits(uint8_t(tid));
     __syncthreads();
 
-    float q_reg[16];
-    float acc_o[16];
+    f16x2_t q_h2[8];
+    float   acc_o[16];
     #pragma unroll
-    for (int j = 0; j < 16; ++j) {
-        acc_o[j] = 0.0f;
-        q_reg[j] = (h < h_cnt) ? d_bf16_to_f32(q_bf16[(size_t(m) * size_t(h_cnt) + size_t(h)) * 512u + d_lane * 16 + j]) : 0.0f;
+    for (int j = 0; j < 16; ++j) acc_o[j] = 0.0f;
+    if (h < h_cnt) {
+        const uint16_t* qsrc = q_bf16 + (size_t(m) * size_t(h_cnt) + size_t(h)) * 512u + size_t(d_lane * 16);
+        const uint4 qv0 = *reinterpret_cast<const uint4*>(qsrc + 0);
+        const uint4 qv1 = *reinterpret_cast<const uint4*>(qsrc + 8);
+        const uint32_t qu[8] = {
+            d_bf16x2_to_f16x2_u32(qv0.x), d_bf16x2_to_f16x2_u32(qv0.y),
+            d_bf16x2_to_f16x2_u32(qv0.z), d_bf16x2_to_f16x2_u32(qv0.w),
+            d_bf16x2_to_f16x2_u32(qv1.x), d_bf16x2_to_f16x2_u32(qv1.y),
+            d_bf16x2_to_f16x2_u32(qv1.z), d_bf16x2_to_f16x2_u32(qv1.w)};
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) __builtin_memcpy(&q_h2[p], &qu[p], 4);
+    } else {
+        const uint32_t z = 0u;
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) __builtin_memcpy(&q_h2[p], &z, 4);
     }
 
     float m_max = -1e30f;
@@ -3590,19 +4344,19 @@ void k_sparse_attn_allheads(
             const uint16_t* src = (p < start_pos)
                 ? (win_kv_ring + size_t(p & 127) * 512u + d_lane * 16)
                 : (cur_kv_bf16 + size_t(p - start_pos) * 512u + d_lane * 16);
-            d_load_win_kv_pak(src, d_lane, s_kv_pak[h_loc]);
+            d_load_win_kv_f16_pak(src, d_lane, s_kv_pak[h_loc]);
         }
         __syncthreads();
 
         if (h < h_cnt) {
             #pragma unroll 1
             for (int t = 0; t < 8; t += 4) {
-                if ((s_valid[t + 0] & s_valid[t + 1] & s_valid[t + 2] & s_valid[t + 3]) >= 0) {
-                    d_sparse_attn_step_4kv_pak(q_reg, acc_o, m_max, l_sum, s_kv_pak, t, d_lane);
+                if ((s_valid[t + 0] | s_valid[t + 1] | s_valid[t + 2] | s_valid[t + 3]) >= 0) {
+                    d_sparse_attn_step_4kv_f16_fdot2(q_h2, acc_o, m_max, l_sum, s_kv_pak, t, d_lane);
                 } else {
                     #pragma unroll 1
                     for (int sub = 0; sub < 4; ++sub) {
-                        if (s_valid[t + sub] >= 0) d_sparse_attn_step_kv_pak(q_reg, acc_o, m_max, l_sum, s_kv_pak[t + sub], d_lane);
+                        if (s_valid[t + sub] >= 0) d_sparse_attn_step_kv_f16_fdot2(q_h2, acc_o, m_max, l_sum, s_kv_pak[t + sub], d_lane);
                     }
                 }
             }
@@ -3616,20 +4370,20 @@ void k_sparse_attn_allheads(
             const int32_t kv_idx = (base + h_loc < n_comp) ? c_idx_row[base + h_loc] : -1;
             if (d_lane == 0) s_valid[h_loc] = kv_idx;
             if (kv_idx >= 0) {
-                d_load_comp_kv_pak(comp_fp4, comp_e4m3, ext_comp_fp4, ext_comp_e4m3, hot_comp_cap,
-                                   s_lut, kv_idx, d_lane, s_kv_pak[h_loc]);
+                d_load_comp_kv_f16_pak(comp_fp4, comp_e4m3, ext_comp_fp4, ext_comp_e4m3, hot_comp_cap,
+                                       s_lut, kv_idx, d_lane, s_kv_pak[h_loc]);
             }
             __syncthreads();
 
             if (h < h_cnt) {
                 #pragma unroll 1
                 for (int t = 0; t < 8; t += 4) {
-                    if ((s_valid[t + 0] & s_valid[t + 1] & s_valid[t + 2] & s_valid[t + 3]) >= 0) {
-                        d_sparse_attn_step_4kv_pak(q_reg, acc_o, m_max, l_sum, s_kv_pak, t, d_lane);
+                    if ((s_valid[t + 0] | s_valid[t + 1] | s_valid[t + 2] | s_valid[t + 3]) >= 0) {
+                        d_sparse_attn_step_4kv_f16_fdot2(q_h2, acc_o, m_max, l_sum, s_kv_pak, t, d_lane);
                     } else {
                         #pragma unroll 1
                         for (int sub = 0; sub < 4; ++sub) {
-                            if (s_valid[t + sub] >= 0) d_sparse_attn_step_kv_pak(q_reg, acc_o, m_max, l_sum, s_kv_pak[t + sub], d_lane);
+                            if (s_valid[t + sub] >= 0) d_sparse_attn_step_kv_f16_fdot2(q_h2, acc_o, m_max, l_sum, s_kv_pak[t + sub], d_lane);
                         }
                     }
                 }
@@ -3644,8 +4398,17 @@ void k_sparse_attn_allheads(
         const float denom = l_sum * scale + __expf(attn_sink[h] - m_tot);
         const float inv_l = (denom > 0.0f) ? (scale / denom) : 0.0f;
         uint16_t* dst = out_o_bf16 + (size_t(m) * size_t(h_cnt) + size_t(h)) * 512u + d_lane * 16;
-        #pragma unroll
-        for (int j = 0; j < 16; ++j) dst[j] = d_f32_to_bf16_rne(acc_o[j] * inv_l);
+        uint4 out0, out1;
+        out0.x = uint32_t(d_f32_to_bf16_rne(acc_o[0]  * inv_l)) | (uint32_t(d_f32_to_bf16_rne(acc_o[1]  * inv_l)) << 16);
+        out0.y = uint32_t(d_f32_to_bf16_rne(acc_o[2]  * inv_l)) | (uint32_t(d_f32_to_bf16_rne(acc_o[3]  * inv_l)) << 16);
+        out0.z = uint32_t(d_f32_to_bf16_rne(acc_o[4]  * inv_l)) | (uint32_t(d_f32_to_bf16_rne(acc_o[5]  * inv_l)) << 16);
+        out0.w = uint32_t(d_f32_to_bf16_rne(acc_o[6]  * inv_l)) | (uint32_t(d_f32_to_bf16_rne(acc_o[7]  * inv_l)) << 16);
+        out1.x = uint32_t(d_f32_to_bf16_rne(acc_o[8]  * inv_l)) | (uint32_t(d_f32_to_bf16_rne(acc_o[9]  * inv_l)) << 16);
+        out1.y = uint32_t(d_f32_to_bf16_rne(acc_o[10] * inv_l)) | (uint32_t(d_f32_to_bf16_rne(acc_o[11] * inv_l)) << 16);
+        out1.z = uint32_t(d_f32_to_bf16_rne(acc_o[12] * inv_l)) | (uint32_t(d_f32_to_bf16_rne(acc_o[13] * inv_l)) << 16);
+        out1.w = uint32_t(d_f32_to_bf16_rne(acc_o[14] * inv_l)) | (uint32_t(d_f32_to_bf16_rne(acc_o[15] * inv_l)) << 16);
+        *reinterpret_cast<uint4*>(dst + 0) = out0;
+        *reinterpret_cast<uint4*>(dst + 8) = out1;
     }
 }
 
@@ -5398,11 +6161,48 @@ void launch_p2p_push_f32_2peers(
     }
 }
 
+namespace {
+struct LocalArCtaPair {
+    uint32_t* d_write_cta;
+    uint32_t* d_read_cta;
+};
+
+// Per-GPU local HBM2 CTA arrival counters for HostRingAllReduce (1 KiB/GPU: 8 slots x 2 cache lines).
+// Eliminates 100% of GPU-side PCIe FetchAdd AtomicOps targeting pinned host DDR4 so MI50s behind
+// non-AtomicOpsRouting PCIe switches (e.g. Broadcom PEX88048) never trip ATHUB RAS interrupts.
+static inline LocalArCtaPair get_host_ring_local_ctas(uint64_t seq) {
+    static std::mutex mtx;
+    static uint32_t* d_pools[16] = {};
+    int dev = 0;
+    (void)hipGetDevice(&dev);
+    if (dev < 0 || dev >= 16) dev = 0;
+    uint32_t* base = __atomic_load_n(&d_pools[dev], __ATOMIC_ACQUIRE);
+    if (__builtin_expect(base == nullptr, 0)) {
+        std::lock_guard<std::mutex> lk(mtx);
+        base = d_pools[dev];
+        if (base == nullptr) {
+            void* ptr = nullptr;
+            if (hipMalloc(&ptr, kHostArRingSlots * 32u * sizeof(uint32_t)) != hipSuccess || ptr == nullptr) {
+                throw std::runtime_error("hipMalloc failed for HostRingAllReduce local CTA counters");
+            }
+            (void)hipMemset(ptr, 0, kHostArRingSlots * 32u * sizeof(uint32_t));
+            (void)hipStreamSynchronize(nullptr);
+            base = static_cast<uint32_t*>(ptr);
+            __atomic_store_n(&d_pools[dev], base, __ATOMIC_RELEASE);
+        }
+    }
+    const size_t slot_idx = static_cast<size_t>((seq - 1ULL) & (kHostArRingSlots - 1ULL));
+    return LocalArCtaPair{base + slot_idx * 32u, base + slot_idx * 32u + 16u};
+}
+}  // namespace
+
 __global__ __launch_bounds__(256, 4)
 void k_host_ring_allreduce_bf16(
     const uint16_t* __restrict__ d_src,
     uint16_t*       __restrict__ d_dst,
     HostRingAllReduceSlot* __restrict__ slot,
+    uint32_t*       __restrict__ d_write_cta,
+    uint32_t*       __restrict__ d_read_cta,
     int rank,
     uint64_t seq,
     size_t n_elems)
@@ -5433,9 +6233,10 @@ void k_host_ring_allreduce_bf16(
 
     if (tid == 0) {
         __threadfence_system();
-        const uint32_t prev = __hip_atomic_fetch_add(&slot->write_ctas[rank][0], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_SYSTEM);
+        const uint32_t prev = __hip_atomic_fetch_add(d_write_cta, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
         if (prev + 1u == uint32_t(gridDim.x)) {
-            __hip_atomic_store(&slot->write_ctas[rank][0], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            __hip_atomic_store(d_write_cta, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __threadfence_system();
             __hip_atomic_store(&slot->ready_seq[rank][0], seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
         }
         while (__hip_atomic_load(&slot->ready_seq[p1][0], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq ||
@@ -5464,9 +6265,11 @@ void k_host_ring_allreduce_bf16(
     __syncthreads();
 
     if (tid == 0) {
-        const uint32_t prev = __hip_atomic_fetch_add(&slot->read_ctas[rank][0], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_SYSTEM);
+        __threadfence_system();
+        const uint32_t prev = __hip_atomic_fetch_add(d_read_cta, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
         if (prev + 1u == uint32_t(gridDim.x)) {
-            __hip_atomic_store(&slot->read_ctas[rank][0], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            __hip_atomic_store(d_read_cta, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __threadfence_system();
             __hip_atomic_store(&slot->done_seq[rank][0], seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
         }
     }
@@ -5490,6 +6293,8 @@ void k_host_ring_allreduce_f32(
     const float* d_src,
     float*       d_dst,
     HostRingAllReduceSlot* __restrict__ slot,
+    uint32_t*    __restrict__ d_write_cta,
+    uint32_t*    __restrict__ d_read_cta,
     int rank,
     uint64_t seq,
     size_t n_elems)
@@ -5517,9 +6322,10 @@ void k_host_ring_allreduce_f32(
 
     if (tid == 0) {
         __threadfence_system();
-        const uint32_t prev = __hip_atomic_fetch_add(&slot->write_ctas[rank][0], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_SYSTEM);
+        const uint32_t prev = __hip_atomic_fetch_add(d_write_cta, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
         if (prev + 1u == uint32_t(gridDim.x)) {
-            __hip_atomic_store(&slot->write_ctas[rank][0], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            __hip_atomic_store(d_write_cta, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __threadfence_system();
             __hip_atomic_store(&slot->ready_seq[rank][0], seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
         }
         while (__hip_atomic_load(&slot->ready_seq[p1][0], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq ||
@@ -5531,9 +6337,8 @@ void k_host_ring_allreduce_f32(
 
     for (size_t i = gid0; i < n_elems; i += stride) {
         float v[3];
-        v[rank] = (d_src == d_dst)
-                      ? __uint_as_float(__hip_atomic_load(&slot->payload[rank][i], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM))
-                      : d_src[i];
+        // Local HBM2 read is always thread-disjoint (saves 33% PCIe read bandwidth even when d_src == d_dst!)
+        v[rank] = d_src[i];
         v[p1]   = __uint_as_float(__hip_atomic_load(&slot->payload[p1][i], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM));
         v[p2]   = __uint_as_float(__hip_atomic_load(&slot->payload[p2][i], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM));
         d_dst[i] = (v[0] + v[1]) + v[2];
@@ -5541,10 +6346,246 @@ void k_host_ring_allreduce_f32(
     __syncthreads();
 
     if (tid == 0) {
-        const uint32_t prev = __hip_atomic_fetch_add(&slot->read_ctas[rank][0], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_SYSTEM);
+        __threadfence_system();
+        const uint32_t prev = __hip_atomic_fetch_add(d_read_cta, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
         if (prev + 1u == uint32_t(gridDim.x)) {
-            __hip_atomic_store(&slot->read_ctas[rank][0], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            __hip_atomic_store(d_read_cta, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __threadfence_system();
             __hip_atomic_store(&slot->done_seq[rank][0], seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        }
+    }
+}
+
+// Wave 9.4 Phase D: TP0-only FP32 reduction (tp1,2 write only, tp0 reads only -> 3x less PCIe traffic, 0 PCIe RMW atomics!)
+__global__ __launch_bounds__(256, 4)
+void k_host_ring_reduce_tp0_f32(
+    const float* d_src,
+    float*       d_dst,
+    HostRingAllReduceSlot* __restrict__ slot,
+    uint32_t*    __restrict__ d_write_cta,
+    uint32_t*    __restrict__ d_read_cta,
+    int rank,
+    uint64_t seq,
+    size_t n_elems)
+{
+    const int tid = int(threadIdx.x);
+    const size_t stride = size_t(gridDim.x) * 256u;
+    const size_t gid0   = size_t(blockIdx.x) * 256u + size_t(tid);
+
+    if (rank != 0) {
+        if (seq > kHostArRingSlots && tid == 0) {
+            const uint64_t min_done = seq - kHostArRingSlots;
+            const int o1 = (rank + 1) % 3;
+            const int o2 = (rank + 2) % 3;
+            while (__hip_atomic_load(&slot->done_seq[o1][0], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < min_done ||
+                   __hip_atomic_load(&slot->done_seq[o2][0], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < min_done) {
+                __builtin_amdgcn_s_sleep(1);
+            }
+        }
+        __syncthreads();
+
+        for (size_t i = gid0; i < n_elems; i += stride) {
+            const uint32_t bits = __float_as_uint(d_src[i]);
+            __hip_atomic_store(&slot->payload[rank][i], bits, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            __threadfence_system();
+            const uint32_t prev = __hip_atomic_fetch_add(d_write_cta, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+            if (prev + 1u == uint32_t(gridDim.x)) {
+                __hip_atomic_store(d_write_cta, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                __threadfence_system();
+                __hip_atomic_store(&slot->ready_seq[rank][0], seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+                __hip_atomic_store(&slot->done_seq[rank][0],  seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+            }
+        }
+        return;
+    }
+
+    // rank == 0: zero PCIe writes; wait on tp1,2 ready_seq and sum directly in local HBM2!
+    if (tid == 0) {
+        while (__hip_atomic_load(&slot->ready_seq[1][0], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq ||
+               __hip_atomic_load(&slot->ready_seq[2][0], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq) {
+            __builtin_amdgcn_s_sleep(1);
+        }
+    }
+    __syncthreads();
+
+    for (size_t i = gid0; i < n_elems; i += stride) {
+        const float v0 = d_src[i];
+        const float v1 = __uint_as_float(__hip_atomic_load(&slot->payload[1][i], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM));
+        const float v2 = __uint_as_float(__hip_atomic_load(&slot->payload[2][i], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM));
+        d_dst[i] = (v0 + v1) + v2;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        __threadfence_system();
+        const uint32_t prev = __hip_atomic_fetch_add(d_read_cta, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        if (prev + 1u == uint32_t(gridDim.x)) {
+            __hip_atomic_store(d_read_cta, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __threadfence_system();
+            __hip_atomic_store(&slot->ready_seq[0][0], seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+            __hip_atomic_store(&slot->done_seq[0][0],  seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        }
+    }
+}
+
+// Wave 9.4 Phase D.2: TP0-only FP16-wire reduction (6x less PCIe traffic vs TP3 FP32 allreduce, 0 PCIe RMW atomics!)
+__global__ __launch_bounds__(256, 4)
+void k_host_ring_reduce_tp0_f16_wire(
+    const float* d_src,
+    float*       d_dst,
+    HostRingAllReduceSlot* __restrict__ slot,
+    uint32_t*    __restrict__ d_write_cta,
+    uint32_t*    __restrict__ d_read_cta,
+    int rank,
+    uint64_t seq,
+    size_t n_elems)
+{
+    const int tid = int(threadIdx.x);
+    const size_t stride  = size_t(gridDim.x) * 256u;
+    const size_t gid0    = size_t(blockIdx.x) * 256u + size_t(tid);
+    const size_t n_words = (n_elems + 1u) >> 1;
+
+    if (rank != 0) {
+        if (seq > kHostArRingSlots && tid == 0) {
+            const uint64_t min_done = seq - kHostArRingSlots;
+            const int o1 = (rank + 1) % 3;
+            const int o2 = (rank + 2) % 3;
+            while (__hip_atomic_load(&slot->done_seq[o1][0], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < min_done ||
+                   __hip_atomic_load(&slot->done_seq[o2][0], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < min_done) {
+                __builtin_amdgcn_s_sleep(1);
+            }
+        }
+        __syncthreads();
+
+        for (size_t w = gid0; w < n_words; w += stride) {
+            const size_t i0 = w << 1;
+            const float f0 = d_src[i0];
+            const uint16_t h0 = (f0 == -INFINITY) ? 0xFC00u : d_f32_to_fp16_bits(fmaxf(-65504.0f, fminf(65504.0f, f0)));
+            uint16_t h1 = 0u;
+            if (i0 + 1u < n_elems) {
+                const float f1 = d_src[i0 + 1u];
+                h1 = (f1 == -INFINITY) ? 0xFC00u : d_f32_to_fp16_bits(fmaxf(-65504.0f, fminf(65504.0f, f1)));
+            }
+            const uint32_t pk = uint32_t(h0) | (uint32_t(h1) << 16);
+            __hip_atomic_store(&slot->payload[rank][w], pk, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            __threadfence_system();
+            const uint32_t prev = __hip_atomic_fetch_add(d_write_cta, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+            if (prev + 1u == uint32_t(gridDim.x)) {
+                __hip_atomic_store(d_write_cta, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                __threadfence_system();
+                __hip_atomic_store(&slot->ready_seq[rank][0], seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+                __hip_atomic_store(&slot->done_seq[rank][0],  seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+            }
+        }
+        return;
+    }
+
+    if (tid == 0) {
+        while (__hip_atomic_load(&slot->ready_seq[1][0], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq ||
+               __hip_atomic_load(&slot->ready_seq[2][0], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq) {
+            __builtin_amdgcn_s_sleep(1);
+        }
+    }
+    __syncthreads();
+
+    for (size_t w = gid0; w < n_words; w += stride) {
+        const size_t i0 = w << 1;
+        const uint32_t p1 = __hip_atomic_load(&slot->payload[1][w], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        const uint32_t p2 = __hip_atomic_load(&slot->payload[2][w], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        const float v1_0 = ((p1 & 0xFFFFu) == 0xFC00u) ? -INFINITY : d_fp16_bits_to_f32(uint16_t(p1 & 0xFFFFu));
+        const float v2_0 = ((p2 & 0xFFFFu) == 0xFC00u) ? -INFINITY : d_fp16_bits_to_f32(uint16_t(p2 & 0xFFFFu));
+        d_dst[i0] = (d_src[i0] + v1_0) + v2_0;
+        if (i0 + 1u < n_elems) {
+            const float v1_1 = ((p1 >> 16) == 0xFC00u) ? -INFINITY : d_fp16_bits_to_f32(uint16_t(p1 >> 16));
+            const float v2_1 = ((p2 >> 16) == 0xFC00u) ? -INFINITY : d_fp16_bits_to_f32(uint16_t(p2 >> 16));
+            d_dst[i0 + 1u] = (d_src[i0 + 1u] + v1_1) + v2_1;
+        }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        __threadfence_system();
+        const uint32_t prev = __hip_atomic_fetch_add(d_read_cta, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        if (prev + 1u == uint32_t(gridDim.x)) {
+            __hip_atomic_store(d_read_cta, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __threadfence_system();
+            __hip_atomic_store(&slot->ready_seq[0][0], seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+            __hip_atomic_store(&slot->done_seq[0][0],  seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        }
+    }
+}
+
+// Wave 9.4 Phase D: TP0 -> TP1,2 tiny uint32 broadcast over HostRingAllReduceSlot (0 PCIe RMW atomics!)
+__global__ __launch_bounds__(256, 4)
+void k_host_ring_bcast_tp0_u32(
+    uint32_t* d_buf,
+    HostRingAllReduceSlot* __restrict__ slot,
+    uint32_t* __restrict__ d_write_cta,
+    uint32_t* __restrict__ d_read_cta,
+    int rank,
+    uint64_t seq,
+    size_t n_words)
+{
+    const int tid = int(threadIdx.x);
+    const size_t stride = size_t(gridDim.x) * 256u;
+    const size_t gid0   = size_t(blockIdx.x) * 256u + size_t(tid);
+
+    if (rank == 0) {
+        if (seq > kHostArRingSlots && tid == 0) {
+            const uint64_t min_done = seq - kHostArRingSlots;
+            while (__hip_atomic_load(&slot->done_seq[1][0], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < min_done ||
+                   __hip_atomic_load(&slot->done_seq[2][0], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < min_done) {
+                __builtin_amdgcn_s_sleep(1);
+            }
+        }
+        __syncthreads();
+
+        for (size_t i = gid0; i < n_words; i += stride) {
+            __hip_atomic_store(&slot->payload[0][i], d_buf[i], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            __threadfence_system();
+            const uint32_t prev = __hip_atomic_fetch_add(d_write_cta, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+            if (prev + 1u == uint32_t(gridDim.x)) {
+                __hip_atomic_store(d_write_cta, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                __threadfence_system();
+                __hip_atomic_store(&slot->ready_seq[0][0], seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+                __hip_atomic_store(&slot->done_seq[0][0],  seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+            }
+        }
+        return;
+    }
+
+    if (tid == 0) {
+        while (__hip_atomic_load(&slot->ready_seq[0][0], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq) {
+            __builtin_amdgcn_s_sleep(1);
+        }
+    }
+    __syncthreads();
+
+    for (size_t i = gid0; i < n_words; i += stride) {
+        d_buf[i] = __hip_atomic_load(&slot->payload[0][i], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        __threadfence_system();
+        const uint32_t prev = __hip_atomic_fetch_add(d_read_cta, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        if (prev + 1u == uint32_t(gridDim.x)) {
+            __hip_atomic_store(d_read_cta, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __threadfence_system();
+            __hip_atomic_store(&slot->ready_seq[rank][0], seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+            __hip_atomic_store(&slot->done_seq[rank][0],  seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
         }
     }
 }
@@ -5554,10 +6595,11 @@ void launch_host_ring_allreduce_bf16(
     int rank, uint64_t seq, size_t n_elems, hipStream_t stream)
 {
     if (n_elems == 0) return;
+    const auto ctas = get_host_ring_local_ctas(seq);
     const size_t n_words = (n_elems + 1u) >> 1;
     const uint32_t num_ctas = (n_words <= 65536u) ? 16u : 32u;
     hipLaunchKernelGGL(k_host_ring_allreduce_bf16, dim3(num_ctas), dim3(256), 0, stream,
-                       d_src, d_dst, d_mapped_slot, rank, seq, n_elems);
+                       d_src, d_dst, d_mapped_slot, ctas.d_write_cta, ctas.d_read_cta, rank, seq, n_elems);
 }
 
 __global__ __launch_bounds__(256, 4)
@@ -5569,6 +6611,8 @@ void k_host_ring_allreduce_f32_hc_post(
     const float*    __restrict__ d_comb_f32,
     uint16_t*       __restrict__ d_out_h_bf16,
     HostRingAllReduceSlot* __restrict__ slot,
+    uint32_t*       __restrict__ d_write_cta,
+    uint32_t*       __restrict__ d_read_cta,
     int rank,
     uint64_t seq,
     int M,
@@ -5597,9 +6641,10 @@ void k_host_ring_allreduce_f32_hc_post(
 
     if (tid == 0) {
         __threadfence_system();
-        const uint32_t prev = __hip_atomic_fetch_add(&slot->write_ctas[rank][0], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_SYSTEM);
+        const uint32_t prev = __hip_atomic_fetch_add(d_write_cta, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
         if (prev + 1u == uint32_t(gridDim.x)) {
-            __hip_atomic_store(&slot->write_ctas[rank][0], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            __hip_atomic_store(d_write_cta, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __threadfence_system();
             __hip_atomic_store(&slot->ready_seq[rank][0], seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
         }
         while (__hip_atomic_load(&slot->ready_seq[p1][0], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq ||
@@ -5643,15 +6688,18 @@ void k_host_ring_allreduce_f32_hc_post(
     __syncthreads();
 
     if (tid == 0) {
-        const uint32_t prev = __hip_atomic_fetch_add(&slot->read_ctas[rank][0], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_SYSTEM);
+        __threadfence_system();
+        const uint32_t prev = __hip_atomic_fetch_add(d_read_cta, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
         if (prev + 1u == uint32_t(gridDim.x)) {
-            __hip_atomic_store(&slot->read_ctas[rank][0], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            __hip_atomic_store(d_read_cta, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __threadfence_system();
             __hip_atomic_store(&slot->done_seq[rank][0], seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
             if (rank == 0 && rtc != nullptr) {
                 const uint64_t now = __builtin_amdgcn_s_memrealtime();
                 const uint64_t p_st = __hip_atomic_load(&rtc->last_stamp, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
                 if (now > p_st && p_st != 0ULL) {
-                    __hip_atomic_fetch_add(&rtc->att_ticks, now - p_st, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+                    const uint64_t cur_t = __hip_atomic_load(&rtc->att_ticks, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+                    __hip_atomic_store(&rtc->att_ticks, cur_t + (now - p_st), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
                 }
                 __hip_atomic_store(&rtc->last_stamp, now, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
             }
@@ -5663,6 +6711,7 @@ __global__ __launch_bounds__(256, 4)
 void k_host_ring_upload_f32(
     const float* __restrict__ d_src_f32,
     HostRingAllReduceSlot* __restrict__ slot,
+    uint32_t*    __restrict__ d_write_cta,
     int rank,
     uint64_t seq,
     int M)
@@ -5690,9 +6739,10 @@ void k_host_ring_upload_f32(
 
     if (tid == 0) {
         __threadfence_system();
-        const uint32_t prev = __hip_atomic_fetch_add(&slot->write_ctas[rank][0], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_SYSTEM);
+        const uint32_t prev = __hip_atomic_fetch_add(d_write_cta, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
         if (prev + 1u == uint32_t(gridDim.x)) {
-            __hip_atomic_store(&slot->write_ctas[rank][0], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            __hip_atomic_store(d_write_cta, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __threadfence_system();
             __hip_atomic_store(&slot->ready_seq[rank][0], seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
         }
     }
@@ -5707,12 +6757,16 @@ void k_host_ring_finish_f32_hc_post(
     const float*    __restrict__ d_comb_f32,
     uint16_t*       __restrict__ d_out_h_bf16,
     HostRingAllReduceSlot* __restrict__ slot,
+    uint32_t*       __restrict__ d_read_cta,
     int rank,
     uint64_t seq,
     int M,
     const uint32_t* __restrict__ d_p150_resp_seq,
     uint32_t p150_req_seq,
-    Dsv41GpuStageRtc* __restrict__ rtc)
+    Dsv41GpuStageRtc* __restrict__ rtc,
+    const float*    __restrict__ d_dev3_f32,
+    const uint32_t* __restrict__ d_dev3_done_seq,
+    uint32_t dev3_req_seq)
 {
     const int tid = int(threadIdx.x);
     const int d   = int(blockIdx.x) * 256 + tid;
@@ -5728,7 +6782,8 @@ void k_host_ring_finish_f32_hc_post(
             const uint64_t t_moe = __builtin_amdgcn_s_memrealtime();
             const uint64_t p_st  = __hip_atomic_load(&rtc->last_stamp, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
             if (t_moe > p_st && p_st != 0ULL) {
-                __hip_atomic_fetch_add(&rtc->mi50_moe_ticks, t_moe - p_st, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+                const uint64_t cur_t = __hip_atomic_load(&rtc->mi50_moe_ticks, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+                __hip_atomic_store(&rtc->mi50_moe_ticks, cur_t + (t_moe - p_st), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
             }
             __hip_atomic_store(&rtc->last_stamp, t_moe, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
         }
@@ -5741,9 +6796,16 @@ void k_host_ring_finish_f32_hc_post(
                 const uint64_t t_p150 = __builtin_amdgcn_s_memrealtime();
                 const uint64_t p_st   = __hip_atomic_load(&rtc->last_stamp, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
                 if (t_p150 > p_st && p_st != 0ULL) {
-                    __hip_atomic_fetch_add(&rtc->p150_wait_ticks, t_p150 - p_st, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+                    const uint64_t cur_t = __hip_atomic_load(&rtc->p150_wait_ticks, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+                    __hip_atomic_store(&rtc->p150_wait_ticks, cur_t + (t_p150 - p_st), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
                 }
                 __hip_atomic_store(&rtc->last_stamp, t_p150, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+            }
+        }
+        if (d_dev3_done_seq != nullptr) {
+            while (static_cast<int32_t>(
+                       __hip_atomic_load(d_dev3_done_seq, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) - dev3_req_seq) < 0) {
+                __builtin_amdgcn_s_sleep(1);
             }
         }
     }
@@ -5762,6 +6824,12 @@ void k_host_ring_finish_f32_hc_post(
                 __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
             const uint32_t bf_u32 = (idx & 1u) ? (w32 & 0xFFFF0000u) : (w32 << 16);
             xv += __uint_as_float(bf_u32);
+        }
+        if (d_dev3_f32 != nullptr) {
+            const uint32_t d3u = __hip_atomic_load(
+                &reinterpret_cast<const uint32_t*>(d_dev3_f32)[idx],
+                __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            xv += __uint_as_float(d3u);
         }
 
         const uint16_t* rs = d_res_bf16 + size_t(m) * 20480u + size_t(d);
@@ -5783,15 +6851,18 @@ void k_host_ring_finish_f32_hc_post(
     __syncthreads();
 
     if (tid == 0) {
-        const uint32_t prev = __hip_atomic_fetch_add(&slot->read_ctas[rank][0], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_SYSTEM);
+        __threadfence_system();
+        const uint32_t prev = __hip_atomic_fetch_add(d_read_cta, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
         if (prev + 1u == uint32_t(gridDim.x)) {
-            __hip_atomic_store(&slot->read_ctas[rank][0], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            __hip_atomic_store(d_read_cta, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __threadfence_system();
             __hip_atomic_store(&slot->done_seq[rank][0], seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
             if (rank == 0 && rtc != nullptr) {
                 const uint64_t now = __builtin_amdgcn_s_memrealtime();
                 const uint64_t p_st = __hip_atomic_load(&rtc->last_stamp, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
                 if (now > p_st && p_st != 0ULL) {
-                    __hip_atomic_fetch_add(&rtc->ar_ticks, now - p_st, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+                    const uint64_t cur_t = __hip_atomic_load(&rtc->ar_ticks, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+                    __hip_atomic_store(&rtc->ar_ticks, cur_t + (now - p_st), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
                 }
                 __hip_atomic_store(&rtc->last_stamp, now, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
             }
@@ -5804,6 +6875,7 @@ __device__ __forceinline__ void d_mhc_fused_row_epilogue(
     int m, int tid, int rank, int p1, int p2,
     const float*    __restrict__ d_src_f32,
     const uint16_t* __restrict__ d_p150_bf16,
+    const float*    __restrict__ d_dev3_f32,
     const uint16_t* __restrict__ d_res_bf16,
     const float*    __restrict__ d_post_f32,
     const float*    __restrict__ d_comb_f32,
@@ -5844,6 +6916,12 @@ __device__ __forceinline__ void d_mhc_fused_row_epilogue(
                 __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
             const uint32_t bf_u32 = (idx & 1u) ? (w32 & 0xFFFF0000u) : (w32 << 16);
             xv += __uint_as_float(bf_u32);
+        }
+        if (d_dev3_f32 != nullptr) {
+            const uint32_t d3u = __hip_atomic_load(
+                &reinterpret_cast<const uint32_t*>(d_dev3_f32)[idx],
+                __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            xv += __uint_as_float(d3u);
         }
 
         const uint16_t* rs = d_res_bf16 + size_t(m) * 20480u + size_t(d);
@@ -5950,6 +7028,8 @@ void k_host_ring_allreduce_f32_mhc_fused(
     uint16_t*       __restrict__ d_out_rot_bf16,
     float norm_eps,
     HostRingAllReduceSlot* __restrict__ slot,
+    uint32_t*       __restrict__ d_write_cta,
+    uint32_t*       __restrict__ d_read_cta,
     int rank,
     uint64_t seq,
     Dsv41GpuStageRtc* __restrict__ rtc)
@@ -5981,9 +7061,10 @@ void k_host_ring_allreduce_f32_mhc_fused(
 
     if (tid == 0) {
         __threadfence_system();
-        const uint32_t prev = __hip_atomic_fetch_add(&slot->write_ctas[rank][0], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_SYSTEM);
+        const uint32_t prev = __hip_atomic_fetch_add(d_write_cta, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
         if (prev + 1u == uint32_t(gridDim.x)) {
-            __hip_atomic_store(&slot->write_ctas[rank][0], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            __hip_atomic_store(d_write_cta, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __threadfence_system();
             __hip_atomic_store(&slot->ready_seq[rank][0], seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
         }
         while (__hip_atomic_load(&slot->ready_seq[p1][0], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq ||
@@ -5995,22 +7076,25 @@ void k_host_ring_allreduce_f32_mhc_fused(
 
     d_mhc_fused_row_epilogue(
         m, tid, rank, p1, p2,
-        d_src_f32, d_p150_bf16, d_res_bf16, d_post_f32, d_comb_f32, d_out_h_bf16,
+        d_src_f32, d_p150_bf16, nullptr, d_res_bf16, d_post_f32, d_comb_f32, d_out_h_bf16,
         d_next_pre_f32, d_next_norm_w, d_out_norm_bf16, d_out_raw_bf16,
         d_out_fp8, d_out_ue8m0, d_signs_u64, d_out_rot_f16, d_out_rot_bf16,
         norm_eps, slot, s_raw, s_wht, s_wave);
     __syncthreads();
 
     if (tid == 0) {
-        const uint32_t prev = __hip_atomic_fetch_add(&slot->read_ctas[rank][0], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_SYSTEM);
+        __threadfence_system();
+        const uint32_t prev = __hip_atomic_fetch_add(d_read_cta, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
         if (prev + 1u == uint32_t(gridDim.x)) {
-            __hip_atomic_store(&slot->read_ctas[rank][0], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            __hip_atomic_store(d_read_cta, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __threadfence_system();
             __hip_atomic_store(&slot->done_seq[rank][0], seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
             if (rank == 0 && rtc != nullptr) {
                 const uint64_t now = __builtin_amdgcn_s_memrealtime();
                 const uint64_t p_st = __hip_atomic_load(&rtc->last_stamp, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
                 if (now > p_st && p_st != 0ULL) {
-                    __hip_atomic_fetch_add(&rtc->att_ticks, now - p_st, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+                    const uint64_t cur_t = __hip_atomic_load(&rtc->att_ticks, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+                    __hip_atomic_store(&rtc->att_ticks, cur_t + (now - p_st), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
                 }
                 __hip_atomic_store(&rtc->last_stamp, now, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
             }
@@ -6037,11 +7121,15 @@ void k_host_ring_finish_f32_mhc_fused(
     uint16_t*       __restrict__ d_out_rot_bf16,
     float norm_eps,
     HostRingAllReduceSlot* __restrict__ slot,
+    uint32_t*       __restrict__ d_read_cta,
     int rank,
     uint64_t seq,
     const uint32_t* __restrict__ d_p150_resp_seq,
     uint32_t p150_req_seq,
-    Dsv41GpuStageRtc* __restrict__ rtc)
+    Dsv41GpuStageRtc* __restrict__ rtc,
+    const float*    __restrict__ d_dev3_f32,
+    const uint32_t* __restrict__ d_dev3_done_seq,
+    uint32_t dev3_req_seq)
 {
     __shared__ uint16_t s_raw[5120];
     __shared__ float s_wht[2][128];
@@ -6061,7 +7149,8 @@ void k_host_ring_finish_f32_mhc_fused(
             const uint64_t t_moe = __builtin_amdgcn_s_memrealtime();
             const uint64_t p_st  = __hip_atomic_load(&rtc->last_stamp, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
             if (t_moe > p_st && p_st != 0ULL) {
-                __hip_atomic_fetch_add(&rtc->mi50_moe_ticks, t_moe - p_st, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+                const uint64_t cur_t = __hip_atomic_load(&rtc->mi50_moe_ticks, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+                __hip_atomic_store(&rtc->mi50_moe_ticks, cur_t + (t_moe - p_st), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
             }
             __hip_atomic_store(&rtc->last_stamp, t_moe, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
         }
@@ -6074,9 +7163,16 @@ void k_host_ring_finish_f32_mhc_fused(
                 const uint64_t t_p150 = __builtin_amdgcn_s_memrealtime();
                 const uint64_t p_st   = __hip_atomic_load(&rtc->last_stamp, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
                 if (t_p150 > p_st && p_st != 0ULL) {
-                    __hip_atomic_fetch_add(&rtc->p150_wait_ticks, t_p150 - p_st, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+                    const uint64_t cur_t = __hip_atomic_load(&rtc->p150_wait_ticks, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+                    __hip_atomic_store(&rtc->p150_wait_ticks, cur_t + (t_p150 - p_st), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
                 }
                 __hip_atomic_store(&rtc->last_stamp, t_p150, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+            }
+        }
+        if (d_dev3_done_seq != nullptr) {
+            while (static_cast<int32_t>(
+                       __hip_atomic_load(d_dev3_done_seq, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) - dev3_req_seq) < 0) {
+                __builtin_amdgcn_s_sleep(1);
             }
         }
     }
@@ -6084,22 +7180,25 @@ void k_host_ring_finish_f32_mhc_fused(
 
     d_mhc_fused_row_epilogue(
         m, tid, rank, p1, p2,
-        d_src_f32, d_p150_bf16, d_res_bf16, d_post_f32, d_comb_f32, d_out_h_bf16,
+        d_src_f32, d_p150_bf16, d_dev3_f32, d_res_bf16, d_post_f32, d_comb_f32, d_out_h_bf16,
         d_next_pre_f32, d_next_norm_w, d_out_norm_bf16, d_out_raw_bf16,
         d_out_fp8, d_out_ue8m0, d_signs_u64, d_out_rot_f16, d_out_rot_bf16,
         norm_eps, slot, s_raw, s_wht, s_wave);
     __syncthreads();
 
     if (tid == 0) {
-        const uint32_t prev = __hip_atomic_fetch_add(&slot->read_ctas[rank][0], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_SYSTEM);
+        __threadfence_system();
+        const uint32_t prev = __hip_atomic_fetch_add(d_read_cta, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
         if (prev + 1u == uint32_t(gridDim.x)) {
-            __hip_atomic_store(&slot->read_ctas[rank][0], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            __hip_atomic_store(d_read_cta, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __threadfence_system();
             __hip_atomic_store(&slot->done_seq[rank][0], seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
             if (rank == 0 && rtc != nullptr) {
                 const uint64_t now = __builtin_amdgcn_s_memrealtime();
                 const uint64_t p_st = __hip_atomic_load(&rtc->last_stamp, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
                 if (now > p_st && p_st != 0ULL) {
-                    __hip_atomic_fetch_add(&rtc->ar_ticks, now - p_st, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+                    const uint64_t cur_t = __hip_atomic_load(&rtc->ar_ticks, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+                    __hip_atomic_store(&rtc->ar_ticks, cur_t + (now - p_st), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
                 }
                 __hip_atomic_store(&rtc->last_stamp, now, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
             }
@@ -6112,9 +7211,44 @@ void launch_host_ring_allreduce_f32(
     int rank, uint64_t seq, size_t n_elems, hipStream_t stream)
 {
     if (n_elems == 0) return;
+    const auto ctas = get_host_ring_local_ctas(seq);
     const uint32_t num_ctas = (n_elems <= 65536u) ? 16u : 32u;
     hipLaunchKernelGGL(k_host_ring_allreduce_f32, dim3(num_ctas), dim3(256), 0, stream,
-                       d_src, d_dst, d_mapped_slot, rank, seq, n_elems);
+                       d_src, d_dst, d_mapped_slot, ctas.d_write_cta, ctas.d_read_cta, rank, seq, n_elems);
+}
+
+void launch_host_ring_reduce_tp0_f32(
+    const float* d_src, float* d_dst, HostRingAllReduceSlot* d_mapped_slot,
+    int rank, uint64_t seq, size_t n_elems, hipStream_t stream)
+{
+    if (n_elems == 0) return;
+    const auto ctas = get_host_ring_local_ctas(seq);
+    const uint32_t num_ctas = (n_elems <= 65536u) ? 16u : 32u;
+    hipLaunchKernelGGL(k_host_ring_reduce_tp0_f32, dim3(num_ctas), dim3(256), 0, stream,
+                       d_src, d_dst, d_mapped_slot, ctas.d_write_cta, ctas.d_read_cta, rank, seq, n_elems);
+}
+
+void launch_host_ring_reduce_tp0_f16_wire(
+    const float* d_src, float* d_dst, HostRingAllReduceSlot* d_mapped_slot,
+    int rank, uint64_t seq, size_t n_elems, hipStream_t stream)
+{
+    if (n_elems == 0) return;
+    const auto ctas = get_host_ring_local_ctas(seq);
+    const size_t n_words = (n_elems + 1u) >> 1;
+    const uint32_t num_ctas = (n_words <= 65536u) ? 16u : 32u;
+    hipLaunchKernelGGL(k_host_ring_reduce_tp0_f16_wire, dim3(num_ctas), dim3(256), 0, stream,
+                       d_src, d_dst, d_mapped_slot, ctas.d_write_cta, ctas.d_read_cta, rank, seq, n_elems);
+}
+
+void launch_host_ring_bcast_tp0_u32(
+    uint32_t* d_buf, HostRingAllReduceSlot* d_mapped_slot,
+    int rank, uint64_t seq, size_t n_words, hipStream_t stream)
+{
+    if (n_words == 0) return;
+    const auto ctas = get_host_ring_local_ctas(seq);
+    const uint32_t num_ctas = (n_words <= 16384u) ? 8u : ((n_words <= 65536u) ? 16u : 32u);
+    hipLaunchKernelGGL(k_host_ring_bcast_tp0_u32, dim3(num_ctas), dim3(256), 0, stream,
+                       d_buf, d_mapped_slot, ctas.d_write_cta, ctas.d_read_cta, rank, seq, n_words);
 }
 
 void launch_host_ring_allreduce_f32_hc_post(
@@ -6125,9 +7259,10 @@ void launch_host_ring_allreduce_f32_hc_post(
     Dsv41GpuStageRtc* d_stage_rtc)
 {
     if (M <= 0) return;
+    const auto ctas = get_host_ring_local_ctas(seq);
     hipLaunchKernelGGL(k_host_ring_allreduce_f32_hc_post, dim3(20), dim3(256), 0, stream,
                        d_src_f32, d_p150_bf16, d_res_bf16, d_post_f32, d_comb_f32,
-                       d_out_h_bf16, d_mapped_slot, rank, seq, M, d_stage_rtc);
+                       d_out_h_bf16, d_mapped_slot, ctas.d_write_cta, ctas.d_read_cta, rank, seq, M, d_stage_rtc);
 }
 
 void launch_host_ring_upload_f32(
@@ -6135,8 +7270,9 @@ void launch_host_ring_upload_f32(
     int rank, uint64_t seq, int M, hipStream_t stream)
 {
     if (M <= 0) return;
+    const auto ctas = get_host_ring_local_ctas(seq);
     hipLaunchKernelGGL(k_host_ring_upload_f32, dim3(20), dim3(256), 0, stream,
-                       d_src_f32, d_mapped_slot, rank, seq, M);
+                       d_src_f32, d_mapped_slot, ctas.d_write_cta, rank, seq, M);
 }
 
 void launch_host_ring_finish_f32_hc_post(
@@ -6145,13 +7281,16 @@ void launch_host_ring_finish_f32_hc_post(
     uint16_t* d_out_h_bf16, HostRingAllReduceSlot* d_mapped_slot,
     int rank, uint64_t seq, int M, hipStream_t stream,
     const uint32_t* d_p150_resp_seq, uint32_t p150_req_seq,
-    Dsv41GpuStageRtc* d_stage_rtc)
+    Dsv41GpuStageRtc* d_stage_rtc,
+    const float* d_dev3_f32, const uint32_t* d_dev3_done_seq, uint32_t dev3_req_seq)
 {
     if (M <= 0) return;
+    const auto ctas = get_host_ring_local_ctas(seq);
     hipLaunchKernelGGL(k_host_ring_finish_f32_hc_post, dim3(20), dim3(256), 0, stream,
                        d_src_f32, d_p150_bf16, d_res_bf16, d_post_f32, d_comb_f32,
-                       d_out_h_bf16, d_mapped_slot, rank, seq, M,
-                       d_p150_resp_seq, p150_req_seq, d_stage_rtc);
+                       d_out_h_bf16, d_mapped_slot, ctas.d_read_cta, rank, seq, M,
+                       d_p150_resp_seq, p150_req_seq, d_stage_rtc,
+                       d_dev3_f32, d_dev3_done_seq, dev3_req_seq);
 }
 
 void launch_host_ring_allreduce_f32_mhc_fused(
@@ -6166,11 +7305,12 @@ void launch_host_ring_allreduce_f32_mhc_fused(
     Dsv41GpuStageRtc* d_stage_rtc)
 {
     if (M <= 0) return;
+    const auto ctas = get_host_ring_local_ctas(seq);
     hipLaunchKernelGGL(k_host_ring_allreduce_f32_mhc_fused, dim3(M), dim3(256), 0, stream,
                        d_src_f32, d_p150_bf16, d_res_bf16, d_post_f32, d_comb_f32,
                        d_out_h_bf16, d_next_pre_f32, d_next_norm_w, d_out_norm_bf16, d_out_raw_bf16,
                        d_out_fp8, d_out_ue8m0, d_signs_u64, d_out_rot_f16, d_out_rot_bf16,
-                       norm_eps, d_mapped_slot, rank, seq, d_stage_rtc);
+                       norm_eps, d_mapped_slot, ctas.d_write_cta, ctas.d_read_cta, rank, seq, d_stage_rtc);
 }
 
 void launch_host_ring_finish_f32_mhc_fused(
@@ -6183,15 +7323,266 @@ void launch_host_ring_finish_f32_mhc_fused(
     float norm_eps, HostRingAllReduceSlot* d_mapped_slot,
     int rank, uint64_t seq, int M, hipStream_t stream,
     const uint32_t* d_p150_resp_seq, uint32_t p150_req_seq,
-    Dsv41GpuStageRtc* d_stage_rtc)
+    Dsv41GpuStageRtc* d_stage_rtc,
+    const float* d_dev3_f32, const uint32_t* d_dev3_done_seq, uint32_t dev3_req_seq)
 {
     if (M <= 0) return;
+    const auto ctas = get_host_ring_local_ctas(seq);
     hipLaunchKernelGGL(k_host_ring_finish_f32_mhc_fused, dim3(M), dim3(256), 0, stream,
                        d_src_f32, d_p150_bf16, d_res_bf16, d_post_f32, d_comb_f32,
                        d_out_h_bf16, d_next_pre_f32, d_next_norm_w, d_out_norm_bf16, d_out_raw_bf16,
                        d_out_fp8, d_out_ue8m0, d_signs_u64, d_out_rot_f16, d_out_rot_bf16,
-                       norm_eps, d_mapped_slot, rank, seq,
-                       d_p150_resp_seq, p150_req_seq, d_stage_rtc);
+                       norm_eps, d_mapped_slot, ctas.d_read_cta, rank, seq,
+                       d_p150_resp_seq, p150_req_seq, d_stage_rtc,
+                       d_dev3_f32, d_dev3_done_seq, dev3_req_seq);
+}
+
+__global__ __launch_bounds__(256, 8)
+void k_add_f32_inplace(float* __restrict__ dst, const float* __restrict__ src, size_t n_elems) {
+    const size_t idx = size_t(blockIdx.x) * 256u + size_t(threadIdx.x);
+    if (idx < n_elems) dst[idx] += src[idx];
+}
+
+void launch_add_f32_inplace(float* d_dst_f32, const float* d_src_f32, size_t n_elems, hipStream_t stream) {
+    if (n_elems == 0 || d_dst_f32 == nullptr || d_src_f32 == nullptr) return;
+    hipLaunchKernelGGL(k_add_f32_inplace, dim3(unsigned((n_elems + 255u) / 256u)), dim3(256), 0, stream,
+                       d_dst_f32, d_src_f32, n_elems);
+}
+
+namespace {
+static inline uint32_t* get_dev3_finish_local_cta(uint32_t req_seq) {
+    static std::mutex mtx;
+    static uint32_t* d_pools[16] = {};
+    int dev = 0;
+    (void)hipGetDevice(&dev);
+    if (dev < 0 || dev >= 16) dev = 0;
+    uint32_t* base = __atomic_load_n(&d_pools[dev], __ATOMIC_ACQUIRE);
+    if (__builtin_expect(base == nullptr, 0)) {
+        std::lock_guard<std::mutex> lk(mtx);
+        base = d_pools[dev];
+        if (base == nullptr) {
+            void* ptr = nullptr;
+            if (hipMalloc(&ptr, 8u * 16u * sizeof(uint32_t)) != hipSuccess || ptr == nullptr) {
+                throw std::runtime_error("hipMalloc failed for dev3_finish local CTA counters");
+            }
+            (void)hipMemset(ptr, 0, 8u * 16u * sizeof(uint32_t));
+            (void)hipStreamSynchronize(nullptr);
+            base = static_cast<uint32_t*>(ptr);
+            __atomic_store_n(&d_pools[dev], base, __ATOMIC_RELEASE);
+        }
+    }
+    const size_t s = size_t((req_seq - 1u) & 7u);
+    return base + s * 16u;
+}
+}  // namespace
+
+void prewarm_host_ring_and_dev3_local_ctas() {
+    (void)get_host_ring_local_ctas(1ULL);
+    (void)get_dev3_finish_local_cta(1u);
+}
+
+__global__ __launch_bounds__(256, 4)
+void k_dev3_finish_f32_hc_post(
+    const float*    __restrict__ d_dev3_y_f32,
+    const uint32_t* __restrict__ d_dev3_done_seq,
+    uint32_t*       __restrict__ d_rank_done_seq,
+    uint32_t*       __restrict__ d_local_cta,
+    uint32_t dev3_req_seq,
+    const uint16_t* __restrict__ d_res_bf16,
+    const float*    __restrict__ d_post_f32,
+    const float*    __restrict__ d_comb_f32,
+    uint16_t*       __restrict__ d_out_h_bf16,
+    int M)
+{
+    const int tid = int(threadIdx.x);
+    const int d   = int(blockIdx.x) * 256 + tid;
+
+    if (tid == 0 && d_dev3_done_seq != nullptr) {
+        while (static_cast<int32_t>(
+                   __hip_atomic_load(d_dev3_done_seq, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) - dev3_req_seq) < 0) {
+            __builtin_amdgcn_s_sleep(1);
+        }
+    }
+    __syncthreads();
+
+    for (int m = 0; m < M; ++m) {
+        const size_t idx = size_t(m) * 5120u + size_t(d);
+        const uint32_t yu = __hip_atomic_load(
+            &reinterpret_cast<const uint32_t*>(d_dev3_y_f32)[idx],
+            __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        const float xv = __uint_as_float(yu);
+
+        const uint16_t* rs = d_res_bf16 + size_t(m) * 20480u + size_t(d);
+        const float r0 = d_bf16_to_f32(rs[0]);
+        const float r1 = d_bf16_to_f32(rs[5120]);
+        const float r2 = d_bf16_to_f32(rs[10240]);
+        const float r3 = d_bf16_to_f32(rs[15360]);
+
+        const float* ps = d_post_f32 + m * 4;
+        const float* cb = d_comb_f32 + m * 16;
+        uint16_t* dst = d_out_h_bf16 + size_t(m) * 20480u + size_t(d);
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float h_val = ps[j] * xv + cb[0 * 4 + j] * r0 + cb[1 * 4 + j] * r1 +
+                                cb[2 * 4 + j] * r2 + cb[3 * 4 + j] * r3;
+            dst[j * 5120] = d_f32_to_bf16_rne(h_val);
+        }
+    }
+    __syncthreads();
+
+    if (tid == 0 && d_rank_done_seq != nullptr) {
+        __threadfence_system();
+        const uint32_t prev = __hip_atomic_fetch_add(d_local_cta, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        if (prev + 1u == uint32_t(gridDim.x)) {
+            __hip_atomic_store(d_local_cta, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __threadfence_system();
+            __hip_atomic_store(d_rank_done_seq, dev3_req_seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        }
+    }
+}
+
+__global__ __launch_bounds__(256, 4)
+void k_dev3_finish_f32_mhc_fused(
+    const float*    __restrict__ d_dev3_y_f32,
+    const uint32_t* __restrict__ d_dev3_done_seq,
+    uint32_t*       __restrict__ d_rank_done_seq,
+    uint32_t*       __restrict__ d_local_cta,
+    uint32_t dev3_req_seq,
+    const uint16_t* __restrict__ d_res_bf16,
+    const float*    __restrict__ d_post_f32,
+    const float*    __restrict__ d_comb_f32,
+    uint16_t*       __restrict__ d_out_h_bf16,
+    const float*    __restrict__ d_next_pre_f32,
+    const uint16_t* __restrict__ d_next_norm_w,
+    uint16_t*       __restrict__ d_out_norm_bf16,
+    uint16_t*       __restrict__ d_out_raw_bf16,
+    uint8_t*        __restrict__ d_out_fp8,
+    uint8_t*        __restrict__ d_out_ue8m0,
+    float norm_eps)
+{
+    __shared__ uint16_t s_raw[5120];
+    __shared__ float s_wave[4];
+
+    const int m   = int(blockIdx.x);
+    const int tid = int(threadIdx.x);
+
+    if (tid == 0 && d_dev3_done_seq != nullptr) {
+        while (static_cast<int32_t>(
+                   __hip_atomic_load(d_dev3_done_seq, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) - dev3_req_seq) < 0) {
+            __builtin_amdgcn_s_sleep(1);
+        }
+    }
+    __syncthreads();
+
+    const float* ps = d_post_f32 + m * 4;
+    const float* cb = d_comb_f32 + m * 16;
+    const float np0 = d_next_pre_f32[m * 4 + 0];
+    const float np1 = d_next_pre_f32[m * 4 + 1];
+    const float np2 = d_next_pre_f32[m * 4 + 2];
+    const float np3 = d_next_pre_f32[m * 4 + 3];
+
+    float sq = 0.0f;
+    for (int d = tid; d < 5120; d += 256) {
+        const size_t idx = size_t(m) * 5120u + size_t(d);
+        const uint32_t yu = __hip_atomic_load(
+            &reinterpret_cast<const uint32_t*>(d_dev3_y_f32)[idx],
+            __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        const float xv = __uint_as_float(yu);
+
+        const uint16_t* rs = d_res_bf16 + size_t(m) * 20480u + size_t(d);
+        const float r0 = d_bf16_to_f32(rs[0]);
+        const float r1 = d_bf16_to_f32(rs[5120]);
+        const float r2 = d_bf16_to_f32(rs[10240]);
+        const float r3 = d_bf16_to_f32(rs[15360]);
+
+        uint16_t* dst = d_out_h_bf16 + size_t(m) * 20480u + size_t(d);
+        uint16_t hb[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float h_val = ps[j] * xv + cb[0 * 4 + j] * r0 + cb[1 * 4 + j] * r1 +
+                                cb[2 * 4 + j] * r2 + cb[3 * 4 + j] * r3;
+            hb[j] = d_f32_to_bf16_rne(h_val);
+            dst[j * 5120] = hb[j];
+        }
+
+        const float y = np0 * d_bf16_to_f32(hb[0]) +
+                        np1 * d_bf16_to_f32(hb[1]) +
+                        np2 * d_bf16_to_f32(hb[2]) +
+                        np3 * d_bf16_to_f32(hb[3]);
+        const uint16_t yb = d_f32_to_bf16_rne(y);
+        s_raw[d] = yb;
+        if (d_out_raw_bf16) d_out_raw_bf16[idx] = yb;
+        const float yf = d_bf16_to_f32(yb);
+        sq += yf * yf;
+    }
+
+    sq = d_wave_sum64(sq);
+    if ((tid & 63) == 0) s_wave[tid >> 6] = sq;
+    __syncthreads();
+
+    const float total_sq = s_wave[0] + s_wave[1] + s_wave[2] + s_wave[3];
+    const float rstd = rsqrtf(total_sq * (1.0f / 5120.0f) + norm_eps);
+    uint16_t* dst_norm = d_out_norm_bf16 + size_t(m) * 5120u;
+    const int lane = tid & 31;
+
+    for (int d = tid; d < 5120; d += 256) {
+        const float v = d_bf16_to_f32(s_raw[d]) * rstd * d_bf16_to_f32(d_next_norm_w[d]);
+        const uint16_t nb = d_f32_to_bf16_rne(v);
+        dst_norm[d] = nb;
+        if (d_out_fp8 != nullptr) {
+            const float xf = d_bf16_to_f32(nb);
+            const float amax = fmaxf(d_subwave_max32(fabsf(xf)), 1e-4f);
+            uint8_t ue8 = 0u;
+            const float sc = d_fast_round_scale_ue8m0(amax, 1.0f / 448.0f, ue8);
+            const float q_in = fmaxf(-448.0f, fminf(448.0f, xf / sc));
+            d_out_fp8[size_t(m) * 5120u + size_t(d)] = d_f32_to_fp8_e4m3(q_in);
+            if (lane == 0 && d_out_ue8m0 != nullptr) {
+                d_out_ue8m0[size_t(m) * 160u + size_t(d >> 5)] = ue8;
+            }
+        }
+    }
+    __syncthreads();
+
+    if (tid == 0 && d_rank_done_seq != nullptr) {
+        __threadfence_system();
+        const uint32_t prev = __hip_atomic_fetch_add(d_local_cta, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        if (prev + 1u == uint32_t(gridDim.x)) {
+            __hip_atomic_store(d_local_cta, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __threadfence_system();
+            __hip_atomic_store(d_rank_done_seq, dev3_req_seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        }
+    }
+}
+
+void launch_dev3_finish_f32_hc_post(
+    const float* d_dev3_y_f32, const uint32_t* d_dev3_done_seq,
+    uint32_t* d_rank_done_seq, uint32_t dev3_req_seq,
+    const uint16_t* d_res_bf16, const float* d_post_f32, const float* d_comb_f32,
+    uint16_t* d_out_h_bf16, int M, hipStream_t stream)
+{
+    if (M <= 0) return;
+    uint32_t* d_cta = get_dev3_finish_local_cta(dev3_req_seq);
+    hipLaunchKernelGGL(k_dev3_finish_f32_hc_post, dim3(20), dim3(256), 0, stream,
+                       d_dev3_y_f32, d_dev3_done_seq, d_rank_done_seq, d_cta, dev3_req_seq,
+                       d_res_bf16, d_post_f32, d_comb_f32, d_out_h_bf16, M);
+}
+
+void launch_dev3_finish_f32_mhc_fused(
+    const float* d_dev3_y_f32, const uint32_t* d_dev3_done_seq,
+    uint32_t* d_rank_done_seq, uint32_t dev3_req_seq,
+    const uint16_t* d_res_bf16, const float* d_post_f32, const float* d_comb_f32,
+    uint16_t* d_out_h_bf16, const float* d_next_pre_f32, const uint16_t* d_next_norm_w,
+    uint16_t* d_out_norm_bf16, uint16_t* d_out_raw_bf16,
+    uint8_t* d_out_fp8, uint8_t* d_out_ue8m0,
+    float norm_eps, int M, hipStream_t stream)
+{
+    if (M <= 0) return;
+    uint32_t* d_cta = get_dev3_finish_local_cta(dev3_req_seq);
+    hipLaunchKernelGGL(k_dev3_finish_f32_mhc_fused, dim3(M), dim3(256), 0, stream,
+                       d_dev3_y_f32, d_dev3_done_seq, d_rank_done_seq, d_cta, dev3_req_seq,
+                       d_res_bf16, d_post_f32, d_comb_f32, d_out_h_bf16,
+                       d_next_pre_f32, d_next_norm_w, d_out_norm_bf16, d_out_raw_bf16,
+                       d_out_fp8, d_out_ue8m0, norm_eps);
 }
 
 void launch_mhc_post_res_pre_rmsnorm_quant_i8(
@@ -6625,7 +8016,7 @@ void launch_indexer_score(
         hipLaunchKernelGGL((k_indexer_score_msplit<8>), dim3(tx, 1), dim3(256), 0, stream,
                            d_q_bf16, d_k_fp4, d_k_ue8m0, d_weights_bf16, d_out_score_f32, M, ih_cnt, T_comp);
     } else {
-        hipLaunchKernelGGL((k_indexer_score_msplit<6>), dim3(tx, (M + 5) / 6), dim3(256), 0, stream,
+        hipLaunchKernelGGL((k_indexer_score_msplit<10>), dim3(tx, (M + 9) / 10), dim3(256), 0, stream,
                            d_q_bf16, d_k_fp4, d_k_ue8m0, d_weights_bf16, d_out_score_f32, M, ih_cnt, T_comp);
     }
 }
@@ -6634,13 +8025,56 @@ void launch_indexer_candidates_and_topk(
     float* d_score_f32, uint32_t* d_cand_block_mask, int cand_block_stride,
     int32_t* d_out_comp_idxs,
     int M, int T_comp, int start_pos, int ratio, int mode, int K_out, hipStream_t stream,
-    TreeAncMask256 tree_anc_mask, uint64_t tree_depth_nibbles, int q_row_offset)
+    TreeAncMask256 tree_anc_mask, uint64_t tree_depth_nibbles, int q_row_offset,
+    int32_t* d_cand_block_ids, int32_t* d_cand_block_cnt)
 {
     if (M <= 0 || T_comp <= 0 || K_out <= 0) return;
     float* block_scratch = d_score_f32 + size_t(M) * size_t(T_comp);
-    hipLaunchKernelGGL(k_indexer_candidates_and_topk, dim3(M), dim3(256), 0, stream,
+    // Wave 9.4 Phase D: 60-CU Split-KV block-max + <=16K candidate radix select for large T_comp > 16384!
+    if ((mode == 0 || mode == 1) && T_comp > 16384 && d_cand_block_ids != nullptr) {
+        const uint32_t split_x = (M <= 16) ? 32u : ((M <= 64) ? 8u : 2u);
+        hipLaunchKernelGGL(k_w94_indexer_causal_and_blockmax, dim3(split_x, uint32_t(M)), dim3(256), 0, stream,
+                           d_score_f32, block_scratch, T_comp, start_pos, ratio, mode,
+                           tree_anc_mask, tree_depth_nibbles, q_row_offset);
+        hipLaunchKernelGGL(k_w94_indexer_splitkv_select, dim3(uint32_t(M)), dim3(256), 0, stream,
+                           d_score_f32, block_scratch, d_cand_block_mask, cand_block_stride,
+                           d_cand_block_ids, d_cand_block_cnt, d_out_comp_idxs,
+                           T_comp, start_pos, ratio, mode, K_out,
+                           tree_anc_mask, tree_depth_nibbles, q_row_offset);
+        return;
+    }
+    hipLaunchKernelGGL(k_indexer_candidates_and_topk, dim3(uint32_t(M)), dim3(256), 0, stream,
                        d_score_f32, d_cand_block_mask, cand_block_stride,
                        d_out_comp_idxs, T_comp, start_pos, ratio, mode, K_out, block_scratch,
+                       tree_anc_mask, tree_depth_nibbles, q_row_offset,
+                       d_cand_block_ids, d_cand_block_cnt);
+}
+
+void launch_w94_indexer_score_cand(
+    const uint16_t* d_q_bf16, const uint8_t* d_k_fp4, const uint8_t* d_k_ue8m0,
+    const uint16_t* d_weights_bf16,
+    const int32_t* d_cand_block_ids, const int32_t* d_cand_block_cnt,
+    float* d_out_score_f32,
+    int M, int ih_cnt, int T_comp, int K_cand, hipStream_t stream)
+{
+    if (M <= 0 || T_comp <= 0 || K_cand <= 0) return;
+    const uint32_t tx = uint32_t((K_cand + 255) / 256);
+    hipLaunchKernelGGL(k_w94_indexer_score_cand, dim3(tx, uint32_t(M)), dim3(256), 0, stream,
+                       d_q_bf16, d_k_fp4, d_k_ue8m0, d_weights_bf16,
+                       d_cand_block_ids, d_cand_block_cnt, d_out_score_f32,
+                       ih_cnt, T_comp, K_cand);
+}
+
+void launch_w94_indexer_cand_topk(
+    float* d_score_f32, const int32_t* d_cand_block_ids, const int32_t* d_cand_block_cnt,
+    int32_t* d_out_comp_idxs,
+    int M, int T_comp, int K_cand, int start_pos, int ratio, int K_out,
+    hipStream_t stream, TreeAncMask256 tree_anc_mask, uint64_t tree_depth_nibbles, int q_row_offset)
+{
+    if (M <= 0 || T_comp <= 0 || K_cand <= 0 || K_out <= 0) return;
+    hipLaunchKernelGGL(k_w94_indexer_cand_topk, dim3(uint32_t(M)), dim3(256), 0, stream,
+                       d_score_f32, d_cand_block_ids, d_cand_block_cnt, d_out_comp_idxs,
+                       T_comp, K_cand, start_pos, ratio, K_out,
                        tree_anc_mask, tree_depth_nibbles, q_row_offset);
 }
 

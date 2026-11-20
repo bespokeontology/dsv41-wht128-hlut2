@@ -11,7 +11,9 @@
 #include "../src/dsv41_rarebal.hpp"
 #include "dsv41_think_loop_guard.hpp"
 #include "dsv41_tree_spec.hpp"
-#include "dsv41_hlut3_kernels.hpp"  // Wave 9 opt-in HLUT3 MTP overlay decode path
+#include "dsv41_hlut3_kernels.hpp"      // Wave 9 opt-in HLUT3 MTP overlay decode path
+#include "dsv41_hlut3_offload_ipc.hpp"  // Wave 9.2 SB-M4-P2-176G asymmetric 4th-GPU HLUT3 offload engine
+#include "dsv41_wave9_3_rocblas.hpp"    // Wave 9.3 Phase B Weight-Unpack-Once + rocBLAS FP16->FP32 prefill engine
 
 #include <immintrin.h>
 #include <sys/stat.h>
@@ -79,12 +81,12 @@ static constexpr std::array<int32_t, kTree8NumNodes>  kTree8Parents = {-1, 0, 0,
 static constexpr std::array<uint32_t, kTree8NumNodes> kTree8Depths  = {0u, 1u, 1u, 1u, 2u, 2u, 2u, 3u};
 static constexpr int32_t kDSparkNoiseId = 128799;
 static constexpr int kMarkovRank        = 256;
-static constexpr int kMaxChunkM         = 512;   // Dumitrescu MR vs MP block law: M=512 fits P150A L1 MR!
+static constexpr int kMaxChunkM         = 4096;  // Wave 9.4 Phase C: 4K CED encoder prefill chunks -> 2x larger expert buckets + 1-pass P150A!
 static constexpr int kMaxDecChunkM      = 512;   // Decoder M=512 (keeps d_cand_block_mask at 16 MiB!)
 static constexpr int kMaxDecM           = 320;   // Padded multiple of 64 for decoder-only taps/heads!
 static constexpr int kF32RingMaxM       = 64;    // Dumitrescu mixed-precision FP32 ring + FP32 mHC post -> 1 RNE BF16!
 static constexpr int kMhcFusedMaxM      = 16;    // Wave 8.5B cross-sublayer mHC + RMSNorm + UE8M0/WHT128 decode fast path!
-static constexpr size_t kPartF32Floats  = 512u * 25600u; // 13,107,200 floats = 50.00 MiB
+static constexpr size_t kPartF32Floats  = 4096u * 5120u;  // 20,971,520 floats = 80.00 MiB (covers M=4096 MoE FP32 accum!)
 
 // Exact 890 B/tok 128-token RadixBlock layout across Slots 0..2 (r=2, 64 slots) and Slot 3 (r=1, 128 slots):
 //   Per r=2 slot (0..2): fp4[64*256=16384] + e4m3[64*32=2048] + ik_fp4[64*64=4096] + ik_ue8[64*4=256] = 22,784 B
@@ -289,12 +291,16 @@ struct BlockGpuWeights {
     uint16_t* d_hlut2_down_sc   = nullptr;
     float*    d_hlut2_down_cent = nullptr;
 
-    // Wave 9 opt-in HLUT3 MTP overlay planes. Populated ONLY when --hlut3-mtp-overlay <path> is
-    // supplied; default production 2.125 bpw HLUT2 footprint stays byte-identical when unset.
+    // Wave 9 opt-in HLUT3 MTP overlay planes + Wave 9.2 TP3/DEV3 tier sub-ranges:
     bool has_hlut3 = false;
-    Hlut3Tile32x32* d_hlut3_gate_tiles = nullptr;  // [128 experts, 24 nt, 160 kt] 400 B tiles
+    int tp3_hlut2_experts = 0;  // [0 .. tp3_hlut2_experts) compacted HLUT2 on TP3
+    int tp3_hlut3_begin   = 0;  // [tp3_hlut3_begin .. tp3_hlut3_begin + tp3_hlut3_count) sharded HLUT3 on TP3
+    int tp3_hlut3_count   = 0;
+    int dev3_hlut3_begin  = 0;  // [dev3_hlut3_begin .. dev3_hlut3_begin + dev3_hlut3_count) unsharded HLUT3 on dev3
+    int dev3_hlut3_count  = 0;
+    Hlut3Tile32x32* d_hlut3_gate_tiles = nullptr;
     Hlut3Tile32x32* d_hlut3_up_tiles   = nullptr;
-    Hlut3Tile32x32* d_hlut3_down_tiles = nullptr;  // [128 experts, 160 nt, 24 kt] 400 B tiles
+    Hlut3Tile32x32* d_hlut3_down_tiles = nullptr;
 
     // MTP extras (markov_head.embed.weight kept in host DDR4, saving 21.05 MiB HBM2/GPU!)
     uint16_t* d_main_norm       = nullptr;  // mtp_0
@@ -323,6 +329,7 @@ struct TpRankContext {
     hipEvent_t ev_router_done = nullptr;
     hipEvent_t ev_router_done_ring[kNumLayers]{};
     hipEvent_t ev_p150_armed_ring[kNumLayers]{};
+    hipEvent_t ev_dev3_armed_ring[kTotalBlocks]{};
     hipEvent_t ev_engram_ready[2]{};
     hipEvent_t ev_engram_consumed[2]{};
     hipEvent_t ev_engram_h2d_done[2][2]{};
@@ -386,6 +393,8 @@ struct TpRankContext {
 
     int32_t*  d_comp_topk_idxs  = nullptr; // [M, 512]
     uint32_t* d_cand_block_mask = nullptr; // [M, cand_block_stride] bit-packed (1 bit per 8 compressed keys!)
+    int32_t*  d_cand_block_ids  = nullptr; // Wave 9.4 Phase D: [kMaxDecChunkM, 2048] compact candidate block IDs (4.0 MiB/rank)
+    int32_t*  d_cand_block_cnt  = nullptr; // Wave 9.4 Phase D: [kMaxDecChunkM] valid candidate block count per row (2 KiB/rank)
     uint32_t* d_p150_wg_sync    = nullptr; // [1] device CTA barrier counter on tp=0 for k_stage_and_arm_p150_shm
 
     float*    d_comp_kv_tmp_f32    = nullptr; // [M, 512]
@@ -407,17 +416,21 @@ struct TpRankContext {
     uint16_t*       d_expert_perm     = nullptr; // [40, 384] U16 logical->physical expert LUT (30,720 B)
     Mi50RoutedPair* d_routed_pairs    = nullptr; // [M * 6]
     int32_t*        d_active_experts  = nullptr; // [256]
+    RocblasPrefillEngine rb_prefill;             // Wave 9.3 Phase B fixed 83.5 MiB/rank FP16->FP32 prefill GEMM engine
     int32_t*        d_csr_offsets     = nullptr; // [257]
     uint16_t*       d_inter_bf16      = nullptr; // [M * 6, 768]
     uint16_t*       d_inter_rot_f16   = nullptr; // [M * 6, 768]
     float*          d_moe_part_f32    = nullptr; // aliased to d_part_f32
 
-    // Wave 9 opt-in HLUT3 MTP overlay workspace (0 B when unset!). TP3 slice geometry is
-    // gate/up N=768 K=5120 and down N=5120 K=768; MTP decode M<=16 top_k=3 -> P<=48.
-    float*          d_hlut3_levels    = nullptr; // [4] positive Gaussian Lloyd-Max centroids
-    float*          d_hlut3_z         = nullptr; // [48, 768] SwiGLU intermediate FP32
-    float*          d_hlut3_zrot      = nullptr; // [48, 768] inverse-WHT128 intermediate FP32
-    float*          d_x_rot_f32       = nullptr; // [16, 5120] opt-in FP32 activation staging
+    // Wave 9 / 9.2 HLUT3 workspace (0 B when unset!). TP3 slice geometry is
+    // gate/up N=768 K=5120 and down N=5120 K=768.
+    float*          d_hlut3_levels      = nullptr; // [4] positive Gaussian Lloyd-Max centroids
+    float*          d_hlut3_z           = nullptr; // [512, 768] SwiGLU intermediate FP32
+    float*          d_hlut3_zrot        = nullptr; // [512, 768] inverse-WHT128 intermediate FP32
+    float*          d_x_rot_f32         = nullptr; // [16, 5120] opt-in FP32 activation staging
+    Mi50RoutedPair* d_tp3_hlut3_pairs   = nullptr; // [M * 6] ranged TP3 HLUT3 pairs
+    uint32_t*       d_dev3_stage_wg_sync= nullptr; // [16 * 16] local HBM2 counters on tp=0 for dev3 staging
+    uint16_t*       h_x_rot_f16         = nullptr; // [M * 5120] pinned FP16 rotated input on tp=0 for M>64 dev3 prefill
     float*          d_moe_sum_f32     = nullptr; // aliased to d_sum_f32
     uint16_t*       d_p150_out_bf16   = nullptr; // [M, 5120]
     float*          d_ar_recv[4][2]{};           // [slot=0..3][peer=0..1] fine-grained coherent P2P posted-write ring
@@ -442,9 +455,12 @@ struct TpRankContext {
     uint16_t*       h_x_moe_bf16   = nullptr; // [M * 5120]
     uint8_t*        h_radix_stage  = nullptr; // [8 MiB] pinned Radix DMA buffer 0 on tp=0
     uint8_t*        h_radix_stage2 = nullptr; // [8 MiB] pinned Radix DMA buffer 1 on tp=0
-    Mi50RoutedPair* h_routed_pairs = nullptr; // [M * 6] pinned routed pairs on tp=0
-    int32_t*        h_active_exp   = nullptr; // [256] pinned active experts on tp=0
-    int32_t*        h_csr_offsets  = nullptr; // [257] pinned CSR offsets on tp=0
+    Mi50RoutedPair* h_routed_pairs    = nullptr; // [M * 6] pinned routed pairs on tp=0
+    int32_t*        h_active_exp      = nullptr; // [256] pinned active experts on tp=0
+    int32_t*        h_csr_offsets     = nullptr; // [257] pinned CSR offsets on tp=0
+    Mi50RoutedPair* h_tp3_hlut3_pairs = nullptr; // [M * 6] dedicated pinned TP3 HLUT3 pairs on tp=0
+    int32_t*        h_tp3_active_exp  = nullptr; // [256] dedicated pinned TP3 HLUT3 active experts on tp=0
+    int32_t*        h_tp3_csr_offsets = nullptr; // [257] dedicated pinned TP3 HLUT3 CSR offsets on tp=0
 
     inline uint32_t* hc_wg_sync_ptr() const noexcept {
         return d_conf_out_f32 ? reinterpret_cast<uint32_t*>(d_conf_out_f32 + 32) : nullptr;
@@ -498,6 +514,23 @@ struct Dsv41Runtime::Impl {
     // Wave 9 opt-in HLUT3 MTP overlay state (path empty -> 0 allocations, 0 footprint change).
     std::string hlut3_mtp_overlay_path;
     bool hlut3_mtp_overlay_enabled = false;
+
+    // Wave 9.2 SB-M4-P2-176G 4th-GPU offload + TP3 in-place HLUT3 promotion state:
+    Hlut3Dev3Engine dev3_engine;
+    std::string hlut3_dev3_overlay_path;
+    int hlut3_dev3_id = 3;
+    std::string hlut3_tp3_overlay_path;
+    std::unique_ptr<SafetensorsMmap> hlut3_tp3_mmap;
+    bool dev3_mtp_planned = false;
+    bool tp3_hlut3_any_planned = false;
+    bool wave9_2_perm_ready = false;
+    std::array<int, kNumLayers> layer_n_hlut2{};
+    std::array<int, kNumLayers> layer_n_tp3_hlut3{};
+    std::array<int, kNumLayers> layer_n_dev3_hlut3{};
+    std::array<std::array<uint16_t, kMi50BackboneExp>, kNumLayers> layer_hlut2_orig_pe{};
+    std::array<std::array<uint16_t, kBackboneExperts>, kNumLayers> wave9_2_composed_perm{};
+    std::vector<Mi50RoutedPair> tp3_hlut3_pairs_buf;
+    std::vector<Mi50RoutedPair> dev3_hlut3_pairs_buf;
 
     // Coherent mapped pinned DDR4 Markov embedding [129280, 256] BF16 (63.1 MiB in DDR4 -> 0 B HBM2!) + GPU DSpark slot
     uint16_t* h_markov_embed_mapped = nullptr;
@@ -621,6 +654,12 @@ struct Dsv41Runtime::Impl {
     std::vector<Mi50RoutedPair> mi50_sorted_pairs_buf;
     std::vector<int32_t> mi50_active_exp_buf;
     std::vector<int32_t> mi50_csr_buf;
+    bool rocblas_prefill_enabled  = true;
+    int  rocblas_expert_thresh    = 18; // Wave 9.4: exact gfx906 HHHS vs fdot2 crossover (1.33x @ 24, 5.39x @ 64)
+    int  rocblas_hlut2_thresh     = 20; // Wave 9.4: B=8 HHHS vs parallel k_hlut2_grouped crossover (keeps M<=256 fast!)
+    float dspark_tree8_conf_thresh = kTree8Top1ConfThresh;
+    int   dspark_chain_max_b       = kDSparkBlockSize;
+    std::vector<RocblasPrefillEngine::ExpertBucketDesc> rb_buckets_buf;
     std::vector<float> host_full_logits;
     std::vector<double> host_tree_probs_f64;
     std::array<std::vector<float>, kDSparkBlockSize> draft_q_probs;
@@ -638,11 +677,17 @@ struct Dsv41Runtime::Impl {
     double sub_att_sparse_ms = 0.0;
     double sub_att_wo_ms = 0.0;
     double sub_att_ar_ms = 0.0;
+    double sub_moe_router_ms = 0.0;
     double sub_moe_sh_ms = 0.0;
     double sub_moe_hlut_ms = 0.0;
+    double sub_moe_tp3_hlut2_ms = 0.0;
+    double sub_moe_tp3_hlut3_ms = 0.0;
+    double sub_moe_dev3_wait_ms = 0.0;
     double sub_moe_ar_ms = 0.0;
     double sub_mhc_ms = 0.0;
     double sub_commit_ms = 0.0;
+    uint64_t dev3_base_dispatches = 0;
+    double dev3_base_busy_ms = 0.0;
     bool sync_timers = false;
     struct PreRopeSlotCapture {
         std::vector<uint16_t> lat[3][4];
@@ -665,11 +710,17 @@ struct Dsv41Runtime::Impl {
         sub_att_sparse_ms = 0.0;
         sub_att_wo_ms = 0.0;
         sub_att_ar_ms = 0.0;
+        sub_moe_router_ms = 0.0;
         sub_moe_sh_ms = 0.0;
         sub_moe_hlut_ms = 0.0;
+        sub_moe_tp3_hlut2_ms = 0.0;
+        sub_moe_tp3_hlut3_ms = 0.0;
+        sub_moe_dev3_wait_ms = 0.0;
         sub_moe_ar_ms = 0.0;
         sub_mhc_ms = 0.0;
         sub_commit_ms = 0.0;
+        dev3_base_dispatches = dev3_engine.dispatches();
+        dev3_base_busy_ms = dev3_engine.busy_ms();
     }
 
     inline void sync_tp0_if_profiling() {
@@ -692,9 +743,11 @@ struct Dsv41Runtime::Impl {
         if (nvme_writer_thread.joinable()) nvme_writer_thread.join();
         if (eg_worker_thread.joinable()) eg_worker_thread.join();
         if (postproc_worker_thread.joinable()) postproc_worker_thread.join();
+        dev3_engine.shutdown();
 
         for (int tp = 0; tp < kTpSize; ++tp) {
             (void)hipSetDevice(tp);
+            ctx[tp].rb_prefill.shutdown();
             if (ctx[tp].h_dpm_flag)    *ctx[tp].h_dpm_flag = 0u;
             if (ctx[tp].keep_warm_stream) (void)hipStreamSynchronize(ctx[tp].keep_warm_stream);
             if (ctx[tp].stream)        (void)hipStreamSynchronize(ctx[tp].stream);
@@ -707,6 +760,9 @@ struct Dsv41Runtime::Impl {
             for (int l = 0; l < kNumLayers; ++l) {
                 if (ctx[tp].ev_router_done_ring[l]) (void)hipEventDestroy(ctx[tp].ev_router_done_ring[l]);
                 if (ctx[tp].ev_p150_armed_ring[l])  (void)hipEventDestroy(ctx[tp].ev_p150_armed_ring[l]);
+            }
+            for (int b = 0; b < kTotalBlocks; ++b) {
+                if (ctx[tp].ev_dev3_armed_ring[b])  (void)hipEventDestroy(ctx[tp].ev_dev3_armed_ring[b]);
             }
             for (int s = 0; s < 2; ++s) {
                 if (ctx[tp].ev_engram_ready[s])    (void)hipEventDestroy(ctx[tp].ev_engram_ready[s]);
@@ -997,33 +1053,128 @@ struct Dsv41Runtime::Impl {
         if (st.contains("ffn.gate.bias_vl")) {
             b.d_gate_bias_vl = upload_tensor_to_gpu<float>(st, "ffn.gate.bias_vl", allocs);
         }
-        b.d_sh_w13_w = upload_concat2_to_gpu<uint8_t>(st, "ffn.shared_experts.w1.weight", "ffn.shared_experts.w3.weight", allocs);
-        b.d_sh_w13_s = upload_concat2_to_gpu<uint8_t>(st, "ffn.shared_experts.w1.scale",  "ffn.shared_experts.w3.scale",  allocs);
-        b.d_sh_w2_w  = upload_tensor_to_gpu<uint8_t>(st, "ffn.shared_experts.w2.weight", allocs);
-        b.d_sh_w2_s  = upload_tensor_to_gpu<uint8_t>(st, "ffn.shared_experts.w2.scale", allocs);
+        b.d_signs_h = upload_tensor_to_gpu<uint64_t>(st, "wht.signs_h", allocs);
+        b.d_signs_i = upload_tensor_to_gpu<uint64_t>(st, "wht.signs_i", allocs);
 
-        b.d_signs_h          = upload_tensor_to_gpu<uint64_t>(st, "wht.signs_h", allocs);
-        b.d_signs_i          = upload_tensor_to_gpu<uint64_t>(st, "wht.signs_i", allocs);
-        b.d_hlut2_gate_codes = upload_tensor_to_gpu<uint32_t>(st, "hlut2.gate_codes", allocs);
-        b.d_hlut2_gate_sc    = upload_tensor_to_gpu<uint16_t>(st, "hlut2.gate_scales", allocs);
-        b.d_hlut2_gate_cent  = upload_tensor_to_gpu<float>(st, "hlut2.gate_centroids", allocs);
-        b.d_hlut2_up_codes   = upload_tensor_to_gpu<uint32_t>(st, "hlut2.up_codes", allocs);
-        b.d_hlut2_up_sc      = upload_tensor_to_gpu<uint16_t>(st, "hlut2.up_scales", allocs);
-        b.d_hlut2_up_cent    = upload_tensor_to_gpu<float>(st, "hlut2.up_centroids", allocs);
-        b.d_hlut2_down_codes = upload_tensor_to_gpu<uint32_t>(st, "hlut2.down_codes", allocs);
-        b.d_hlut2_down_sc    = upload_tensor_to_gpu<uint16_t>(st, "hlut2.down_scales", allocs);
-        b.d_hlut2_down_cent  = upload_tensor_to_gpu<float>(st, "hlut2.down_centroids", allocs);
+        if (block_id >= kNumLayers && dev3_mtp_planned) {
+            // Wave 9.2 Tier-0: 100% of MTP FFN (FP8 shared_experts + 128 routed HLUT3 experts) is
+            // offloaded onto hlut3_dev=3 (0000:85:00.0), reclaiming +1,237.5 MiB/rank on C7/88/03!
+            b.tp3_hlut2_experts = 0;
+            b.tp3_hlut3_begin   = 0;
+            b.tp3_hlut3_count   = 0;
+            b.dev3_hlut3_begin  = 0;
+            b.dev3_hlut3_count  = kMtpExperts;
+        } else if (block_id < kNumLayers && wave9_2_perm_ready &&
+                   (layer_n_dev3_hlut3[size_t(block_id)] > 0 || layer_n_tp3_hlut3[size_t(block_id)] > 0)) {
+            b.d_sh_w13_w = upload_concat2_to_gpu<uint8_t>(st, "ffn.shared_experts.w1.weight", "ffn.shared_experts.w3.weight", allocs);
+            b.d_sh_w13_s = upload_concat2_to_gpu<uint8_t>(st, "ffn.shared_experts.w1.scale",  "ffn.shared_experts.w3.scale",  allocs);
+            b.d_sh_w2_w  = upload_tensor_to_gpu<uint8_t>(st, "ffn.shared_experts.w2.weight", allocs);
+            b.d_sh_w2_s  = upload_tensor_to_gpu<uint8_t>(st, "ffn.shared_experts.w2.scale", allocs);
 
-        if (rarebal_overlay_mmap) {
-            const int n_ov = apply_mi50_rarebal_overlay(
-                tp, block_id, b.mi50_experts,
-                b.d_hlut2_gate_codes, b.d_hlut2_gate_sc, b.d_hlut2_gate_cent,
-                b.d_hlut2_up_codes,   b.d_hlut2_up_sc,   b.d_hlut2_up_cent,
-                b.d_hlut2_down_codes, b.d_hlut2_down_sc, b.d_hlut2_down_cent,
-                *rarebal_overlay_mmap,
-                [](void* d_dst, const void* h_src, size_t nb) { copy_h2d_fast(d_dst, h_src, nb); });
-            if (tp == 0 && n_ov > 0) {
-                rarebal_mi50_patched_slots.fetch_add(n_ov, std::memory_order_relaxed);
+            const int n_hlut2 = layer_n_hlut2[size_t(block_id)];
+            const int n_tp3   = layer_n_tp3_hlut3[size_t(block_id)];
+            const int n_dev3  = layer_n_dev3_hlut3[size_t(block_id)];
+            b.tp3_hlut2_experts = n_hlut2;
+            b.tp3_hlut3_begin   = n_hlut2;
+            b.tp3_hlut3_count   = n_tp3;
+            b.dev3_hlut3_begin  = n_hlut2 + n_tp3;
+            b.dev3_hlut3_count  = n_dev3;
+
+            if (n_hlut2 > 0) {
+                constexpr size_t kCodesWords  = 24ULL * 320ULL * 32ULL;  // 245,760 uint32_t (983,040 B)
+                constexpr size_t kScalesHalfs = 24ULL * 40ULL * 32ULL;   //  30,720 uint16_t (61,440 B)
+                const auto* base_gc = reinterpret_cast<const uint32_t*>(st.tensor_bytes("hlut2.gate_codes"));
+                const auto* base_gs = reinterpret_cast<const uint16_t*>(st.tensor_bytes("hlut2.gate_scales"));
+                const auto* base_gm = reinterpret_cast<const float*>(st.tensor_bytes("hlut2.gate_centroids"));
+                const auto* base_uc = reinterpret_cast<const uint32_t*>(st.tensor_bytes("hlut2.up_codes"));
+                const auto* base_us = reinterpret_cast<const uint16_t*>(st.tensor_bytes("hlut2.up_scales"));
+                const auto* base_um = reinterpret_cast<const float*>(st.tensor_bytes("hlut2.up_centroids"));
+                const auto* base_dc = reinterpret_cast<const uint32_t*>(st.tensor_bytes("hlut2.down_codes"));
+                const auto* base_ds = reinterpret_cast<const uint16_t*>(st.tensor_bytes("hlut2.down_scales"));
+                const auto* base_dm = reinterpret_cast<const float*>(st.tensor_bytes("hlut2.down_centroids"));
+
+                b.d_hlut2_gate_codes = alloc_gpu_buf<uint32_t>(size_t(n_hlut2) * kCodesWords, allocs, false);
+                b.d_hlut2_gate_sc    = alloc_gpu_buf<uint16_t>(size_t(n_hlut2) * kScalesHalfs, allocs, false);
+                b.d_hlut2_gate_cent  = alloc_gpu_buf<float>(size_t(n_hlut2) * 2u, allocs, false);
+                b.d_hlut2_up_codes   = alloc_gpu_buf<uint32_t>(size_t(n_hlut2) * kCodesWords, allocs, false);
+                b.d_hlut2_up_sc      = alloc_gpu_buf<uint16_t>(size_t(n_hlut2) * kScalesHalfs, allocs, false);
+                b.d_hlut2_up_cent    = alloc_gpu_buf<float>(size_t(n_hlut2) * 2u, allocs, false);
+                b.d_hlut2_down_codes = alloc_gpu_buf<uint32_t>(size_t(n_hlut2) * kCodesWords, allocs, false);
+                b.d_hlut2_down_sc    = alloc_gpu_buf<uint16_t>(size_t(n_hlut2) * kScalesHalfs, allocs, false);
+                b.d_hlut2_down_cent  = alloc_gpu_buf<float>(size_t(n_hlut2) * 2u, allocs, false);
+
+                int n_ov = 0;
+                for (int k = 0; k < n_hlut2; ++k) {
+                    const int orig_pe = int(layer_hlut2_orig_pe[size_t(block_id)][size_t(k)]);
+                    const std::string pfx = "mi50.b" + std::to_string(block_id) + ".e" + std::to_string(orig_pe) + ".tp" + std::to_string(tp);
+                    const bool has_ov = (rarebal_overlay_mmap && rarebal_overlay_mmap->contains(pfx + ".gate_codes"));
+                    if (has_ov) {
+                        copy_h2d_fast(b.d_hlut2_gate_codes + size_t(k) * kCodesWords,  rarebal_overlay_mmap->tensor_bytes(pfx + ".gate_codes"),     kCodesWords * 4ULL);
+                        copy_h2d_fast(b.d_hlut2_gate_sc    + size_t(k) * kScalesHalfs, rarebal_overlay_mmap->tensor_bytes(pfx + ".gate_scales"),    kScalesHalfs * 2ULL);
+                        copy_h2d_fast(b.d_hlut2_gate_cent  + size_t(k) * 2u,           rarebal_overlay_mmap->tensor_bytes(pfx + ".gate_centroids"), 8ULL);
+                        copy_h2d_fast(b.d_hlut2_up_codes   + size_t(k) * kCodesWords,  rarebal_overlay_mmap->tensor_bytes(pfx + ".up_codes"),       kCodesWords * 4ULL);
+                        copy_h2d_fast(b.d_hlut2_up_sc      + size_t(k) * kScalesHalfs, rarebal_overlay_mmap->tensor_bytes(pfx + ".up_scales"),      kScalesHalfs * 2ULL);
+                        copy_h2d_fast(b.d_hlut2_up_cent    + size_t(k) * 2u,           rarebal_overlay_mmap->tensor_bytes(pfx + ".up_centroids"),   8ULL);
+                        copy_h2d_fast(b.d_hlut2_down_codes + size_t(k) * kCodesWords,  rarebal_overlay_mmap->tensor_bytes(pfx + ".down_codes"),     kCodesWords * 4ULL);
+                        copy_h2d_fast(b.d_hlut2_down_sc    + size_t(k) * kScalesHalfs, rarebal_overlay_mmap->tensor_bytes(pfx + ".down_scales"),    kScalesHalfs * 2ULL);
+                        copy_h2d_fast(b.d_hlut2_down_cent  + size_t(k) * 2u,           rarebal_overlay_mmap->tensor_bytes(pfx + ".down_centroids"), 8ULL);
+                        ++n_ov;
+                    } else {
+                        copy_h2d_fast(b.d_hlut2_gate_codes + size_t(k) * kCodesWords,  base_gc + size_t(orig_pe) * kCodesWords,  kCodesWords * 4ULL);
+                        copy_h2d_fast(b.d_hlut2_gate_sc    + size_t(k) * kScalesHalfs, base_gs + size_t(orig_pe) * kScalesHalfs, kScalesHalfs * 2ULL);
+                        copy_h2d_fast(b.d_hlut2_gate_cent  + size_t(k) * 2u,           base_gm + size_t(orig_pe) * 2u,           8ULL);
+                        copy_h2d_fast(b.d_hlut2_up_codes   + size_t(k) * kCodesWords,  base_uc + size_t(orig_pe) * kCodesWords,  kCodesWords * 4ULL);
+                        copy_h2d_fast(b.d_hlut2_up_sc      + size_t(k) * kScalesHalfs, base_us + size_t(orig_pe) * kScalesHalfs, kScalesHalfs * 2ULL);
+                        copy_h2d_fast(b.d_hlut2_up_cent    + size_t(k) * 2u,           base_um + size_t(orig_pe) * 2u,           8ULL);
+                        copy_h2d_fast(b.d_hlut2_down_codes + size_t(k) * kCodesWords,  base_dc + size_t(orig_pe) * kCodesWords,  kCodesWords * 4ULL);
+                        copy_h2d_fast(b.d_hlut2_down_sc    + size_t(k) * kScalesHalfs, base_ds + size_t(orig_pe) * kScalesHalfs, kScalesHalfs * 2ULL);
+                        copy_h2d_fast(b.d_hlut2_down_cent  + size_t(k) * 2u,           base_dm + size_t(orig_pe) * 2u,           8ULL);
+                    }
+                }
+                if (tp == 0 && n_ov > 0) {
+                    rarebal_mi50_patched_slots.fetch_add(n_ov, std::memory_order_relaxed);
+                }
+            }
+
+            if (n_tp3 > 0 && hlut3_tp3_mmap) {
+                const size_t n_tiles = size_t(n_tp3) * kHlut3Tp3ProjTiles;
+                const size_t proj_b  = n_tiles * sizeof(Hlut3Tile32x32);
+                const std::string pfx = "tp3.tp" + std::to_string(tp) + ".b" + std::to_string(block_id) + ".";
+                b.d_hlut3_gate_tiles = alloc_gpu_buf<Hlut3Tile32x32>(n_tiles, allocs, false);
+                b.d_hlut3_up_tiles   = alloc_gpu_buf<Hlut3Tile32x32>(n_tiles, allocs, false);
+                b.d_hlut3_down_tiles = alloc_gpu_buf<Hlut3Tile32x32>(n_tiles, allocs, false);
+                copy_h2d_fast(b.d_hlut3_gate_tiles, hlut3_tp3_mmap->tensor_bytes(pfx + "gate_tiles"), proj_b);
+                copy_h2d_fast(b.d_hlut3_up_tiles,   hlut3_tp3_mmap->tensor_bytes(pfx + "up_tiles"),   proj_b);
+                copy_h2d_fast(b.d_hlut3_down_tiles, hlut3_tp3_mmap->tensor_bytes(pfx + "down_tiles"), proj_b);
+            }
+        } else {
+            b.tp3_hlut2_experts = b.mi50_experts;
+            b.d_sh_w13_w = upload_concat2_to_gpu<uint8_t>(st, "ffn.shared_experts.w1.weight", "ffn.shared_experts.w3.weight", allocs);
+            b.d_sh_w13_s = upload_concat2_to_gpu<uint8_t>(st, "ffn.shared_experts.w1.scale",  "ffn.shared_experts.w3.scale",  allocs);
+            b.d_sh_w2_w  = upload_tensor_to_gpu<uint8_t>(st, "ffn.shared_experts.w2.weight", allocs);
+            b.d_sh_w2_s  = upload_tensor_to_gpu<uint8_t>(st, "ffn.shared_experts.w2.scale", allocs);
+
+            b.d_hlut2_gate_codes = upload_tensor_to_gpu<uint32_t>(st, "hlut2.gate_codes", allocs);
+            b.d_hlut2_gate_sc    = upload_tensor_to_gpu<uint16_t>(st, "hlut2.gate_scales", allocs);
+            b.d_hlut2_gate_cent  = upload_tensor_to_gpu<float>(st, "hlut2.gate_centroids", allocs);
+            b.d_hlut2_up_codes   = upload_tensor_to_gpu<uint32_t>(st, "hlut2.up_codes", allocs);
+            b.d_hlut2_up_sc      = upload_tensor_to_gpu<uint16_t>(st, "hlut2.up_scales", allocs);
+            b.d_hlut2_up_cent    = upload_tensor_to_gpu<float>(st, "hlut2.up_centroids", allocs);
+            b.d_hlut2_down_codes = upload_tensor_to_gpu<uint32_t>(st, "hlut2.down_codes", allocs);
+            b.d_hlut2_down_sc    = upload_tensor_to_gpu<uint16_t>(st, "hlut2.down_scales", allocs);
+            b.d_hlut2_down_cent  = upload_tensor_to_gpu<float>(st, "hlut2.down_centroids", allocs);
+
+            if (rarebal_overlay_mmap) {
+                const int n_ov = apply_mi50_rarebal_overlay(
+                    tp, block_id, b.mi50_experts,
+                    b.d_hlut2_gate_codes, b.d_hlut2_gate_sc, b.d_hlut2_gate_cent,
+                    b.d_hlut2_up_codes,   b.d_hlut2_up_sc,   b.d_hlut2_up_cent,
+                    b.d_hlut2_down_codes, b.d_hlut2_down_sc, b.d_hlut2_down_cent,
+                    *rarebal_overlay_mmap,
+                    [](void* d_dst, const void* h_src, size_t nb) { copy_h2d_fast(d_dst, h_src, nb); });
+                if (tp == 0 && n_ov > 0) {
+                    rarebal_mi50_patched_slots.fetch_add(n_ov, std::memory_order_relaxed);
+                }
             }
         }
 
@@ -1216,6 +1367,184 @@ struct Dsv41Runtime::Impl {
         std::fflush(stdout);
     }
 
+    // Wave 9.2 SB-M4-P2-176G tier plan & intra-MI50 bijection composer:
+    // Partitions physical [0..215] on every backbone layer l into contiguous sub-ranges:
+    //   [0 .. n_hlut2)                           -> compacted TP3 HLUT2 (cold MI50 experts)
+    //   [n_hlut2 .. n_hlut2 + n_tp3)             -> TP3-sharded WHT128-HLUT3 (warm-hot MI50 experts)
+    //   [n_hlut2 + n_tp3 .. 216)                 -> unsharded WHT128-HLUT3 on hlut3_dev=3 (85:00.0)
+    // while keeping [216..383] (2x Blackhole P150A) 100% bit-for-bit invariant!
+    void prepare_wave9_2_tier_plan(const std::string& rarebal_ov_path) {
+        dev3_mtp_planned = false;
+        tp3_hlut3_any_planned = false;
+        wave9_2_perm_ready = false;
+        hlut3_tp3_mmap.reset();
+        layer_n_hlut2.fill(kMi50BackboneExp);
+        layer_n_tp3_hlut3.fill(0);
+        layer_n_dev3_hlut3.fill(0);
+
+        if (hlut3_dev3_overlay_path.empty() && hlut3_tp3_overlay_path.empty()) {
+            return;
+        }
+
+        // 1. Load base 40x384 logical->physical bijection (identity if disabled/absent)
+        std::array<std::array<uint16_t, kBackboneExperts>, kNumLayers> base_perm{};
+        std::array<std::array<uint16_t, kBackboneExperts>, kNumLayers> base_inv{};
+        for (int l = 0; l < kNumLayers; ++l) {
+            for (int e = 0; e < kBackboneExperts; ++e) {
+                base_perm[size_t(l)][size_t(e)] = static_cast<uint16_t>(e);
+                base_inv[size_t(l)][size_t(e)]  = static_cast<uint16_t>(e);
+            }
+        }
+        if (!expert_perm_disabled) {
+            const uint16_t* p_raw = nullptr;
+            std::unique_ptr<SafetensorsMmap> ext_perm_st;
+            std::string perm_src;
+            if (!expert_perm_overlay_path.empty() && expert_perm_overlay_path != rarebal_ov_path) {
+                ext_perm_st = std::make_unique<SafetensorsMmap>(expert_perm_overlay_path);
+                if (ext_perm_st->contains("expert_perm_u16")) {
+                    p_raw = reinterpret_cast<const uint16_t*>(ext_perm_st->tensor_bytes("expert_perm_u16"));
+                    perm_src = expert_perm_overlay_path;
+                }
+            } else if (rarebal_overlay_mmap && rarebal_overlay_mmap->contains("expert_perm_u16")) {
+                p_raw = reinterpret_cast<const uint16_t*>(rarebal_overlay_mmap->tensor_bytes("expert_perm_u16"));
+                perm_src = rarebal_ov_path;
+            }
+            if (p_raw != nullptr) {
+                for (int l = 0; l < kNumLayers; ++l) {
+                    std::array<uint8_t, kBackboneExperts> seen{};
+                    for (int e = 0; e < kBackboneExperts; ++e) {
+                        const uint16_t pe = p_raw[size_t(l) * size_t(kBackboneExperts) + size_t(e)];
+                        if (pe >= kBackboneExperts || seen[pe] != 0u) {
+                            throw std::runtime_error("Invalid base expert_perm_u16 in " + perm_src);
+                        }
+                        seen[pe] = 1u;
+                        base_perm[size_t(l)][size_t(e)] = pe;
+                        base_inv[size_t(l)][size_t(pe)] = static_cast<uint16_t>(e);
+                    }
+                }
+            }
+        }
+
+        // 2. Inspect dev3 & tp3 HLUT3 overlays
+        std::array<std::vector<uint16_t>, kNumLayers> dev3_eids{};
+        std::array<std::vector<uint16_t>, kNumLayers> tp3_eids{};
+        int total_dev3_bb = 0;
+        int total_tp3_bb  = 0;
+
+        if (!hlut3_dev3_overlay_path.empty()) {
+            SafetensorsMmap dev3_st(hlut3_dev3_overlay_path);
+            if (dev3_st.contains("dev3.b40.gate_tiles") &&
+                dev3_st.contains("dev3.b41.gate_tiles") &&
+                dev3_st.contains("dev3.b42.gate_tiles")) {
+                dev3_mtp_planned = true;
+            }
+            for (int l = 0; l < kNumLayers; ++l) {
+                const std::string key = "dev3.b" + std::to_string(l) + ".logical_eids";
+                if (!dev3_st.contains(key)) continue;
+                const size_t nb = size_t(dev3_st.at(key).byte_size());
+                if ((nb % sizeof(uint16_t)) != 0) {
+                    throw std::runtime_error("Invalid byte size for " + key);
+                }
+                const int ne = int(nb / sizeof(uint16_t));
+                const auto* ptr = reinterpret_cast<const uint16_t*>(dev3_st.tensor_bytes(key));
+                dev3_eids[size_t(l)].assign(ptr, ptr + ne);
+                total_dev3_bb += ne;
+            }
+        }
+
+        if (!hlut3_tp3_overlay_path.empty()) {
+            hlut3_tp3_mmap = std::make_unique<SafetensorsMmap>(hlut3_tp3_overlay_path);
+            for (int l = 0; l < kNumLayers; ++l) {
+                const std::string key = "tp3.b" + std::to_string(l) + ".logical_eids";
+                if (!hlut3_tp3_mmap->contains(key)) continue;
+                const size_t nb = size_t(hlut3_tp3_mmap->at(key).byte_size());
+                if ((nb % sizeof(uint16_t)) != 0) {
+                    throw std::runtime_error("Invalid byte size for " + key);
+                }
+                const int ne = int(nb / sizeof(uint16_t));
+                const auto* ptr = reinterpret_cast<const uint16_t*>(hlut3_tp3_mmap->tensor_bytes(key));
+                tp3_eids[size_t(l)].assign(ptr, ptr + ne);
+                total_tp3_bb += ne;
+            }
+            if (total_tp3_bb > 0) {
+                tp3_hlut3_any_planned = true;
+            }
+        }
+
+        if (total_dev3_bb == 0 && total_tp3_bb == 0) {
+            if (dev3_mtp_planned) {
+                std::printf("[DSV41_RT] Wave 9.2 Tier-0 MTP Offload PLANNED: 384/384 MTP experts + shared_experts -> hlut3_dev=%d (reclaiming +1,237.5 MiB/rank on TP3)\n",
+                            hlut3_dev3_id);
+                std::fflush(stdout);
+            }
+            return;
+        }
+
+        // 3. Compose intra-MI50 [0..215] bijection per layer, preserving P150A [216..383] 100% invariant
+        for (int l = 0; l < kNumLayers; ++l) {
+            std::array<int8_t, kBackboneExperts> role{}; // 0 = default, 1 = tp3_hlut3, 2 = dev3_hlut3
+            for (uint16_t le : tp3_eids[size_t(l)]) {
+                if (le >= kBackboneExperts || base_perm[size_t(l)][le] >= kMi50BackboneExp || role[le] != 0) {
+                    throw std::runtime_error("tp3 HLUT3 expert violates MI50 [0..215] disjointness at layer " + std::to_string(l));
+                }
+                role[le] = 1;
+            }
+            for (uint16_t le : dev3_eids[size_t(l)]) {
+                if (le >= kBackboneExperts || base_perm[size_t(l)][le] >= kMi50BackboneExp || role[le] != 0) {
+                    throw std::runtime_error("dev3 HLUT3 expert violates MI50 [0..215] disjointness at layer " + std::to_string(l));
+                }
+                role[le] = 2;
+            }
+
+            std::array<uint16_t, kBackboneExperts> comp_row{};
+            int k_hlut2 = 0;
+            for (int orig_pe = 0; orig_pe < kMi50BackboneExp; ++orig_pe) {
+                const uint16_t le = base_inv[size_t(l)][size_t(orig_pe)];
+                if (role[le] == 0) {
+                    layer_hlut2_orig_pe[size_t(l)][size_t(k_hlut2)] = static_cast<uint16_t>(orig_pe);
+                    comp_row[le] = static_cast<uint16_t>(k_hlut2);
+                    ++k_hlut2;
+                }
+            }
+            const int n_tp3  = int(tp3_eids[size_t(l)].size());
+            const int n_dev3 = int(dev3_eids[size_t(l)].size());
+            if (k_hlut2 + n_tp3 + n_dev3 != kMi50BackboneExp) {
+                throw std::runtime_error("Wave 9.2 MI50 partition sum != 216 at layer " + std::to_string(l));
+            }
+            for (int j = 0; j < n_tp3; ++j) {
+                comp_row[tp3_eids[size_t(l)][size_t(j)]] = static_cast<uint16_t>(k_hlut2 + j);
+            }
+            for (int j = 0; j < n_dev3; ++j) {
+                comp_row[dev3_eids[size_t(l)][size_t(j)]] = static_cast<uint16_t>(k_hlut2 + n_tp3 + j);
+            }
+            for (int orig_pe = kMi50BackboneExp; orig_pe < kBackboneExperts; ++orig_pe) {
+                const uint16_t le = base_inv[size_t(l)][size_t(orig_pe)];
+                comp_row[le] = static_cast<uint16_t>(orig_pe);
+            }
+
+            std::array<uint8_t, kBackboneExperts> seen{};
+            for (int le = 0; le < kBackboneExperts; ++le) {
+                const uint16_t pe = comp_row[size_t(le)];
+                if (pe >= kBackboneExperts || seen[pe] != 0u) {
+                    throw std::runtime_error("Wave 9.2 composed permutation invalid at layer " + std::to_string(l));
+                }
+                seen[pe] = 1u;
+                wave9_2_composed_perm[size_t(l)][size_t(le)] = pe;
+                host_expert_inv_perm[size_t(l)][size_t(pe)]  = static_cast<uint16_t>(le);
+            }
+            layer_n_hlut2[size_t(l)]     = k_hlut2;
+            layer_n_tp3_hlut3[size_t(l)] = n_tp3;
+            layer_n_dev3_hlut3[size_t(l)]= n_dev3;
+        }
+
+        wave9_2_perm_ready = true;
+        expert_perm_active = true;
+        std::printf("[DSV41_RT] Wave 9.2 SB-M4-P2-176G Tier Plan READY: mtp_dev3=%d dev3_bb=%d tp3_hlut3_bb=%d compacted_tp3_hlut2=%d (P150A [216..383] invariant)\n",
+                    dev3_mtp_planned ? 384 : 0, total_dev3_bb, total_tp3_bb,
+                    40 * kMi50BackboneExp - total_dev3_bb - total_tp3_bb);
+        std::fflush(stdout);
+    }
+
     void init_tp_rank(int tp, const std::string& mi50_root, int vocab_offset_in) {
         DSV41_HIP_CHECK(hipSetDevice(tp));
         auto& c = ctx[tp];
@@ -1256,6 +1585,9 @@ struct Dsv41Runtime::Impl {
             for (int l = 0; l < kNumLayers; ++l) {
                 DSV41_HIP_CHECK(hipEventCreateWithFlags(&c.ev_router_done_ring[l], hipEventDisableTiming));
                 DSV41_HIP_CHECK(hipEventCreateWithFlags(&c.ev_p150_armed_ring[l], hipEventDisableTiming));
+            }
+            for (int b = 0; b < kTotalBlocks; ++b) {
+                DSV41_HIP_CHECK(hipEventCreateWithFlags(&c.ev_dev3_armed_ring[b], hipEventDisableTiming));
             }
         }
         for (int s = 0; s < 2; ++s) {
@@ -1381,8 +1713,11 @@ struct Dsv41Runtime::Impl {
 
         c.d_comp_topk_idxs  = alloc_gpu_buf<int32_t>(M * kIndexTopk, c.device_allocs);
         c.d_cand_block_mask = alloc_gpu_buf<uint32_t>(size_t(kMaxDecChunkM) * size_t(c.cand_block_stride), c.device_allocs);
+        c.d_cand_block_ids  = alloc_gpu_buf<int32_t>(size_t(kMaxDecChunkM) * 2048u, c.device_allocs, true);
+        c.d_cand_block_cnt  = alloc_gpu_buf<int32_t>(size_t(kMaxDecChunkM), c.device_allocs, true);
         if (tp == 0) {
-            c.d_p150_wg_sync = alloc_gpu_buf<uint32_t>(16u, c.device_allocs, true);
+            c.d_p150_wg_sync       = alloc_gpu_buf<uint32_t>(16u, c.device_allocs, true);
+            c.d_dev3_stage_wg_sync = alloc_gpu_buf<uint32_t>(2u * kHlut3OffloadRingSlots * 16u, c.device_allocs, true);
         }
 
         c.d_comp_kv_tmp_f32    = alloc_gpu_buf<float>(M * kHeadDim, c.device_allocs);
@@ -1404,7 +1739,10 @@ struct Dsv41Runtime::Impl {
         c.d_sh_gateup_bf16  = c.d_o_bf16;
         c.d_x_rot_f16       = alloc_gpu_buf<uint16_t>(M * kDim, c.device_allocs);
         c.d_expert_perm     = alloc_gpu_buf<uint16_t>(size_t(kNumLayers) * size_t(kBackboneExperts), c.device_allocs);
-        {
+        if (wave9_2_perm_ready) {
+            copy_h2d_fast(c.d_expert_perm, wave9_2_composed_perm.data(),
+                          size_t(kNumLayers) * size_t(kBackboneExperts) * sizeof(uint16_t));
+        } else {
             std::vector<uint16_t> id_perm(size_t(kNumLayers) * size_t(kBackboneExperts));
             for (int l = 0; l < kNumLayers; ++l) {
                 for (int e = 0; e < kBackboneExperts; ++e) {
@@ -1416,11 +1754,24 @@ struct Dsv41Runtime::Impl {
         c.d_routed_pairs    = alloc_gpu_buf<Mi50RoutedPair>(M * kBackboneTopk, c.device_allocs);
         c.d_active_experts  = alloc_gpu_buf<int32_t>(256u, c.device_allocs);
         c.d_csr_offsets     = alloc_gpu_buf<int32_t>(257u, c.device_allocs);
+        if (tp3_hlut3_any_planned) {
+            const auto sol = solve_gaussian_lloyd_max_hlut3();
+            const float lv[4] = {float(sol.levels[0]), float(sol.levels[1]),
+                                 float(sol.levels[2]), float(sol.levels[3])};
+            c.d_hlut3_levels    = alloc_gpu_buf<float>(4u, c.device_allocs, false);
+            copy_h2d_fast(c.d_hlut3_levels, lv, sizeof(lv));
+            // Alias TP3 HLUT3 scratch onto strictly disjoint d_o_bf16 / d_q_bf16 (24,576*M B >= 18,432*M B = M*6*768 FP32!)
+            // Saves +3 MiB/rank HBM2 and enables single-dispatch grouped CSR for all M*6 pairs!
+            c.d_hlut3_z         = reinterpret_cast<float*>(c.d_o_bf16);
+            c.d_hlut3_zrot      = reinterpret_cast<float*>(c.d_q_bf16);
+            c.d_tp3_hlut3_pairs = alloc_gpu_buf<Mi50RoutedPair>(M * kBackboneTopk, c.device_allocs, false);
+        }
         c.d_inter_bf16      = c.d_q_bf16;
         c.d_inter_rot_f16   = c.d_q_bf16 + (M * kBackboneTopk * kSharedInterTp);
         c.d_moe_part_f32    = c.d_part_f32;
         c.d_moe_sum_f32     = c.d_sum_f32;
-        c.d_p150_out_bf16   = alloc_gpu_buf<uint16_t>(M * kDim, c.device_allocs);
+        // Wave 9.4 Phase C: Alias d_p150_out_bf16 onto strictly disjoint d_o_bf16 (96 MiB >= 40 MiB @ M=4096, saves +40 MiB/rank!)
+        c.d_p150_out_bf16   = c.d_o_bf16;
 
         const size_t dec_M = kMaxDecM;
         c.d_target_mean_bf16  = alloc_gpu_buf<uint16_t>(dec_M * kDim, c.device_allocs);
@@ -1441,12 +1792,16 @@ struct Dsv41Runtime::Impl {
         c.h_radix_stage    = alloc_pinned<uint8_t>(tp, 8u * 1024u * 1024u);
         c.h_radix_stage2   = alloc_pinned<uint8_t>(tp, 8u * 1024u * 1024u);
         if (tp == 0) {
-            c.h_topk_ids     = alloc_pinned<int32_t>(tp, M * kBackboneTopk);
-            c.h_topk_w       = alloc_pinned<float>(tp, M * kBackboneTopk);
-            c.h_x_moe_bf16   = alloc_pinned<uint16_t>(tp, M * kDim);
-            c.h_routed_pairs = alloc_pinned<Mi50RoutedPair>(tp, M * kBackboneTopk);
-            c.h_active_exp   = alloc_pinned<int32_t>(tp, 256u);
-            c.h_csr_offsets  = alloc_pinned<int32_t>(tp, 257u);
+            c.h_topk_ids        = alloc_pinned<int32_t>(tp, M * kBackboneTopk);
+            c.h_topk_w          = alloc_pinned<float>(tp, M * kBackboneTopk);
+            c.h_x_moe_bf16      = alloc_pinned<uint16_t>(tp, M * kDim);
+            c.h_x_rot_f16       = alloc_pinned<uint16_t>(tp, M * kDim);
+            c.h_routed_pairs    = alloc_pinned<Mi50RoutedPair>(tp, M * kBackboneTopk);
+            c.h_active_exp      = alloc_pinned<int32_t>(tp, 256u);
+            c.h_csr_offsets     = alloc_pinned<int32_t>(tp, 257u);
+            c.h_tp3_hlut3_pairs = alloc_pinned<Mi50RoutedPair>(tp, M * kBackboneTopk);
+            c.h_tp3_active_exp  = alloc_pinned<int32_t>(tp, 256u);
+            c.h_tp3_csr_offsets = alloc_pinned<int32_t>(tp, 257u);
         }
 
         reset_r2_compressor_state_gpu(tp);
@@ -1464,6 +1819,49 @@ struct Dsv41Runtime::Impl {
                     double(free_b) / (1024.0 * 1024.0),
                     max_seq_len);
         std::fflush(stdout);
+    }
+
+    // Wave 9.3 Phase B: Custom fused FP8+LUT GEMM (k_fp8_gemm_bm128_bn64 & k_fp8_grouped_wo_a_bm128_bn64)
+    // beats unpack+rocBLAS across M=64..2048 by avoiding 2x FP16 weight write/readback AND leaves rb_prefill
+    // free for concurrent router BF16 GEMM (2.5-3.0x faster) + HLUT2/HLUT3 expert buckets!
+    inline void dispatch_fp8_gemm(
+        TpRankContext& c,
+        const uint8_t* d_x_fp8, const uint8_t* d_x_scale,
+        const uint8_t* d_w_fp8, const uint8_t* d_w_scale,
+        uint16_t* d_out_bf16, float* d_out_f32,
+        int M, int N, int K, bool write_f32, bool accumulate_f32)
+    {
+        // Wave 9.4 Phase C.2: HHHS Tensile hits 20.5 TFLOPS (1.53x faster than custom) on large-M wq_b [12288x1280]
+        // during Attention (when router_stream is strictly idle -> 0 race on c.rb_prefill)!
+        if (rocblas_prefill_enabled && !write_f32 && N >= 8192 && K == 1280 && M >= 1024 &&
+            c.rb_prefill.run_fp8_gemm(d_x_fp8, d_x_scale, d_w_fp8, d_w_scale,
+                                      d_out_bf16, d_out_f32, M, N, K, write_f32, accumulate_f32, c.stream)) {
+            return;
+        }
+        launch_fp8_gemm(d_x_fp8, d_x_scale, d_w_fp8, d_w_scale, d_out_bf16, d_out_f32,
+                        M, N, K, write_f32, accumulate_f32, c.stream);
+    }
+
+    inline void dispatch_fp8_grouped_wo_a(
+        TpRankContext& c,
+        const uint8_t* d_o_fp8, const uint8_t* d_o_scale,
+        const uint8_t* d_wo_a_fp8, const uint8_t* d_wo_a_scale,
+        uint16_t* d_out_bf16, int M, int g_cnt)
+    {
+        launch_fp8_grouped_wo_a(d_o_fp8, d_o_scale, d_wo_a_fp8, d_wo_a_scale, d_out_bf16, M, g_cnt, c.stream);
+    }
+
+    inline void dispatch_bf16_gemm(
+        TpRankContext& c,
+        const uint16_t* d_x_bf16, const uint16_t* d_w_bf16,
+        uint16_t* d_out_bf16, float* d_out_f32,
+        int M, int N, int K, bool write_f32)
+    {
+        if (rocblas_prefill_enabled && c.rb_prefill.run_bf16_gemm(
+                d_x_bf16, d_w_bf16, d_out_bf16, d_out_f32, M, N, K, write_f32, c.stream)) {
+            return;
+        }
+        launch_bf16_gemm(d_x_bf16, d_w_bf16, d_out_bf16, d_out_f32, M, N, K, write_f32, c.stream);
     }
 
     // Out-of-place TP3 BF16 all-reduce: dst[tp] = src[0] + src[1] + src[2]
@@ -1506,6 +1904,70 @@ struct Dsv41Runtime::Impl {
             for (int tp = 0; tp < 3; ++tp) {
                 DSV41_HIP_CHECK(hipSetDevice(tp));
                 launch_host_ring_allreduce_f32(srcs[tp] + off, dsts[tp] + off, slot, tp, seq, tile, ctx[tp].stream);
+            }
+        }
+        sync_tp0_if_profiling();
+        accum_allreduce_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tar0).count();
+    }
+
+    // Wave 9.4 Phase D: TP0-only FP32 reduction (3x less PCIe traffic for CSA2 indexer scores!)
+    void reduce_tp0_f32(const float* src0, const float* src1, const float* src2,
+                        float* dst0, size_t n_elems) {
+        if (n_elems == 0) return;
+        sync_tp0_if_profiling();
+        const auto tar0 = std::chrono::steady_clock::now();
+        const float* srcs[3] = {src0, src1, src2};
+        for (size_t off = 0; off < n_elems; off += kHostArMaxWords) {
+            const size_t tile = std::min<size_t>(kHostArMaxWords, n_elems - off);
+            const uint64_t seq = ++host_ar_seq;
+            HostRingAllReduceSlot* slot = &h_ar_ring[(seq - 1ULL) & (kHostArRingSlots - 1ULL)];
+            for (int tp = 0; tp < 3; ++tp) {
+                DSV41_HIP_CHECK(hipSetDevice(tp));
+                launch_host_ring_reduce_tp0_f32(
+                    srcs[tp] + off, (tp == 0) ? (dst0 + off) : nullptr,
+                    slot, tp, seq, tile, ctx[tp].stream);
+            }
+        }
+        sync_tp0_if_profiling();
+        accum_allreduce_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tar0).count();
+    }
+
+    // Wave 9.4 Phase D.2: TP0-only FP16-wire reduction (6x less PCIe traffic vs TP3 FP32 allreduce!)
+    void reduce_tp0_f16_wire(const float* src0, const float* src1, const float* src2,
+                             float* dst0, size_t n_elems) {
+        if (n_elems == 0) return;
+        sync_tp0_if_profiling();
+        const auto tar0 = std::chrono::steady_clock::now();
+        const float* srcs[3] = {src0, src1, src2};
+        const size_t max_tile_elems = kHostArMaxWords * 2u;
+        for (size_t off = 0; off < n_elems; off += max_tile_elems) {
+            const size_t tile = std::min<size_t>(max_tile_elems, n_elems - off);
+            const uint64_t seq = ++host_ar_seq;
+            HostRingAllReduceSlot* slot = &h_ar_ring[(seq - 1ULL) & (kHostArRingSlots - 1ULL)];
+            for (int tp = 0; tp < 3; ++tp) {
+                DSV41_HIP_CHECK(hipSetDevice(tp));
+                launch_host_ring_reduce_tp0_f16_wire(
+                    srcs[tp] + off, (tp == 0) ? (dst0 + off) : nullptr,
+                    slot, tp, seq, tile, ctx[tp].stream);
+            }
+        }
+        sync_tp0_if_profiling();
+        accum_allreduce_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tar0).count();
+    }
+
+    // Wave 9.4 Phase D: TP0 -> TP1,2 tiny uint32 broadcast (for top-512 indices & compact cand_block_ids!)
+    void bcast_tp0_u32(uint32_t* buf0, uint32_t* buf1, uint32_t* buf2, size_t n_words) {
+        if (n_words == 0) return;
+        sync_tp0_if_profiling();
+        const auto tar0 = std::chrono::steady_clock::now();
+        uint32_t* bufs[3] = {buf0, buf1, buf2};
+        for (size_t off = 0; off < n_words; off += kHostArMaxWords) {
+            const size_t tile = std::min<size_t>(kHostArMaxWords, n_words - off);
+            const uint64_t seq = ++host_ar_seq;
+            HostRingAllReduceSlot* slot = &h_ar_ring[(seq - 1ULL) & (kHostArRingSlots - 1ULL)];
+            for (int tp = 0; tp < 3; ++tp) {
+                DSV41_HIP_CHECK(hipSetDevice(tp));
+                launch_host_ring_bcast_tp0_u32(bufs[tp] + off, slot, tp, seq, tile, ctx[tp].stream);
             }
         }
         sync_tp0_if_profiling();
@@ -1698,29 +2160,29 @@ struct Dsv41Runtime::Impl {
             if (!x_and_fp8_precomputed) {
                 launch_act_quant_ue8m0_32(c.d_x_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr, M, kDim, false, c.stream);
             }
-            launch_fp8_gemm(c.d_fp8_act, c.d_fp8_scale, b.d_wqkv_w, b.d_wqkv_s, c.d_qkv_bf16, nullptr,
-                            M, kQkvConcatRows, kDim, false, false, c.stream);
+            dispatch_fp8_gemm(c, c.d_fp8_act, c.d_fp8_scale, b.d_wqkv_w, b.d_wqkv_s, c.d_qkv_bf16, nullptr,
+                              M, kQkvConcatRows, kDim, false, false);
             launch_split_qkv_norm_rope_quant(c.d_qkv_bf16, b.d_q_norm, b.d_kv_norm, use_comp_yarn,
                                              c.d_qr_bf16, c.d_kv_cur_bf16, M, start_pos, kNormEps, c.stream,
                                              tree_anc_mask, tree_depth_nibbles);
 
             // Quantize qr [M, 1280] (reused by wq_b AND indexer.wq_b!)
             launch_act_quant_ue8m0_32(c.d_qr_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr, M, kQLoraRank, false, c.stream);
-            launch_fp8_gemm(c.d_fp8_act, c.d_fp8_scale, b.d_wq_b_w, b.d_wq_b_s, c.d_q_bf16, nullptr,
-                            M, b.h_cnt * kHeadDim, kQLoraRank, false, false, c.stream);
+            dispatch_fp8_gemm(c, c.d_fp8_act, c.d_fp8_scale, b.d_wq_b_w, b.d_wq_b_s, c.d_q_bf16, nullptr,
+                              M, b.h_cnt * kHeadDim, kQLoraRank, false, false);
             launch_rope_tail64_bf16(c.d_q_bf16, use_comp_yarn, M, b.h_cnt, kHeadDim, start_pos, 1, false, c.stream,
                                     tree_anc_mask, tree_depth_nibbles);
 
             // Compressor pre-RoPE latent (skipped during SWA Bounded Replay when Global KV already restored!)
             if (b.is_kv_source && !skip_global_kv_write) {
                 if (ratio == 1) {
-                    launch_bf16_gemm(c.d_x_bf16, b.d_comp_wkv, c.d_latent_bf16, nullptr, M, kHeadDim, kDim, false, c.stream);
+                    dispatch_bf16_gemm(c, c.d_x_bf16, b.d_comp_wkv, c.d_latent_bf16, nullptr, M, kHeadDim, kDim, false);
                     launch_rmsnorm_bf16(c.d_latent_bf16, b.d_comp_norm, c.d_latent_bf16, M, kHeadDim, kNormEps, c.stream);
                     n_lat = M;
                 } else {
                     const int r2_idx = kv_slot;  // 0, 1, 2
-                    launch_bf16_gemm(c.d_x_bf16, b.d_comp_wkv, nullptr, c.d_comp_kv_tmp_f32, M, kHeadDim, kDim, true, c.stream);
-                    launch_bf16_gemm(c.d_x_bf16, b.d_comp_wgate, nullptr, c.d_comp_score_tmp_f32, M, kHeadDim, kDim, true, c.stream);
+                    dispatch_bf16_gemm(c, c.d_x_bf16, b.d_comp_wkv, nullptr, c.d_comp_kv_tmp_f32, M, kHeadDim, kDim, true);
+                    dispatch_bf16_gemm(c, c.d_x_bf16, b.d_comp_wgate, nullptr, c.d_comp_score_tmp_f32, M, kHeadDim, kDim, true);
                     if (!commit_window_immediately) {
                         DSV41_HIP_CHECK(hipMemcpyAsync(c.d_comp_kv_last[r2_idx], c.d_comp_kv_tmp_f32,
                                                        size_t(M) * kHeadDim * sizeof(float),
@@ -1772,8 +2234,8 @@ struct Dsv41Runtime::Impl {
                                                      lat_slot_base, n_lat, c.stream);
                 }
                 if (T_comp > 0) {
-                    launch_fp8_gemm(c.d_fp8_act, c.d_fp8_scale, b.d_idx_wq_b_w, b.d_idx_wq_b_s, c.d_idx_q_bf16, nullptr,
-                                    M, b.ih_cnt * kIndexHeadDim, kQLoraRank, false, false, c.stream);
+                    dispatch_fp8_gemm(c, c.d_fp8_act, c.d_fp8_scale, b.d_idx_wq_b_w, b.d_idx_wq_b_s, c.d_idx_q_bf16, nullptr,
+                                      M, b.ih_cnt * kIndexHeadDim, kQLoraRank, false, false);
                     launch_rope_tail64_bf16(c.d_idx_q_bf16, true,
                                             M, b.ih_cnt, kIndexHeadDim, start_pos, 1, false, c.stream,
                                             tree_anc_mask, tree_depth_nibbles);
@@ -1788,48 +2250,116 @@ struct Dsv41Runtime::Impl {
             sub_att_qkv_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_att0).count();
         }
 
-        // Sub-batched Indexer score + TP3 all-reduce + candidate/top-k selection aliased onto d_part_f32 / d_sum_f32!
+        // Wave 9.4 Phase D: Compact mode==2 candidate scoring (21.25x faster @ 340K, 64x @ 1M) +
+        // TP0-only FP32 reduction (3x less PCIe) + 60-CU Split-KV exact top-K + tiny TP0->TP1,2 u32 broadcast!
         if (ctx[0].blocks[l].is_index_source) {
             io_shared_k_comp = K_comp;
             if (T_comp > 0) {
                 sync_tp0_if_profiling();
                 const auto t_hsi0 = std::chrono::steady_clock::now();
                 const int mode = (l == kCandSourceLayer) ? 1 : ((l > kCandSourceLayer) ? 2 : 0);
-                const size_t floats_per_row = size_t(T_comp) + size_t((T_comp + 7) / 8) + 64u;
-                const int max_sub_m = std::max(1, std::min(M, static_cast<int>(kPartF32Floats / floats_per_row)));
 
-                for (int m0 = 0; m0 < M; m0 += max_sub_m) {
-                    const int sub_m = std::min(max_sub_m, M - m0);
-                    for (int tp = 0; tp < 3; ++tp) {
-                        DSV41_HIP_CHECK(hipSetDevice(tp));
-                        auto& c = ctx[tp];
-                        const auto& b = c.blocks[l];
-                        launch_indexer_score(
-                            c.d_idx_q_bf16 + size_t(m0) * size_t(b.ih_cnt) * kIndexHeadDim,
-                            c.d_index_k_fp4[kv_slot],
-                            c.d_index_k_ue8m0[kv_slot],
-                            c.d_idx_weights_bf16 + size_t(m0) * size_t(b.ih_cnt),
-                            c.d_part_f32,  // Always offset 0 of aliased scratch!
-                            sub_m, b.ih_cnt, T_comp, c.stream);
+                if (mode == 2) {
+                    const int K_cand = std::min((T_comp + 7) & ~7, 16384);
+                    const int max_sub_m = std::max(
+                        1, std::min(M, static_cast<int>(kPartF32Floats / size_t(K_cand + 64))));
+                    for (int m0 = 0; m0 < M; m0 += max_sub_m) {
+                        const int sub_m = std::min(max_sub_m, M - m0);
+                        for (int tp = 0; tp < 3; ++tp) {
+                            DSV41_HIP_CHECK(hipSetDevice(tp));
+                            auto& c = ctx[tp];
+                            const auto& b = c.blocks[l];
+                            launch_w94_indexer_score_cand(
+                                c.d_idx_q_bf16 + size_t(m0) * size_t(b.ih_cnt) * kIndexHeadDim,
+                                c.d_index_k_fp4[kv_slot],
+                                c.d_index_k_ue8m0[kv_slot],
+                                c.d_idx_weights_bf16 + size_t(m0) * size_t(b.ih_cnt),
+                                c.d_cand_block_ids + size_t(m0) * 2048u,
+                                c.d_cand_block_cnt + size_t(m0),
+                                c.d_part_f32,
+                                sub_m, b.ih_cnt, T_comp, K_cand, c.stream);
+                        }
+                        reduce_tp0_f16_wire(ctx[0].d_part_f32, ctx[1].d_part_f32, ctx[2].d_part_f32,
+                                            ctx[0].d_sum_f32, size_t(sub_m) * size_t(K_cand));
+                        {
+                            DSV41_HIP_CHECK(hipSetDevice(0));
+                            auto& c0 = ctx[0];
+                            launch_w94_indexer_cand_topk(
+                                c0.d_sum_f32,
+                                c0.d_cand_block_ids + size_t(m0) * 2048u,
+                                c0.d_cand_block_cnt + size_t(m0),
+                                c0.d_comp_topk_idxs + size_t(m0) * size_t(K_comp),
+                                sub_m, T_comp, K_cand,
+                                is_tree ? start_pos : (start_pos + m0),
+                                ratio, K_comp, c0.stream,
+                                tree_anc_mask, tree_depth_nibbles, m0);
+                        }
+                        bcast_tp0_u32(
+                            reinterpret_cast<uint32_t*>(ctx[0].d_comp_topk_idxs + size_t(m0) * size_t(K_comp)),
+                            reinterpret_cast<uint32_t*>(ctx[1].d_comp_topk_idxs + size_t(m0) * size_t(K_comp)),
+                            reinterpret_cast<uint32_t*>(ctx[2].d_comp_topk_idxs + size_t(m0) * size_t(K_comp)),
+                            size_t(sub_m) * size_t(K_comp));
                     }
-                    all_reduce_tp3_f32(ctx[0].d_part_f32, ctx[1].d_part_f32, ctx[2].d_part_f32,
-                                       ctx[0].d_sum_f32,  ctx[1].d_sum_f32,  ctx[2].d_sum_f32,
-                                       size_t(sub_m) * size_t(T_comp));
-                    for (int tp = 0; tp < 3; ++tp) {
-                        DSV41_HIP_CHECK(hipSetDevice(tp));
-                        auto& c = ctx[tp];
-                        uint32_t* cand_ptr = (mode == 0)
-                            ? nullptr
-                            : (c.d_cand_block_mask + size_t(m0) * size_t(c.cand_block_stride));
-                        launch_indexer_candidates_and_topk(
-                            c.d_sum_f32,  // Always offset 0 of aliased scratch!
-                            cand_ptr,
-                            c.cand_block_stride,
-                            c.d_comp_topk_idxs + size_t(m0) * size_t(K_comp),
-                            sub_m, T_comp,
-                            is_tree ? start_pos : (start_pos + m0),
-                            ratio, mode, K_comp, c.stream,
-                            tree_anc_mask, tree_depth_nibbles, m0);
+                } else {
+                    const size_t floats_per_row = size_t(T_comp) + size_t((T_comp + 7) / 8) + 64u;
+                    const int max_sub_m = std::max(
+                        1, std::min({M, kMaxDecChunkM, static_cast<int>(kPartF32Floats / floats_per_row)}));
+                    for (int m0 = 0; m0 < M; m0 += max_sub_m) {
+                        const int sub_m = std::min(max_sub_m, M - m0);
+                        for (int tp = 0; tp < 3; ++tp) {
+                            DSV41_HIP_CHECK(hipSetDevice(tp));
+                            auto& c = ctx[tp];
+                            const auto& b = c.blocks[l];
+                            launch_indexer_score(
+                                c.d_idx_q_bf16 + size_t(m0) * size_t(b.ih_cnt) * kIndexHeadDim,
+                                c.d_index_k_fp4[kv_slot],
+                                c.d_index_k_ue8m0[kv_slot],
+                                c.d_idx_weights_bf16 + size_t(m0) * size_t(b.ih_cnt),
+                                c.d_part_f32,
+                                sub_m, b.ih_cnt, T_comp, c.stream);
+                        }
+                        reduce_tp0_f16_wire(ctx[0].d_part_f32, ctx[1].d_part_f32, ctx[2].d_part_f32,
+                                            ctx[0].d_sum_f32, size_t(sub_m) * size_t(T_comp));
+                        {
+                            DSV41_HIP_CHECK(hipSetDevice(0));
+                            auto& c0 = ctx[0];
+                            uint32_t* cand_ptr = (mode == 0)
+                                ? nullptr
+                                : (c0.d_cand_block_mask + size_t(m0) * size_t(c0.cand_block_stride));
+                            int32_t* cid_ptr = (mode == 0)
+                                ? c0.d_cand_block_ids
+                                : (c0.d_cand_block_ids + size_t(m0) * 2048u);
+                            int32_t* ccnt_ptr = (mode == 0)
+                                ? nullptr
+                                : (c0.d_cand_block_cnt + size_t(m0));
+                            launch_indexer_candidates_and_topk(
+                                c0.d_sum_f32,
+                                cand_ptr,
+                                c0.cand_block_stride,
+                                c0.d_comp_topk_idxs + size_t(m0) * size_t(K_comp),
+                                sub_m, T_comp,
+                                is_tree ? start_pos : (start_pos + m0),
+                                ratio, mode, K_comp, c0.stream,
+                                tree_anc_mask, tree_depth_nibbles, m0,
+                                cid_ptr, ccnt_ptr);
+                        }
+                        bcast_tp0_u32(
+                            reinterpret_cast<uint32_t*>(ctx[0].d_comp_topk_idxs + size_t(m0) * size_t(K_comp)),
+                            reinterpret_cast<uint32_t*>(ctx[1].d_comp_topk_idxs + size_t(m0) * size_t(K_comp)),
+                            reinterpret_cast<uint32_t*>(ctx[2].d_comp_topk_idxs + size_t(m0) * size_t(K_comp)),
+                            size_t(sub_m) * size_t(K_comp));
+                        if (mode == 1) {
+                            bcast_tp0_u32(
+                                reinterpret_cast<uint32_t*>(ctx[0].d_cand_block_ids + size_t(m0) * 2048u),
+                                reinterpret_cast<uint32_t*>(ctx[1].d_cand_block_ids + size_t(m0) * 2048u),
+                                reinterpret_cast<uint32_t*>(ctx[2].d_cand_block_ids + size_t(m0) * 2048u),
+                                size_t(sub_m) * 2048u);
+                            bcast_tp0_u32(
+                                reinterpret_cast<uint32_t*>(ctx[0].d_cand_block_cnt + size_t(m0)),
+                                reinterpret_cast<uint32_t*>(ctx[1].d_cand_block_cnt + size_t(m0)),
+                                reinterpret_cast<uint32_t*>(ctx[2].d_cand_block_cnt + size_t(m0)),
+                                size_t(sub_m));
+                        }
                     }
                 }
                 sync_tp0_if_profiling();
@@ -1906,16 +2436,16 @@ struct Dsv41Runtime::Impl {
                 launch_act_quant_ue8m0_32(c.d_o_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr,
                                           M, b.g_cnt * 4096, false, c.stream);
             }
-            launch_fp8_grouped_wo_a(c.d_fp8_act, c.d_fp8_scale, b.d_wo_a_w, b.d_wo_a_s,
-                                    c.d_wo_mid_bf16, M, b.g_cnt, c.stream);
+            dispatch_fp8_grouped_wo_a(c, c.d_fp8_act, c.d_fp8_scale, b.d_wo_a_w, b.d_wo_a_s,
+                                      c.d_wo_mid_bf16, M, b.g_cnt);
             launch_act_quant_ue8m0_32(c.d_wo_mid_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr,
                                       M, b.g_cnt * kOLoraRank, false, c.stream);
             if (M <= kF32RingMaxM) {
-                launch_fp8_gemm(c.d_fp8_act, c.d_fp8_scale, b.d_wo_b_w, b.d_wo_b_s, nullptr, c.d_part_f32,
-                                M, kDim, b.g_cnt * kOLoraRank, true, false, c.stream);
+                dispatch_fp8_gemm(c, c.d_fp8_act, c.d_fp8_scale, b.d_wo_b_w, b.d_wo_b_s, nullptr, c.d_part_f32,
+                                  M, kDim, b.g_cnt * kOLoraRank, true, false);
             } else {
-                launch_fp8_gemm(c.d_fp8_act, c.d_fp8_scale, b.d_wo_b_w, b.d_wo_b_s, c.d_part_bf16, nullptr,
-                                M, kDim, b.g_cnt * kOLoraRank, false, false, c.stream);
+                dispatch_fp8_gemm(c, c.d_fp8_act, c.d_fp8_scale, b.d_wo_b_w, b.d_wo_b_s, c.d_part_bf16, nullptr,
+                                  M, kDim, b.g_cnt * kOLoraRank, false, false);
             }
         }
         if (sync_timers) {
@@ -1984,6 +2514,127 @@ struct Dsv41Runtime::Impl {
             const int P = M * top_k;
             const bool use_pairs = (M <= 16);
             const bool do_collect = (rarebal_collector && rarebal_collector->active);
+            if (dev3_engine.active() && dev3_engine.has_mtp()) {
+                DSV41_HIP_CHECK(hipSetDevice(0));
+                auto& c0 = ctx[0];
+                launch_bf16_gemm(c0.d_x_bf16, b0.d_gate_w, nullptr, c0.d_gate_logits_f32,
+                                 M, b0.n_routed_experts, kDim, true, c0.stream);
+                launch_moe_gate(c0.d_gate_logits_f32, b0.d_gate_bias, nullptr, nullptr,
+                                c0.d_topk_ids, c0.d_topk_weights,
+                                M, b0.n_routed_experts, top_k, kRouteScale, c0.stream);
+                if (M <= kHlut3OffloadMaxRows) {
+                    if (do_collect) {
+                        DSV41_HIP_CHECK(hipMemcpyAsync(c0.h_topk_ids, c0.d_topk_ids, size_t(M) * top_k * sizeof(int32_t),
+                                                       hipMemcpyDeviceToHost, c0.stream));
+                        if (rarebal_collector->need_x_copy(block_id) && rarebal_collector->h_x_pinned) {
+                            DSV41_HIP_CHECK(hipMemcpyAsync(rarebal_collector->h_x_pinned, c0.d_x_bf16,
+                                                           size_t(M) * kDim * sizeof(uint16_t),
+                                                           hipMemcpyDeviceToHost, c0.stream));
+                        }
+                        DSV41_HIP_CHECK(hipEventRecord(c0.ev_router_done, c0.stream));
+                    }
+                    const uint32_t mseq = dev3_engine.next_mtp_fast_seq();
+                    Hlut3OffloadSlot* mslot = dev3_engine.mtp_fast_slot(mseq);
+                    uint32_t* d_sync0 = c0.d_dev3_stage_wg_sync +
+                                        ((mseq - 1u) & uint32_t(kHlut3OffloadRingSlots - 1u)) * 16u;
+                    launch_stage_and_arm_hlut3_dev3(
+                        mslot, d_sync0, c0.d_topk_ids, c0.d_topk_weights,
+                        c0.d_x_rot_f16, c0.d_x_bf16,
+                        static_cast<uint32_t>(block_id), M, top_k,
+                        0, kMtpExperts, /*include_mtp_shared=*/1u, mseq, c0.stream);
+                    (void)hipStreamQuery(c0.stream);
+
+                    if (deferred_hc_ffn_block >= 0) {
+                        for (int tp = 0; tp < 3; ++tp) {
+                            DSV41_HIP_CHECK(hipSetDevice(tp));
+                            auto& c = ctx[tp];
+                            const auto& b = c.blocks[block_id];
+                            launch_hc_mixes(c.d_h_bf16[in_h_slot], b.d_hc_ffn_fn, b.d_hc_ffn_scale, b.d_hc_ffn_base,
+                                            c.d_hc_rsqrt_f32, c.d_hc_mixes_f32,
+                                            c.d_pre_mix_f32[out_h_slot], c.d_post_mix_f32, c.d_comb_mix_f32,
+                                            M, kNormEps, kHcSinkhornIters, kHcEps, c.stream,
+                                            (fused_mhc_norm && M <= 8) ? c.hc_wg_sync_ptr() : nullptr);
+                        }
+                    }
+                    if (do_collect) {
+                        DSV41_HIP_CHECK(hipSetDevice(0));
+                        DSV41_HIP_CHECK(hipEventSynchronize(c0.ev_router_done));
+                        rarebal_collector->record_routed_batch(block_id, M, top_k, c0.h_topk_ids, rarebal_collector->h_x_pinned);
+                    }
+                    for (int tp = 0; tp < 3; ++tp) {
+                        DSV41_HIP_CHECK(hipSetDevice(tp));
+                        auto& c = ctx[tp];
+                        if (next_norms[tp] != nullptr && M <= kMhcFusedMaxM) {
+                            launch_dev3_finish_f32_mhc_fused(
+                                mslot->y_out_f32, &mslot->done_seq, &mslot->rank_done_seq[tp][0], mseq,
+                                c.d_h_bf16[in_h_slot], c.d_post_mix_f32, c.d_comb_mix_f32, c.d_h_bf16[out_h_slot],
+                                c.d_pre_mix_f32[out_h_slot], next_norms[tp], c.d_x_bf16,
+                                (next_emit_tp0_raw_sub && tp == 0) ? c.d_sub_bf16 : nullptr,
+                                next_emit_fp8 ? c.d_fp8_act : nullptr,
+                                next_emit_fp8 ? c.d_fp8_scale : nullptr,
+                                kNormEps, M, c.stream);
+                        } else {
+                            launch_dev3_finish_f32_hc_post(
+                                mslot->y_out_f32, &mslot->done_seq, &mslot->rank_done_seq[tp][0], mseq,
+                                c.d_h_bf16[in_h_slot], c.d_post_mix_f32, c.d_comb_mix_f32, c.d_h_bf16[out_h_slot],
+                                M, c.stream);
+                        }
+                        (void)hipStreamQuery(c.stream);
+                    }
+                    return;
+                }
+
+                // M > 64 MTP prefill / calibration harvest on hlut3_dev=3 (0 TP3 AllReduce!)
+                DSV41_HIP_CHECK(hipMemcpyAsync(c0.h_topk_ids, c0.d_topk_ids, size_t(M) * top_k * sizeof(int32_t),
+                                               hipMemcpyDeviceToHost, c0.stream));
+                DSV41_HIP_CHECK(hipMemcpyAsync(c0.h_topk_w, c0.d_topk_weights, size_t(M) * top_k * sizeof(float),
+                                               hipMemcpyDeviceToHost, c0.stream));
+                DSV41_HIP_CHECK(hipMemcpyAsync(c0.h_x_rot_f16, c0.d_x_rot_f16, size_t(M) * kDim * sizeof(uint16_t),
+                                               hipMemcpyDeviceToHost, c0.stream));
+                DSV41_HIP_CHECK(hipMemcpyAsync(c0.h_x_moe_bf16, c0.d_x_bf16, size_t(M) * kDim * sizeof(uint16_t),
+                                               hipMemcpyDeviceToHost, c0.stream));
+                DSV41_HIP_CHECK(hipStreamSynchronize(c0.stream));
+
+                dev3_hlut3_pairs_buf.clear();
+                for (int r = 0; r < M; ++r) {
+                    for (int k = 0; k < top_k; ++k) {
+                        const int32_t eid = c0.h_topk_ids[r * top_k + k];
+                        const float   w   = c0.h_topk_w[r * top_k + k];
+                        if (eid >= 0 && eid < kMtpExperts && w != 0.0f) {
+                            dev3_hlut3_pairs_buf.push_back(Mi50RoutedPair{r, eid, w, 0});
+                        }
+                    }
+                }
+                const uint32_t pseq = dev3_engine.submit_prefill_async(
+                    block_id, M, c0.h_x_rot_f16, c0.h_x_moe_bf16,
+                    dev3_hlut3_pairs_buf.data(), int(dev3_hlut3_pairs_buf.size()),
+                    /*include_mtp_shared=*/true);
+
+                if (deferred_hc_ffn_block >= 0) {
+                    for (int tp = 0; tp < 3; ++tp) {
+                        DSV41_HIP_CHECK(hipSetDevice(tp));
+                        auto& c = ctx[tp];
+                        const auto& b = c.blocks[block_id];
+                        launch_hc_mixes(c.d_h_bf16[in_h_slot], b.d_hc_ffn_fn, b.d_hc_ffn_scale, b.d_hc_ffn_base,
+                                        c.d_hc_rsqrt_f32, c.d_hc_mixes_f32,
+                                        c.d_pre_mix_f32[out_h_slot], c.d_post_mix_f32, c.d_comb_mix_f32,
+                                        M, kNormEps, kHcSinkhornIters, kHcEps, c.stream,
+                                        (fused_mhc_norm && M <= 8) ? c.hc_wg_sync_ptr() : nullptr);
+                    }
+                }
+                if (do_collect) {
+                    rarebal_collector->record_routed_batch(block_id, M, top_k, c0.h_topk_ids, c0.h_x_moe_bf16);
+                }
+                const float* h_y = dev3_engine.wait_prefill_output(pseq);
+                for (int tp = 0; tp < 3; ++tp) {
+                    DSV41_HIP_CHECK(hipSetDevice(tp));
+                    auto& c = ctx[tp];
+                    launch_f32_to_bf16(h_y, c.d_sub_bf16, size_t(M) * kDim, c.stream);
+                    launch_hc_post(c.d_sub_bf16, c.d_h_bf16[in_h_slot], c.d_post_mix_f32, c.d_comb_mix_f32,
+                                   c.d_h_bf16[out_h_slot], M, c.stream);
+                }
+                return;
+            }
             for (int tp = 0; tp < 3; ++tp) {
                 DSV41_HIP_CHECK(hipSetDevice(tp));
                 auto& c = ctx[tp];
@@ -2100,6 +2751,9 @@ struct Dsv41Runtime::Impl {
             d_p150_shm_ptr != nullptr && !rarebal_collector && !sync_timers)
         {
             uint32_t posted_p150_seq = 0u;
+            uint32_t posted_dev3_seq = 0u;
+            Hlut3OffloadSlot* dev3_slot = nullptr;
+            const bool use_dev3_bb = (dev3_engine.active() && b0.dev3_hlut3_count > 0);
             for (int tp = 0; tp < 3; ++tp) {
                 DSV41_HIP_CHECK(hipSetDevice(tp));
                 auto& c = ctx[tp];
@@ -2115,15 +2769,27 @@ struct Dsv41Runtime::Impl {
                                 M, b.n_routed_experts, top_k, kRouteScale, c.stream,
                                 d_perm_row);
                 if (tp == 0) {
-                    DSV41_HIP_CHECK(hipEventRecord(c.ev_router_done_ring[block_id], c.stream));
-                    DSV41_HIP_CHECK(hipStreamWaitEvent(c.router_stream, c.ev_router_done_ring[block_id], 0));
+                    // Wave 9.3 Phase D: Arm P150A + dev3 directly on c.stream right after launch_moe_gate
+                    // (eliminates 80 cross-stream hipEventRecord + hipStreamWaitEvent hardware bounces/step!).
                     posted_p150_seq = ++p150_seq_counter;
                     launch_stage_and_arm_p150_shm(
                         d_p150_shm_ptr, c.d_p150_wg_sync,
                         c.d_topk_ids, c.d_topk_weights, c.d_part_bf16,
                         static_cast<uint32_t>(block_id), M, top_k, kMi50BackboneExp,
-                        posted_p150_seq, c.router_stream);
-                    DSV41_HIP_CHECK(hipEventRecord(c.ev_p150_armed_ring[block_id], c.router_stream));
+                        posted_p150_seq, c.stream);
+                    if (use_dev3_bb) {
+                        posted_dev3_seq = dev3_engine.next_bb_fast_seq();
+                        dev3_slot = dev3_engine.bb_fast_slot(posted_dev3_seq);
+                        uint32_t* d_sync0 = c.d_dev3_stage_wg_sync +
+                                            (kHlut3OffloadRingSlots + ((posted_dev3_seq - 1u) & uint32_t(kHlut3OffloadRingSlots - 1u))) * 16u;
+                        launch_stage_and_arm_hlut3_dev3(
+                            dev3_slot, d_sync0, c.d_topk_ids, c.d_topk_weights,
+                            c.d_x_rot_f16, nullptr,
+                            static_cast<uint32_t>(block_id), M, top_k,
+                            b.dev3_hlut3_begin, b.dev3_hlut3_begin + b.dev3_hlut3_count,
+                            /*include_mtp_shared=*/0u, posted_dev3_seq, c.stream);
+                    }
+                    (void)hipStreamQuery(c.stream);
                 }
             }
 
@@ -2146,10 +2812,6 @@ struct Dsv41Runtime::Impl {
                 DSV41_HIP_CHECK(hipSetDevice(tp));
                 auto& c = ctx[tp];
                 const auto& b = c.blocks[block_id];
-                if (tp == 0) {
-                    // Ensure high-priority router_stream arms shm->req_seq on empty CUs BEFORE tp=0 launches shared_experts/HLUT2!
-                    DSV41_HIP_CHECK(hipStreamWaitEvent(c.stream, c.ev_p150_armed_ring[block_id], 0));
-                }
 
                 // 1. Shared SwiGLU initializes c.d_moe_part_f32 (accumulate_f32 = false)
                 if (!x_and_fp8_and_wht_precomputed) {
@@ -2162,37 +2824,57 @@ struct Dsv41Runtime::Impl {
                 launch_fp8_gemm(c.d_fp8_act, c.d_fp8_scale, b.d_sh_w2_w, b.d_sh_w2_s, nullptr, c.d_moe_part_f32,
                                 M, kDim, kSharedInterTp, true, false, c.stream);
 
-                // 2. Device-resident MI50 [0..215] HLUT2 routed experts (0 host syncs!)
-                if (use_pairs) {
-                    launch_pack_mi50_routed_pairs(c.d_topk_ids, c.d_topk_weights, c.d_routed_pairs,
-                                                  M, top_k, b.mi50_experts, c.stream);
-                    launch_mi50_routed_hlut2_pairs(
-                        c.d_x_rot_f16, c.d_routed_pairs, P_tot,
-                        b.d_hlut2_gate_codes, b.d_hlut2_gate_sc, b.d_hlut2_gate_cent,
-                        b.d_hlut2_up_codes,   b.d_hlut2_up_sc,   b.d_hlut2_up_cent,
-                        b.d_hlut2_down_codes, b.d_hlut2_down_sc, b.d_hlut2_down_cent,
-                        b.d_signs_i, c.d_inter_bf16, c.d_inter_rot_f16,
-                        c.d_moe_part_f32, c.stream);
-                } else {
-                    const int max_act = std::min(b.mi50_experts, P_tot);
-                    launch_build_mi50_csr(c.d_topk_ids, c.d_topk_weights,
-                                          c.d_active_experts, c.d_csr_offsets, c.d_routed_pairs,
-                                          M, top_k, b.mi50_experts, c.stream);
-                    launch_mi50_routed_hlut2_grouped(
-                        c.d_x_rot_f16, c.d_active_experts, c.d_csr_offsets, c.d_routed_pairs,
-                        M, max_act, P_tot,
-                        b.d_hlut2_gate_codes, b.d_hlut2_gate_sc, b.d_hlut2_gate_cent,
-                        b.d_hlut2_up_codes,   b.d_hlut2_up_sc,   b.d_hlut2_up_cent,
-                        b.d_hlut2_down_codes, b.d_hlut2_down_sc, b.d_hlut2_down_cent,
-                        b.d_signs_i, c.d_inter_bf16, c.d_inter_rot_f16,
-                        c.d_moe_part_f32, c.stream);
+                // 2a. Device-resident TP3 compacted HLUT2 routed experts [0 .. tp3_hlut2_experts)
+                if (b.tp3_hlut2_experts > 0) {
+                    if (use_pairs) {
+                        launch_pack_mi50_routed_pairs(c.d_topk_ids, c.d_topk_weights, c.d_routed_pairs,
+                                                      M, top_k, b.tp3_hlut2_experts, c.stream);
+                        launch_mi50_routed_hlut2_pairs(
+                            c.d_x_rot_f16, c.d_routed_pairs, P_tot,
+                            b.d_hlut2_gate_codes, b.d_hlut2_gate_sc, b.d_hlut2_gate_cent,
+                            b.d_hlut2_up_codes,   b.d_hlut2_up_sc,   b.d_hlut2_up_cent,
+                            b.d_hlut2_down_codes, b.d_hlut2_down_sc, b.d_hlut2_down_cent,
+                            b.d_signs_i, c.d_inter_bf16, c.d_inter_rot_f16,
+                            c.d_moe_part_f32, c.stream);
+                    } else {
+                        const int max_act = std::min(b.tp3_hlut2_experts, P_tot);
+                        launch_build_mi50_csr(c.d_topk_ids, c.d_topk_weights,
+                                              c.d_active_experts, c.d_csr_offsets, c.d_routed_pairs,
+                                              M, top_k, b.tp3_hlut2_experts, c.stream);
+                        launch_mi50_routed_hlut2_grouped(
+                            c.d_x_rot_f16, c.d_active_experts, c.d_csr_offsets, c.d_routed_pairs,
+                            M, max_act, P_tot,
+                            b.d_hlut2_gate_codes, b.d_hlut2_gate_sc, b.d_hlut2_gate_cent,
+                            b.d_hlut2_up_codes,   b.d_hlut2_up_sc,   b.d_hlut2_up_cent,
+                            b.d_hlut2_down_codes, b.d_hlut2_down_sc, b.d_hlut2_down_cent,
+                            b.d_signs_i, c.d_inter_bf16, c.d_inter_rot_f16,
+                            c.d_moe_part_f32, c.stream);
+                    }
+                }
+
+                // 2b. Device-resident TP3 in-place HLUT3 routed experts [tp3_hlut3_begin .. +tp3_hlut3_count)
+                // Wave 9.3 Phase D: Always use single-CTA CSR + zero-scratch v_dot2_f32_f16 grouped HLUT3!
+                if (b.tp3_hlut3_count > 0 && b.d_hlut3_gate_tiles != nullptr) {
+                    const int max_act3 = std::min(b.tp3_hlut3_count, P_tot);
+                    launch_build_ranged_csr(
+                        c.d_topk_ids, c.d_topk_weights,
+                        c.d_active_experts, c.d_csr_offsets, c.d_tp3_hlut3_pairs,
+                        M, top_k, b.tp3_hlut3_begin, b.tp3_hlut3_begin + b.tp3_hlut3_count, c.stream);
+                    launch_hlut3_fdot2_grouped_f16(
+                        c.d_x_rot_f16, c.d_active_experts, c.d_csr_offsets, c.d_tp3_hlut3_pairs,
+                        nullptr, max_act3, b.tp3_hlut3_count, kSharedInterTp,
+                        b.d_hlut3_gate_tiles, b.d_hlut3_up_tiles, b.d_hlut3_down_tiles,
+                        c.d_hlut3_levels, b.d_signs_i,
+                        reinterpret_cast<uint16_t*>(c.d_hlut3_z), c.d_moe_part_f32, c.stream);
                 }
             }
 
-            // 3. Upload MI50 FP32 partials + GPU wait on mapped P150A resp_seq + fused mHC post (+ next RMSNorm/UE8M0!)
+            // 3. Upload MI50 FP32 partials + GPU wait on mapped P150A resp_seq & dev3 done_seq + fused mHC post!
             const uint32_t rslot = (posted_p150_seq - 1u) & (DSV41_P150_FAST_RING_SLOTS - 1u);
             const uint64_t ar_seq = ++host_ar_seq;
             HostRingAllReduceSlot* ar_slot = &h_ar_ring[(ar_seq - 1ULL) & (kHostArRingSlots - 1ULL)];
+            const float*    d_dev3_y    = dev3_slot ? dev3_slot->y_out_f32 : nullptr;
+            const uint32_t* d_dev3_done = dev3_slot ? &dev3_slot->done_seq : nullptr;
             for (int tp = 0; tp < 3; ++tp) {
                 DSV41_HIP_CHECK(hipSetDevice(tp));
                 auto& c = ctx[tp];
@@ -2208,20 +2890,22 @@ struct Dsv41Runtime::Impl {
                         nullptr, nullptr, nullptr,
                         kNormEps, ar_slot, tp, ar_seq, M, c.stream,
                         d_p150_resp_seq[tp], posted_p150_seq,
-                        (tp == 0 && rtc_active_in_chunk) ? d_stage_rtc : nullptr);
+                        (tp == 0 && rtc_active_in_chunk) ? d_stage_rtc : nullptr,
+                        d_dev3_y, d_dev3_done, posted_dev3_seq);
                 } else {
                     launch_host_ring_finish_f32_hc_post(
                         c.d_moe_part_f32, d_p150_fast_y_out_bf16[tp][rslot],
                         c.d_h_bf16[in_h_slot], c.d_post_mix_f32, c.d_comb_mix_f32, c.d_h_bf16[out_h_slot],
                         ar_slot, tp, ar_seq, M, c.stream,
                         d_p150_resp_seq[tp], posted_p150_seq,
-                        (tp == 0 && rtc_active_in_chunk) ? d_stage_rtc : nullptr);
+                        (tp == 0 && rtc_active_in_chunk) ? d_stage_rtc : nullptr,
+                        d_dev3_y, d_dev3_done, posted_dev3_seq);
                 }
             }
             return;
         }
 
-        // Wave 7A Backbone MoE (prefill M > 64, RAREBAL collector, or --no-dual-stream-overlap):
+        // Wave 7A / 9.2 Backbone MoE (prefill M > 64, RAREBAL collector, or --no-dual-stream-overlap):
         if (deferred_hc_ffn_block >= 0) {
             for (int tp = 0; tp < 3; ++tp) {
                 DSV41_HIP_CHECK(hipSetDevice(tp));
@@ -2240,8 +2924,12 @@ struct Dsv41Runtime::Impl {
             const auto& bm0 = c0.blocks[block_id];
             DSV41_HIP_CHECK(hipEventRecord(c0.ev_x_ready, c0.stream));
             DSV41_HIP_CHECK(hipStreamWaitEvent(c0.router_stream, c0.ev_x_ready, 0));
-            launch_bf16_gemm(c0.d_x_bf16, bm0.d_gate_w, nullptr, c0.d_gate_logits_f32,
-                             M, bm0.n_routed_experts, kDim, true, c0.router_stream);
+            if (!(rocblas_prefill_enabled && c0.rb_prefill.run_bf16_gemm(
+                    c0.d_x_bf16, bm0.d_gate_w, nullptr, c0.d_gate_logits_f32,
+                    M, bm0.n_routed_experts, kDim, true, c0.router_stream))) {
+                launch_bf16_gemm(c0.d_x_bf16, bm0.d_gate_w, nullptr, c0.d_gate_logits_f32,
+                                 M, bm0.n_routed_experts, kDim, true, c0.router_stream);
+            }
             const uint16_t* d_perm_row0 = (expert_perm_active && block_id < kNumLayers)
                 ? (c0.d_expert_perm + size_t(block_id) * size_t(kBackboneExperts))
                 : nullptr;
@@ -2254,9 +2942,27 @@ struct Dsv41Runtime::Impl {
                                            hipMemcpyDeviceToHost, c0.router_stream));
             DSV41_HIP_CHECK(hipMemcpyAsync(c0.h_topk_w, c0.d_topk_weights, size_t(M) * top_k * sizeof(float),
                                            hipMemcpyDeviceToHost, c0.router_stream));
+            const bool p150_direct = (p150_shm.ptr != nullptr && p150_shm_pinned && M <= int(DSV41_P150_MAX_ROWS));
+            const bool dev3_int8_wire = (dev3_engine.active() && bm0.dev3_hlut3_count > 0 && M >= 64);
             if (p150_shm.ptr) {
-                uint16_t* dst_x = p150_shm_pinned ? p150_shm.ptr->x_in_bf16 : c0.h_x_moe_bf16;
+                uint16_t* dst_x = p150_direct ? p150_shm.ptr->x_in_bf16 : c0.h_x_moe_bf16;
                 DSV41_HIP_CHECK(hipMemcpyAsync(dst_x, c0.d_part_bf16, size_t(M) * kDim * sizeof(uint16_t),
+                                               hipMemcpyDeviceToHost, c0.router_stream));
+            }
+            if (dev3_int8_wire) {
+                // Wave 9.4 Phase C: Quantize rotated FP16 -> INT8 + FP16 row scales in disjoint d_wo_mid_bf16 (24 MiB)
+                // and DMA 20 MiB directly into dev3 pinned staging (0 CPU activation memcpy, 2x smaller PCIe H2D!)
+                int8_t*   d_i8_tmp = reinterpret_cast<int8_t*>(c0.d_wo_mid_bf16);
+                uint16_t* d_sc_tmp = reinterpret_cast<uint16_t*>(d_i8_tmp + ((size_t(M) * kDim + 255u) & ~255u));
+                launch_w94_quant_f16_to_int8_rowwise(c0.d_x_rot_f16, d_i8_tmp, d_sc_tmp, M, kDim, c0.router_stream);
+                DSV41_HIP_CHECK(hipMemcpyAsync(dev3_engine.prefill_x_i8_staging(), d_i8_tmp,
+                                               size_t(M) * kDim * sizeof(int8_t),
+                                               hipMemcpyDeviceToHost, c0.router_stream));
+                DSV41_HIP_CHECK(hipMemcpyAsync(dev3_engine.prefill_x_scales_staging(), d_sc_tmp,
+                                               size_t(M) * size_t(kDim / 128) * sizeof(uint16_t),
+                                               hipMemcpyDeviceToHost, c0.router_stream));
+            } else if (!p150_shm.ptr && dev3_engine.active() && bm0.dev3_hlut3_count > 0) {
+                DSV41_HIP_CHECK(hipMemcpyAsync(c0.h_x_rot_f16, c0.d_x_rot_f16, size_t(M) * kDim * sizeof(uint16_t),
                                                hipMemcpyDeviceToHost, c0.router_stream));
             }
             if (rarebal_collector && rarebal_collector->need_x_copy(block_id) && rarebal_collector->h_x_pinned) {
@@ -2265,35 +2971,101 @@ struct Dsv41Runtime::Impl {
                                                hipMemcpyDeviceToHost, c0.router_stream));
             }
             DSV41_HIP_CHECK(hipEventRecord(c0.ev_router_done, c0.router_stream));
+            (void)hipStreamQuery(c0.router_stream);
         }
 
-        // Wait ONLY on tp=0's exclusive router_stream event so we immediately post to P150A!
+        // Wave 9.3 Phase B: Overlap shared_experts on tp=0,1,2 (c.stream) with tp=0 router_stream D2H + CPU routing!
+        auto launch_shared_experts_all_tp = [&]() {
+            const auto t_sh0 = std::chrono::steady_clock::now();
+            for (int tp = 0; tp < 3; ++tp) {
+                DSV41_HIP_CHECK(hipSetDevice(tp));
+                auto& c = ctx[tp];
+                const auto& b = c.blocks[block_id];
+                if (!x_and_fp8_and_wht_precomputed) {
+                    launch_act_quant_ue8m0_32(c.d_x_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr, M, kDim, false, c.stream);
+                }
+                dispatch_fp8_gemm(c, c.d_fp8_act, c.d_fp8_scale, b.d_sh_w13_w, b.d_sh_w13_s, c.d_sh_gateup_bf16, nullptr,
+                                  M, 2 * kSharedInterTp, kDim, false, false);
+                launch_swiglu10_split_quant_ue8m0_32(c.d_sh_gateup_bf16, c.d_fp8_act, c.d_fp8_scale,
+                                                     M, kSharedInterTp, c.stream);
+                dispatch_fp8_gemm(c, c.d_fp8_act, c.d_fp8_scale, b.d_sh_w2_w, b.d_sh_w2_s, nullptr, c.d_moe_part_f32,
+                                  M, kDim, kSharedInterTp, true, false);
+            }
+            if (sync_timers) {
+                sync_tp0_if_profiling();
+                sub_moe_sh_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_sh0).count();
+            }
+        };
+        if (!sync_timers) {
+            launch_shared_experts_all_tp();
+        }
+
+        // Wait ONLY on tp=0's exclusive router_stream event so we immediately post to P150A & hlut3_dev=3!
         DSV41_HIP_CHECK(hipSetDevice(0));
         DSV41_HIP_CHECK(hipEventSynchronize(ctx[0].ev_router_done));
 
         mi50_pairs_buf.clear();
-        bool any_p150 = false;
-        uint32_t posted_p150_seq = 0u;
+        tp3_hlut3_pairs_buf.clear();
+        dev3_hlut3_pairs_buf.clear();
         auto* shm = p150_shm.ptr;
+        bool any_p150 = false;
+        bool p150_split_active = (shm != nullptr && M > int(DSV41_P150_MAX_ROWS));
+        bool p150_slice0_posted = false;
+        bool p150_slice0_collected = false;
+        bool p150_slice1_posted = false;
+        int  p150_slice0_rows = std::min(M, int(DSV41_P150_MAX_ROWS));
+        int  p150_slice1_rows = std::max(0, M - p150_slice0_rows);
+        uint32_t posted_p150_seq = 0u;
+        uint32_t posted_dev3_prefill_seq = 0u;
 
         const int32_t* ids = ctx[0].h_topk_ids;
         const float*   ws  = ctx[0].h_topk_w;
+        auto fill_p150_slice_meta = [&](int r_begin, int r_cnt) -> bool {
+            if (!shm || r_cnt <= 0) return false;
+            bool slice_any = false;
+            for (int rr = 0; rr < r_cnt; ++rr) {
+                const int r = r_begin + rr;
+                uint32_t p150_slot_cursor = 0u;
+                for (int k = 0; k < top_k; ++k) {
+                    const int32_t eid = ids[r * top_k + k];
+                    const float w = ws[r * top_k + k];
+                    if (eid >= kMi50BackboneExp && w != 0.0f && p150_slot_cursor < DSV41_P150_MAX_SLOTS) {
+                        shm->row_slots[rr][p150_slot_cursor] = eid - kMi50BackboneExp;
+                        shm->row_weights[rr][p150_slot_cursor] = w;
+                        ++p150_slot_cursor;
+                        slice_any = true;
+                    }
+                }
+                for (uint32_t s = p150_slot_cursor; s < DSV41_P150_MAX_SLOTS; ++s) {
+                    shm->row_slots[rr][s] = -1;
+                    shm->row_weights[rr][s] = 0.0f;
+                }
+            }
+            return slice_any;
+        };
+
         for (int r = 0; r < M; ++r) {
             uint32_t p150_slot_cursor = 0u;
             for (int k = 0; k < top_k; ++k) {
                 const int32_t eid = ids[r * top_k + k];
                 const float w = ws[r * top_k + k];
                 if (eid < 0 || w == 0.0f) continue;
-                if (eid < b0.mi50_experts) {
+                if (eid < b0.tp3_hlut2_experts) {
                     mi50_pairs_buf.push_back(Mi50RoutedPair{r, eid, w, 0});
-                } else if (shm && p150_slot_cursor < DSV41_P150_MAX_SLOTS) {
-                    shm->row_slots[r][p150_slot_cursor] = eid - kMi50BackboneExp;
-                    shm->row_weights[r][p150_slot_cursor] = w;
+                } else if (eid >= b0.tp3_hlut3_begin && eid < b0.tp3_hlut3_begin + b0.tp3_hlut3_count) {
+                    tp3_hlut3_pairs_buf.push_back(Mi50RoutedPair{r, eid - b0.tp3_hlut3_begin, w, 0});
+                } else if (eid >= b0.dev3_hlut3_begin && eid < b0.dev3_hlut3_begin + b0.dev3_hlut3_count) {
+                    dev3_hlut3_pairs_buf.push_back(Mi50RoutedPair{r, eid - b0.dev3_hlut3_begin, w, 0});
+                } else if (shm && eid >= kMi50BackboneExp && p150_slot_cursor < DSV41_P150_MAX_SLOTS) {
+                    if (!p150_split_active) {
+                        shm->row_slots[r][p150_slot_cursor] = eid - kMi50BackboneExp;
+                        shm->row_weights[r][p150_slot_cursor] = w;
+                    }
                     ++p150_slot_cursor;
                     any_p150 = true;
                 }
             }
-            if (shm) {
+            if (shm && !p150_split_active) {
                 for (uint32_t s = p150_slot_cursor; s < DSV41_P150_MAX_SLOTS; ++s) {
                     shm->row_slots[r][s] = -1;
                     shm->row_weights[r][s] = 0.0f;
@@ -2301,64 +3073,119 @@ struct Dsv41Runtime::Impl {
             }
         }
 
-        // Wave 7A: Kick off P150A [216..383] doorbell FIRST over /dev/shm, strictly BEFORE
-        // ANY MI50 shared SwiGLU, routed [0..215] HLUT2, or RAREBAL CPU staging!
+        // 0a. Kick off P150A [216..383] doorbell FIRST over /dev/shm (Slice 0 if M > 1024, else full M)!
         if (any_p150 && shm) {
-            if (!p150_shm_pinned) {
-                std::memcpy(shm->x_in_bf16, ctx[0].h_x_moe_bf16, size_t(M) * kDim * sizeof(uint16_t));
+            if (!p150_split_active) {
+                if (!p150_shm_pinned) {
+                    std::memcpy(shm->x_in_bf16, ctx[0].h_x_moe_bf16, size_t(M) * kDim * sizeof(uint16_t));
+                }
+                shm->op = DSV41_P150_OP_MOE_FORWARD;
+                shm->layer = static_cast<uint32_t>(block_id);
+                shm->rows = static_cast<uint32_t>(M);
+                shm->input_is_wht_rotated = 1u;
+                posted_p150_seq = ++p150_seq_counter;
+                shm->req_seq.store(posted_p150_seq, std::memory_order_release);
+            } else {
+                p150_slice0_posted = fill_p150_slice_meta(0, p150_slice0_rows);
+                if (p150_slice0_posted) {
+                    std::memcpy(shm->x_in_bf16, ctx[0].h_x_moe_bf16, size_t(p150_slice0_rows) * kDim * sizeof(uint16_t));
+                    shm->op = DSV41_P150_OP_MOE_FORWARD;
+                    shm->layer = static_cast<uint32_t>(block_id);
+                    shm->rows = static_cast<uint32_t>(p150_slice0_rows);
+                    shm->input_is_wht_rotated = 1u;
+                    posted_p150_seq = ++p150_seq_counter;
+                    shm->req_seq.store(posted_p150_seq, std::memory_order_release);
+                } else {
+                    std::memset(ctx[0].h_x_moe_bf16, 0, size_t(p150_slice0_rows) * kDim * sizeof(uint16_t));
+                    p150_slice0_collected = true;
+                    p150_slice1_posted = fill_p150_slice_meta(p150_slice0_rows, p150_slice1_rows);
+                    if (p150_slice1_posted) {
+                        std::memcpy(shm->x_in_bf16, ctx[0].h_x_moe_bf16 + size_t(p150_slice0_rows) * kDim,
+                                    size_t(p150_slice1_rows) * kDim * sizeof(uint16_t));
+                        shm->op = DSV41_P150_OP_MOE_FORWARD;
+                        shm->layer = static_cast<uint32_t>(block_id);
+                        shm->rows = static_cast<uint32_t>(p150_slice1_rows);
+                        shm->input_is_wht_rotated = 1u;
+                        posted_p150_seq = ++p150_seq_counter;
+                        shm->req_seq.store(posted_p150_seq, std::memory_order_release);
+                    }
+                }
             }
-            shm->op = DSV41_P150_OP_MOE_FORWARD;
-            shm->layer = static_cast<uint32_t>(block_id);
-            shm->rows = static_cast<uint32_t>(M);
-            shm->input_is_wht_rotated = 1u;
-            posted_p150_seq = ++p150_seq_counter;
-            shm->req_seq.store(posted_p150_seq, std::memory_order_release);
         }
 
-        // Wave 7A: P150A doorbell is armed!
-        // 1. Launch MI50 shared SwiGLU FIRST (`accumulate_f32 = false`) to initialize `c.d_moe_part_f32`
-        //    on all 3 ranks BEFORE `[0..215]` HLUT2 `atomicAdd`s onto `c.d_moe_part_f32`!
-        for (int tp = 0; tp < 3; ++tp) {
-            DSV41_HIP_CHECK(hipSetDevice(tp));
-            auto& c = ctx[tp];
-            const auto& b = c.blocks[block_id];
-            if (!x_and_fp8_and_wht_precomputed) {
-                launch_act_quant_ue8m0_32(c.d_x_bf16, c.d_fp8_act, c.d_fp8_scale, nullptr, M, kDim, false, c.stream);
+        // 0b. Kick off 4th-GPU hlut3_dev=3 (0000:85:00.0) unsharded HLUT3 backbone experts SECOND!
+        const bool dev3_used_int8_wire = (dev3_engine.active() && !dev3_hlut3_pairs_buf.empty() && M >= 64);
+        if (dev3_engine.active() && !dev3_hlut3_pairs_buf.empty()) {
+            if (dev3_used_int8_wire) {
+                posted_dev3_prefill_seq = dev3_engine.submit_prefill_int8_async(
+                    block_id, M,
+                    dev3_hlut3_pairs_buf.data(), int(dev3_hlut3_pairs_buf.size()),
+                    /*out_bf16=*/true);
+            } else {
+                const bool dev3_reuse_bf16 = (shm != nullptr);
+                const uint16_t* dev3_x_src = dev3_reuse_bf16
+                    ? ((p150_shm_pinned && !p150_split_active) ? shm->x_in_bf16 : ctx[0].h_x_moe_bf16)
+                    : ctx[0].h_x_rot_f16;
+                posted_dev3_prefill_seq = dev3_engine.submit_prefill_async(
+                    block_id, M, dev3_x_src, nullptr,
+                    dev3_hlut3_pairs_buf.data(), int(dev3_hlut3_pairs_buf.size()),
+                    /*include_mtp_shared=*/false,
+                    /*x_is_bf16=*/dev3_reuse_bf16);
             }
-            launch_fp8_gemm(c.d_fp8_act, c.d_fp8_scale, b.d_sh_w13_w, b.d_sh_w13_s, c.d_sh_gateup_bf16, nullptr,
-                            M, 2 * kSharedInterTp, kDim, false, false, c.stream);
-            launch_swiglu10_split_quant_ue8m0_32(c.d_sh_gateup_bf16, c.d_fp8_act, c.d_fp8_scale,
-                                                 M, kSharedInterTp, c.stream);
-            launch_fp8_gemm(c.d_fp8_act, c.d_fp8_scale, b.d_sh_w2_w, b.d_sh_w2_s, nullptr, c.d_moe_part_f32,
-                            M, kDim, kSharedInterTp, true, false, c.stream);
         }
         if (sync_timers) {
-            sync_tp0_if_profiling();
-            sub_moe_sh_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_moe0).count();
+            sub_moe_router_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_moe0).count();
+            launch_shared_experts_all_tp();
         }
 
-        // 2. Launch MI50 HLUT2 routed experts [0..215] (`atomicAdd` onto `c.d_moe_part_f32`) overlapping P150A!
+        // 2a. Launch TP3 compacted HLUT2 routed experts [0 .. tp3_hlut2_experts) overlapping P150A & dev3!
         const auto t_hlut0 = std::chrono::steady_clock::now();
         const int P = static_cast<int>(mi50_pairs_buf.size());
-        if (P > 0) {
+        if (P > 0 && b0.tp3_hlut2_experts > 0) {
             std::array<int, 256> counts{};
             int num_act = 0;
             for (const auto& pr : mi50_pairs_buf) {
                 if (counts[pr.expert]++ == 0) ++num_act;
             }
+            const bool use_rb2 = (rocblas_prefill_enabled && ctx[0].rb_prefill.active() && M >= RocblasPrefillEngine::kDefaultDenseThreshM);
             const bool use_grouped = (M > 8 && num_act < P);
-            if (!use_grouped) {
+            rb_buckets_buf.clear();
+            int tail_pair_base = 0;
+            int tail_act = 0;
+            int tail_pairs = 0;
+            if (!use_grouped && !use_rb2) {
                 std::memcpy(ctx[0].h_routed_pairs, mi50_pairs_buf.data(), size_t(P) * sizeof(Mi50RoutedPair));
             } else {
-                int act_idx = 0;
-                ctx[0].h_csr_offsets[0] = 0;
                 std::array<int, 256> cursor{};
-                for (int e = 0; e < b0.mi50_experts; ++e) {
-                    if (counts[e] > 0) {
-                        cursor[e] = ctx[0].h_csr_offsets[act_idx];
-                        ctx[0].h_active_exp[act_idx] = e;
-                        ctx[0].h_csr_offsets[act_idx + 1] = cursor[e] + counts[e];
-                        ++act_idx;
+                int hot_pos = 0;
+                if (use_rb2) {
+                    for (int e = 0; e < b0.tp3_hlut2_experts; ++e) {
+                        if (counts[e] >= rocblas_hlut2_thresh) {
+                            rb_buckets_buf.push_back(RocblasPrefillEngine::ExpertBucketDesc{e, 0, counts[e]});
+                        }
+                    }
+                    // Sort by m_e descending so every B=8 strided-batched HHHS group has tightly matched m_pad!
+                    std::sort(rb_buckets_buf.begin(), rb_buckets_buf.end(),
+                              [](const auto& a, const auto& b) {
+                                  return (a.m_e != b.m_e) ? (a.m_e > b.m_e) : (a.eid < b.eid);
+                              });
+                    for (auto& bk : rb_buckets_buf) {
+                        bk.p_start = hot_pos;
+                        cursor[bk.eid] = hot_pos;
+                        hot_pos += bk.m_e;
+                    }
+                }
+                tail_pair_base = hot_pos;
+                tail_pairs = P - tail_pair_base;
+                ctx[0].h_csr_offsets[0] = 0;
+                int rel_pos = 0;
+                for (int e = 0; e < b0.tp3_hlut2_experts; ++e) {
+                    if (counts[e] > 0 && (!use_rb2 || counts[e] < rocblas_hlut2_thresh)) {
+                        cursor[e] = tail_pair_base + rel_pos;
+                        ctx[0].h_active_exp[tail_act] = e;
+                        rel_pos += counts[e];
+                        ctx[0].h_csr_offsets[tail_act + 1] = rel_pos;
+                        ++tail_act;
                     }
                 }
                 for (const auto& pr : mi50_pairs_buf) {
@@ -2370,10 +3197,10 @@ struct Dsv41Runtime::Impl {
                 DSV41_HIP_CHECK(hipSetDevice(tp));
                 auto& c = ctx[tp];
                 const auto& b = c.blocks[block_id];
-                if (!use_grouped) {
-                    DSV41_HIP_CHECK(hipMemcpyAsync(c.d_routed_pairs, ctx[0].h_routed_pairs,
-                                                   size_t(P) * sizeof(Mi50RoutedPair),
-                                                   hipMemcpyHostToDevice, c.stream));
+                DSV41_HIP_CHECK(hipMemcpyAsync(c.d_routed_pairs, ctx[0].h_routed_pairs,
+                                               size_t(P) * sizeof(Mi50RoutedPair),
+                                               hipMemcpyHostToDevice, c.stream));
+                if (!use_grouped && !use_rb2) {
                     launch_mi50_routed_hlut2_pairs(
                         c.d_x_rot_f16, c.d_routed_pairs, P,
                         b.d_hlut2_gate_codes, b.d_hlut2_gate_sc, b.d_hlut2_gate_cent,
@@ -2382,28 +3209,138 @@ struct Dsv41Runtime::Impl {
                         b.d_signs_i, c.d_inter_bf16, c.d_inter_rot_f16,
                         c.d_moe_part_f32, c.stream);
                 } else {
-                    DSV41_HIP_CHECK(hipMemcpyAsync(c.d_routed_pairs, ctx[0].h_routed_pairs,
-                                                   size_t(P) * sizeof(Mi50RoutedPair),
-                                                   hipMemcpyHostToDevice, c.stream));
-                    DSV41_HIP_CHECK(hipMemcpyAsync(c.d_active_experts, ctx[0].h_active_exp,
-                                                   size_t(num_act) * sizeof(int32_t),
-                                                   hipMemcpyHostToDevice, c.stream));
-                    DSV41_HIP_CHECK(hipMemcpyAsync(c.d_csr_offsets, ctx[0].h_csr_offsets,
-                                                   size_t(num_act + 1) * sizeof(int32_t),
-                                                   hipMemcpyHostToDevice, c.stream));
-                    launch_mi50_routed_hlut2_grouped(
-                        c.d_x_rot_f16, c.d_active_experts, c.d_csr_offsets, c.d_routed_pairs,
-                        M, num_act, P,
-                        b.d_hlut2_gate_codes, b.d_hlut2_gate_sc, b.d_hlut2_gate_cent,
-                        b.d_hlut2_up_codes,   b.d_hlut2_up_sc,   b.d_hlut2_up_cent,
-                        b.d_hlut2_down_codes, b.d_hlut2_down_sc, b.d_hlut2_down_cent,
-                        b.d_signs_i, c.d_inter_bf16, c.d_inter_rot_f16,
-                        c.d_moe_part_f32, c.stream);
+                    if (!rb_buckets_buf.empty()) {
+                        c.rb_prefill.run_hlut2_expert_buckets_batched(
+                            c.d_x_rot_f16, c.d_routed_pairs,
+                            rb_buckets_buf.data(), int(rb_buckets_buf.size()),
+                            b.d_hlut2_gate_codes, b.d_hlut2_gate_sc, b.d_hlut2_gate_cent,
+                            b.d_hlut2_up_codes,   b.d_hlut2_up_sc,   b.d_hlut2_up_cent,
+                            b.d_hlut2_down_codes, b.d_hlut2_down_sc, b.d_hlut2_down_cent,
+                            b.d_signs_i, c.d_moe_part_f32, c.stream);
+                    }
+                    if (tail_pairs > 0) {
+                        DSV41_HIP_CHECK(hipMemcpyAsync(c.d_active_experts, ctx[0].h_active_exp,
+                                                       size_t(tail_act) * sizeof(int32_t),
+                                                       hipMemcpyHostToDevice, c.stream));
+                        DSV41_HIP_CHECK(hipMemcpyAsync(c.d_csr_offsets, ctx[0].h_csr_offsets,
+                                                       size_t(tail_act + 1) * sizeof(int32_t),
+                                                       hipMemcpyHostToDevice, c.stream));
+                        launch_mi50_routed_hlut2_grouped(
+                            c.d_x_rot_f16, c.d_active_experts, c.d_csr_offsets,
+                            c.d_routed_pairs + tail_pair_base,
+                            M, tail_act, tail_pairs,
+                            b.d_hlut2_gate_codes, b.d_hlut2_gate_sc, b.d_hlut2_gate_cent,
+                            b.d_hlut2_up_codes,   b.d_hlut2_up_sc,   b.d_hlut2_up_cent,
+                            b.d_hlut2_down_codes, b.d_hlut2_down_sc, b.d_hlut2_down_cent,
+                            b.d_signs_i, c.d_inter_bf16, c.d_inter_rot_f16,
+                            c.d_moe_part_f32, c.stream);
+                    }
                 }
+            }
+            if (sync_timers) {
+                sync_tp0_if_profiling();
+                sub_moe_tp3_hlut2_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_hlut0).count();
             }
         }
 
-        // Wave 8.5A: Record logical expert hits & activations on CPU WHILE 3x MI50 + 2x P150A execute in parallel!
+        // 2b. Launch TP3 in-place HLUT3 routed experts [tp3_hlut3_begin .. +tp3_hlut3_count) overlapping P150A & dev3!
+        const auto t_hlut3_0 = std::chrono::steady_clock::now();
+        const int P_tp3 = static_cast<int>(tp3_hlut3_pairs_buf.size());
+        if (P_tp3 > 0 && b0.tp3_hlut3_count > 0 && b0.d_hlut3_gate_tiles != nullptr) {
+            std::array<int, 256> counts3{};
+            int num_act3 = 0;
+            for (const auto& pr : tp3_hlut3_pairs_buf) {
+                if (counts3[pr.expert]++ == 0) ++num_act3;
+            }
+            const bool use_rb3 = (rocblas_prefill_enabled && ctx[0].rb_prefill.active() && M >= RocblasPrefillEngine::kDefaultDenseThreshM);
+            const bool use_grouped3 = (M > 8 && num_act3 < P_tp3);
+            rb_buckets_buf.clear();
+            int tail3_base = 0;
+            int tail3_act = 0;
+            int tail3_pairs = 0;
+            if (!use_grouped3 && !use_rb3) {
+                std::memcpy(ctx[0].h_tp3_hlut3_pairs, tp3_hlut3_pairs_buf.data(), size_t(P_tp3) * sizeof(Mi50RoutedPair));
+            } else {
+                std::array<int, 256> cursor{};
+                int hot_pos = 0;
+                if (use_rb3) {
+                    for (int e = 0; e < b0.tp3_hlut3_count; ++e) {
+                        if (counts3[e] >= rocblas_expert_thresh) {
+                            rb_buckets_buf.push_back(RocblasPrefillEngine::ExpertBucketDesc{e, 0, counts3[e]});
+                        }
+                    }
+                    std::sort(rb_buckets_buf.begin(), rb_buckets_buf.end(),
+                              [](const auto& a, const auto& b) {
+                                  return (a.m_e != b.m_e) ? (a.m_e > b.m_e) : (a.eid < b.eid);
+                              });
+                    for (auto& bk : rb_buckets_buf) {
+                        bk.p_start = hot_pos;
+                        cursor[bk.eid] = hot_pos;
+                        hot_pos += bk.m_e;
+                    }
+                }
+                tail3_base = hot_pos;
+                tail3_pairs = P_tp3 - tail3_base;
+                ctx[0].h_tp3_csr_offsets[0] = 0;
+                int rel_pos = 0;
+                for (int e = 0; e < b0.tp3_hlut3_count; ++e) {
+                    if (counts3[e] > 0 && (!use_rb3 || counts3[e] < rocblas_expert_thresh)) {
+                        cursor[e] = tail3_base + rel_pos;
+                        ctx[0].h_tp3_active_exp[tail3_act] = e;
+                        rel_pos += counts3[e];
+                        ctx[0].h_tp3_csr_offsets[tail3_act + 1] = rel_pos;
+                        ++tail3_act;
+                    }
+                }
+                for (const auto& pr : tp3_hlut3_pairs_buf) {
+                    ctx[0].h_tp3_hlut3_pairs[cursor[pr.expert]++] = pr;
+                }
+            }
+            for (int tp = 0; tp < 3; ++tp) {
+                DSV41_HIP_CHECK(hipSetDevice(tp));
+                auto& c = ctx[tp];
+                const auto& b = c.blocks[block_id];
+                DSV41_HIP_CHECK(hipMemcpyAsync(c.d_tp3_hlut3_pairs, ctx[0].h_tp3_hlut3_pairs,
+                                               size_t(P_tp3) * sizeof(Mi50RoutedPair),
+                                               hipMemcpyHostToDevice, c.stream));
+                if (!use_grouped3 && !use_rb3) {
+                    launch_hlut3_tp3_pairs_f16(
+                        c.d_x_rot_f16, c.d_tp3_hlut3_pairs, P_tp3, Hlut3Dev3Engine::kMaxScratchPairs,
+                        b.tp3_hlut3_count, b.d_hlut3_gate_tiles, b.d_hlut3_up_tiles, b.d_hlut3_down_tiles,
+                        c.d_hlut3_levels, b.d_signs_i, c.d_hlut3_z, c.d_hlut3_zrot,
+                        c.d_moe_part_f32, c.stream);
+                } else {
+                    if (!rb_buckets_buf.empty()) {
+                        c.rb_prefill.run_hlut3_expert_buckets_batched(
+                            c.d_x_rot_f16, c.d_tp3_hlut3_pairs,
+                            rb_buckets_buf.data(), int(rb_buckets_buf.size()), kSharedInterTp,
+                            b.d_hlut3_gate_tiles, b.d_hlut3_up_tiles, b.d_hlut3_down_tiles,
+                            c.d_hlut3_levels, b.d_signs_i, c.d_moe_part_f32, c.stream);
+                    }
+                    if (tail3_pairs > 0) {
+                        DSV41_HIP_CHECK(hipMemcpyAsync(c.d_active_experts, ctx[0].h_tp3_active_exp,
+                                                       size_t(tail3_act) * sizeof(int32_t),
+                                                       hipMemcpyHostToDevice, c.stream));
+                        DSV41_HIP_CHECK(hipMemcpyAsync(c.d_csr_offsets, ctx[0].h_tp3_csr_offsets,
+                                                       size_t(tail3_act + 1) * sizeof(int32_t),
+                                                       hipMemcpyHostToDevice, c.stream));
+                        launch_hlut3_fdot2_grouped_f16(
+                            c.d_x_rot_f16, c.d_active_experts, c.d_csr_offsets,
+                            c.d_tp3_hlut3_pairs + tail3_base, nullptr,
+                            tail3_act, b.tp3_hlut3_count, kSharedInterTp,
+                            b.d_hlut3_gate_tiles, b.d_hlut3_up_tiles, b.d_hlut3_down_tiles,
+                            c.d_hlut3_levels, b.d_signs_i,
+                            reinterpret_cast<uint16_t*>(c.d_hlut3_z), c.d_moe_part_f32, c.stream);
+                    }
+                }
+            }
+            if (sync_timers) {
+                sync_tp0_if_profiling();
+                sub_moe_tp3_hlut3_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_hlut3_0).count();
+            }
+        }
+
+        // Wave 8.5A: Record logical expert hits & activations on CPU WHILE 4x MI50 + 2x P150A execute in parallel!
         if (rarebal_collector && rarebal_collector->active) {
             const size_t total_slots = size_t(M) * size_t(top_k);
             if (expert_perm_active && block_id < kNumLayers) {
@@ -2423,7 +3360,57 @@ struct Dsv41Runtime::Impl {
             }
         }
 
+        // Wave 9.3 Phase B: If M > 1024 (split P150A 1024-row batches), collect Slice 0 while TP3 + dev3
+        // execute on GPU and immediately launch Slice 1 [1024..M) so Slice 1 overlaps dev3 & AllReduce!
+        if (p150_split_active && p150_slice0_posted && !p150_slice0_collected && shm) {
+            const auto tw0 = std::chrono::steady_clock::now();
+            while (shm->resp_seq.load(std::memory_order_acquire) != posted_p150_seq) {
+                dsv41_cpu_relax();
+            }
+            const double s0_w = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw0).count();
+            p150_wait_this_ms += s0_w;
+            accum_p150_wait_ms += s0_w;
+            if (shm->status != 0) {
+                throw std::runtime_error("p150_dsv41_worker slice0 returned error status " + std::to_string(shm->status));
+            }
+            accum_p150_dev_ms += double(shm->last_device_ns) * 1e-6;
+            std::memcpy(ctx[0].h_x_moe_bf16, shm->y_out_bf16, size_t(p150_slice0_rows) * kDim * sizeof(uint16_t));
+            p150_slice0_collected = true;
+
+            p150_slice1_posted = fill_p150_slice_meta(p150_slice0_rows, p150_slice1_rows);
+            if (p150_slice1_posted) {
+                std::memcpy(shm->x_in_bf16, ctx[0].h_x_moe_bf16 + size_t(p150_slice0_rows) * kDim,
+                            size_t(p150_slice1_rows) * kDim * sizeof(uint16_t));
+                shm->op = DSV41_P150_OP_MOE_FORWARD;
+                shm->layer = static_cast<uint32_t>(block_id);
+                shm->rows = static_cast<uint32_t>(p150_slice1_rows);
+                shm->input_is_wht_rotated = 1u;
+                posted_p150_seq = ++p150_seq_counter;
+                shm->req_seq.store(posted_p150_seq, std::memory_order_release);
+            }
+        }
+
         const size_t moe_elems = size_t(M) * kDim;
+        if (posted_dev3_prefill_seq != 0u) {
+            const auto td3w0 = std::chrono::steady_clock::now();
+            if (dev3_used_int8_wire) {
+                const uint16_t* h_dev3_y_bf16 = dev3_engine.wait_prefill_output_bf16(posted_dev3_prefill_seq);
+                if (sync_timers) {
+                    sub_moe_dev3_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - td3w0).count();
+                }
+                DSV41_HIP_CHECK(hipSetDevice(0));
+                launch_w94_add_bf16_to_f32_inplace(ctx[0].d_moe_part_f32, h_dev3_y_bf16, moe_elems, ctx[0].stream);
+            } else {
+                const float* h_dev3_y = dev3_engine.wait_prefill_output(posted_dev3_prefill_seq);
+                if (sync_timers) {
+                    sub_moe_dev3_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - td3w0).count();
+                }
+                DSV41_HIP_CHECK(hipSetDevice(0));
+                // Add unsharded dev3 output ONCE onto tp=0 before TP3 AllReduce so all 3 ranks receive exact sum!
+                launch_add_f32_inplace(ctx[0].d_moe_part_f32, h_dev3_y, moe_elems, ctx[0].stream);
+            }
+        }
+
         if (M <= kF32RingMaxM) {
             if (sync_timers) {
                 sync_tp0_if_profiling();
@@ -2531,23 +3518,60 @@ struct Dsv41Runtime::Impl {
                 sub_moe_ar_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_mar0).count();
             }
             if (any_p150 && shm) {
-                const auto tw0 = std::chrono::steady_clock::now();
-                while (shm->resp_seq.load(std::memory_order_acquire) != posted_p150_seq) {
-                    dsv41_cpu_relax();
-                }
-                p150_wait_this_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw0).count();
-                accum_p150_wait_ms += p150_wait_this_ms;
-                if (shm->status != 0) {
-                    throw std::runtime_error("p150_dsv41_worker returned error status " + std::to_string(shm->status));
-                }
-                accum_p150_dev_ms += double(shm->last_device_ns) * 1e-6;
-                for (int tp = 0; tp < 3; ++tp) {
-                    DSV41_HIP_CHECK(hipSetDevice(tp));
-                    auto& c = ctx[tp];
-                    DSV41_HIP_CHECK(hipMemcpyAsync(c.d_p150_out_bf16, shm->y_out_bf16,
-                                                   moe_elems * sizeof(uint16_t),
-                                                   hipMemcpyHostToDevice, c.stream));
-                    launch_add_bf16_2way_inplace(c.d_sub_bf16, c.d_p150_out_bf16, moe_elems, c.stream);
+                if (!p150_split_active) {
+                    const auto tw0 = std::chrono::steady_clock::now();
+                    while (shm->resp_seq.load(std::memory_order_acquire) != posted_p150_seq) {
+                        dsv41_cpu_relax();
+                    }
+                    p150_wait_this_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw0).count();
+                    accum_p150_wait_ms += p150_wait_this_ms;
+                    if (shm->status != 0) {
+                        throw std::runtime_error("p150_dsv41_worker returned error status " + std::to_string(shm->status));
+                    }
+                    accum_p150_dev_ms += double(shm->last_device_ns) * 1e-6;
+                    for (int tp = 0; tp < 3; ++tp) {
+                        DSV41_HIP_CHECK(hipSetDevice(tp));
+                        auto& c = ctx[tp];
+                        DSV41_HIP_CHECK(hipMemcpyAsync(c.d_p150_out_bf16, shm->y_out_bf16,
+                                                       moe_elems * sizeof(uint16_t),
+                                                       hipMemcpyHostToDevice, c.stream));
+                        launch_add_bf16_2way_inplace(c.d_sub_bf16, c.d_p150_out_bf16, moe_elems, c.stream);
+                    }
+                } else {
+                    if (p150_slice1_posted) {
+                        const auto tw0 = std::chrono::steady_clock::now();
+                        while (shm->resp_seq.load(std::memory_order_acquire) != posted_p150_seq) {
+                            dsv41_cpu_relax();
+                        }
+                        const double s1_w = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw0).count();
+                        p150_wait_this_ms += s1_w;
+                        accum_p150_wait_ms += s1_w;
+                        if (shm->status != 0) {
+                            throw std::runtime_error("p150_dsv41_worker slice1 returned error status " + std::to_string(shm->status));
+                        }
+                        accum_p150_dev_ms += double(shm->last_device_ns) * 1e-6;
+                    }
+                    const size_t s0_elems = size_t(p150_slice0_rows) * kDim;
+                    const size_t s1_elems = size_t(p150_slice1_rows) * kDim;
+                    for (int tp = 0; tp < 3; ++tp) {
+                        DSV41_HIP_CHECK(hipSetDevice(tp));
+                        auto& c = ctx[tp];
+                        if (p150_slice0_posted) {
+                            DSV41_HIP_CHECK(hipMemcpyAsync(c.d_p150_out_bf16, ctx[0].h_x_moe_bf16,
+                                                           s0_elems * sizeof(uint16_t),
+                                                           hipMemcpyHostToDevice, c.stream));
+                        } else {
+                            DSV41_HIP_CHECK(hipMemsetAsync(c.d_p150_out_bf16, 0, s0_elems * sizeof(uint16_t), c.stream));
+                        }
+                        if (p150_slice1_posted) {
+                            DSV41_HIP_CHECK(hipMemcpyAsync(c.d_p150_out_bf16 + s0_elems, shm->y_out_bf16,
+                                                           s1_elems * sizeof(uint16_t),
+                                                           hipMemcpyHostToDevice, c.stream));
+                        } else if (s1_elems > 0) {
+                            DSV41_HIP_CHECK(hipMemsetAsync(c.d_p150_out_bf16 + s0_elems, 0, s1_elems * sizeof(uint16_t), c.stream));
+                        }
+                        launch_add_bf16_2way_inplace(c.d_sub_bf16, c.d_p150_out_bf16, moe_elems, c.stream);
+                    }
                 }
             }
             for (int tp = 0; tp < 3; ++tp) {
@@ -4036,6 +5060,11 @@ struct Dsv41Runtime::Impl {
                 DSV41_HIP_CHECK(hipMemcpyAsync(ctrl->out_conf_logits, c0.d_conf_out_f32,
                                                B * sizeof(float), hipMemcpyDeviceToHost, c0.stream));
             }
+            DSV41_HIP_CHECK(hipSetDevice(1));
+            (void)hipStreamQuery(ctx[1].stream);
+            DSV41_HIP_CHECK(hipSetDevice(2));
+            (void)hipStreamQuery(ctx[2].stream);
+            DSV41_HIP_CHECK(hipSetDevice(0));
             DSV41_HIP_CHECK(hipStreamSynchronize(c0.stream));
         }
 
@@ -4051,7 +5080,7 @@ struct Dsv41Runtime::Impl {
                                   (fixed_t16 || cur_pos < tree16_max_context) &&
                                   p_root_top1 < t16_conf_thresh);
             const bool run_t8  = !run_t16 && (target_tree_nodes >= 8 && rem_budget >= 4 &&
-                                              p_root_top1 < kTree8Top1ConfThresh);
+                                              p_root_top1 < dspark_tree8_conf_thresh);
             if ((run_t16 || run_t8) && out_used_tree_nodes && out_tree_tokens &&
                 ctrl->out_drafts[0] != Dsv41SpecialTokens::kEos)
             {
@@ -4488,7 +5517,7 @@ struct Dsv41Runtime::Impl {
                 return 3;  // Max depth of canonical static Width-[3,2,1,1] M = 8 tree!
             }
 
-            drafted_cnt = std::max(1, std::min(B, int(ctrl->out_drafted_cnt)));
+            drafted_cnt = std::max(1, std::min(std::min(B, dspark_chain_max_b), int(ctrl->out_drafted_cnt)));
             if (temperature > 1e-5f) {
                 std::uniform_real_distribution<float> dist(0.0f, 1.0f);
                 for (int i = 0; i < drafted_cnt; ++i) (void)dist(rng);
@@ -4959,11 +5988,21 @@ struct Dsv41Runtime::Impl {
             while (b < max_blocks) {
                 const int b_start = b;
                 const int batch = std::min(64, max_blocks - b);
+                // Wave 9.3 Phase C.2: Issue async POSIX_FADV_WILLNEED readahead on the NEXT 64-block window
+                // so Linux NVMe submission queues prefetch batch+1 while we read & stream current batch!
+                const int next_start = b_start + batch;
+                const int next_end   = std::min(max_blocks, next_start + 64);
+                if (next_start < next_end) {
+                    #pragma omp parallel for schedule(static) num_threads(8) if((next_end - next_start) >= 8)
+                    for (int nk = next_start; nk < next_end; ++nk) {
+                        nvme_store.prefetch_block_hint(chain_keys[size_t(nk)]);
+                    }
+                }
                 // Single contiguous allocation per 64-block batch avoids per-thread mmap_sem page-fault contention!
                 std::shared_ptr<RadixBlockEntry[]> slab(new RadixBlockEntry[static_cast<size_t>(batch)]);
                 std::vector<uint8_t> batch_ok(static_cast<size_t>(batch), 0u);
 
-                #pragma omp parallel for schedule(static) num_threads(16) if(batch >= 4)
+                #pragma omp parallel for schedule(dynamic, 2) num_threads(24) if(batch >= 4)
                 for (int k = 0; k < batch; ++k) {
                     const int idx = b_start + k;
                     const int32_t* blk_toks = prompt_toks + idx * kRadixBlockTokens;
@@ -5170,6 +6209,72 @@ void Dsv41Runtime::set_hlut3_mtp_overlay(const std::string& overlay_path) {
     std::fflush(stdout);
 }
 
+void Dsv41Runtime::set_hlut3_dev3_overlay(const std::string& overlay_path, int dev_id) {
+    std::lock_guard<std::mutex> lk(gen_mtx_);
+    if (!impl_) return;
+    impl_->hlut3_dev3_overlay_path = overlay_path;
+    impl_->hlut3_dev3_id = dev_id;
+    if (overlay_path.empty()) {
+        std::printf("[DSV41_RT] Wave 9.2 dev3 HLUT3 overlay UNSET (default 3x MI50 TP3 mode)\n");
+    } else {
+        std::printf("[DSV41_RT] Wave 9.2 dev3 HLUT3 overlay queued: path=%s hlut3_dev=%d\n",
+                    overlay_path.c_str(), dev_id);
+    }
+    std::fflush(stdout);
+}
+
+void Dsv41Runtime::set_hlut3_tp3_overlay(const std::string& overlay_path) {
+    std::lock_guard<std::mutex> lk(gen_mtx_);
+    if (!impl_) return;
+    impl_->hlut3_tp3_overlay_path = overlay_path;
+    if (overlay_path.empty()) {
+        std::printf("[DSV41_RT] Wave 9.2 TP3 HLUT3 backbone overlay UNSET\n");
+    } else {
+        std::printf("[DSV41_RT] Wave 9.2 TP3 HLUT3 backbone overlay queued: path=%s\n",
+                    overlay_path.c_str());
+    }
+    std::fflush(stdout);
+}
+
+void Dsv41Runtime::set_rocblas_prefill(bool enable) {
+    std::lock_guard<std::mutex> lk(gen_mtx_);
+    if (!impl_) return;
+    impl_->rocblas_prefill_enabled = enable;
+    std::printf("[DSV41_RT] Wave 9.3 rocBLAS FP16->FP32 prefill %s (expert_thresh=%d)\n",
+                enable ? "ENABLED" : "DISABLED", impl_->rocblas_expert_thresh);
+    std::fflush(stdout);
+}
+
+void Dsv41Runtime::set_rocblas_expert_thresh(int thresh) {
+    std::lock_guard<std::mutex> lk(gen_mtx_);
+    if (!impl_) return;
+    impl_->rocblas_expert_thresh = std::max(4, thresh);
+    std::printf("[DSV41_RT] Wave 9.3 rocBLAS expert bucket threshold set to %d\n",
+                impl_->rocblas_expert_thresh);
+    std::fflush(stdout);
+}
+
+void Dsv41Runtime::set_rocblas_hlut2_thresh(int thresh) {
+    std::lock_guard<std::mutex> lk(gen_mtx_);
+    if (!impl_) return;
+    impl_->rocblas_hlut2_thresh = std::max(4, thresh);
+    std::printf("[DSV41_RT] Wave 9.3 rocBLAS HLUT2 bucket threshold set to %d\n",
+                impl_->rocblas_hlut2_thresh);
+    std::fflush(stdout);
+}
+
+void Dsv41Runtime::set_dspark_tree8_conf_thresh(float thresh) {
+    std::lock_guard<std::mutex> lk(gen_mtx_);
+    if (!impl_) return;
+    impl_->dspark_tree8_conf_thresh = std::clamp(thresh, 0.0f, 1.0f);
+}
+
+void Dsv41Runtime::set_dspark_chain_max_b(int max_b) {
+    std::lock_guard<std::mutex> lk(gen_mtx_);
+    if (!impl_) return;
+    impl_->dspark_chain_max_b = std::clamp(max_b, 1, kDSparkBlockSize);
+}
+
 void Dsv41Runtime::set_csa2_shared_tree8(bool enable) {
     std::lock_guard<std::mutex> lk(gen_mtx_);
     if (impl_) {
@@ -5245,7 +6350,9 @@ void Dsv41Runtime::init(
     impl_->rarebal_overlay_path_saved = rarebal_overlay_path;
     impl_->model_overlay_uuid = compute_model_overlay_uuid(
         mi50_packed_root, rarebal_overlay_path,
-        impl_->expert_perm_disabled ? std::string() : impl_->expert_perm_overlay_path);
+        (impl_->expert_perm_disabled ? std::string() : impl_->expert_perm_overlay_path),
+        impl_->hlut3_dev3_overlay_path,
+        impl_->hlut3_tp3_overlay_path);
     impl_->exported_radix_key = impl_->model_overlay_uuid;
     if (!rarebal_overlay_path.empty()) {
         impl_->rarebal_overlay_mmap = std::make_unique<SafetensorsMmap>(rarebal_overlay_path);
@@ -5253,6 +6360,7 @@ void Dsv41Runtime::init(
                     rarebal_overlay_path.c_str(), impl_->rarebal_overlay_mmap->entries().size());
         std::fflush(stdout);
     }
+    impl_->prepare_wave9_2_tier_plan(rarebal_overlay_path);
 
     const auto t0 = std::chrono::steady_clock::now();
     std::printf("[DSV41_RT] Loading tokenizer & building ICU Engram compressed map (99,092)...\n");
@@ -5376,7 +6484,7 @@ void Dsv41Runtime::init(
     // across both NVMe drives while all 3 MI50 GPUs load HBM2 weights!
     impl_->start_background_workers();
 
-    std::exception_ptr load_err[4]{};
+    std::exception_ptr load_err[5]{};
     std::thread loaders[3];
     for (int tp = 0; tp < 3; ++tp) {
         loaders[tp] = std::thread([&, tp]() {
@@ -5394,12 +6502,76 @@ void Dsv41Runtime::init(
             load_err[3] = std::current_exception();
         }
     });
+    std::thread dev3_loader;
+    if (!impl_->hlut3_dev3_overlay_path.empty()) {
+        dev3_loader = std::thread([&]() {
+            try {
+                impl_->dev3_engine.init(
+                    impl_->hlut3_dev3_overlay_path, mi50_packed_root, impl_->hlut3_dev3_id,
+                    impl_->rocblas_prefill_enabled, impl_->rocblas_expert_thresh);
+            } catch (...) {
+                load_err[4] = std::current_exception();
+            }
+        });
+    }
 
     for (int tp = 0; tp < 3; ++tp) loaders[tp].join();
     engram_prefaulter.join();
-    for (int i = 0; i < 4; ++i) {
+    if (dev3_loader.joinable()) dev3_loader.join();
+    impl_->hlut3_tp3_mmap.reset();
+    for (int i = 0; i < 5; ++i) {
         if (load_err[i]) std::rethrow_exception(load_err[i]);
     }
+
+    // Wave 9.3 Phase B/D: Initialize fixed 83.5 MiB/rank rocBLAS FP16->FP32 prefill engine serially
+    // + pre-warm HLUT2/HLUT3 unpack/gather/scatter & fdot2 grouped kernels on tp=0,1,2 BEFORE DpmWarmGuard!
+    for (int tp = 0; tp < 3; ++tp) {
+        DSV41_HIP_CHECK(hipSetDevice(tp));
+        auto& c = impl_->ctx[tp];
+        if (impl_->rocblas_prefill_enabled) {
+            c.rb_prefill.init(tp, c.stream, /*is_dev3=*/false);
+            // Warm exact HLUT2 & HLUT3 unpack/gather/scatter code objects on tp=0,1,2!
+            const auto& b0 = c.blocks[0];
+            Mi50RoutedPair dummy_pr{0, 0, 0.0f, 0};
+            DSV41_HIP_CHECK(hipMemcpyAsync(c.d_routed_pairs, &dummy_pr, sizeof(dummy_pr), hipMemcpyHostToDevice, c.stream));
+            if (b0.d_hlut2_gate_codes != nullptr) {
+                c.rb_prefill.run_hlut2_expert_bucket(
+                    c.d_x_rot_f16, c.d_routed_pairs, 0, 0, 1,
+                    b0.d_hlut2_gate_codes, b0.d_hlut2_gate_sc, b0.d_hlut2_gate_cent,
+                    b0.d_hlut2_up_codes,   b0.d_hlut2_up_sc,   b0.d_hlut2_up_cent,
+                    b0.d_hlut2_down_codes, b0.d_hlut2_down_sc, b0.d_hlut2_down_cent,
+                    b0.d_signs_i, c.d_moe_part_f32, c.stream);
+            }
+            if (b0.tp3_hlut3_count > 0 && b0.d_hlut3_gate_tiles != nullptr) {
+                c.rb_prefill.run_hlut3_expert_bucket(
+                    c.d_x_rot_f16, c.d_routed_pairs, 0, 0, 1, kSharedInterTp,
+                    b0.d_hlut3_gate_tiles, b0.d_hlut3_up_tiles, b0.d_hlut3_down_tiles,
+                    c.d_hlut3_levels, b0.d_signs_i, c.d_moe_part_f32, c.stream);
+            }
+            DSV41_HIP_CHECK(hipStreamSynchronize(c.stream));
+            size_t fb = 0, tb = 0;
+            DSV41_HIP_CHECK(hipMemGetInfo(&fb, &tb));
+            std::printf("[DSV41_W93] tp=%d RocblasPrefillEngine ready (%.1f MiB ws, HBM free=%.1f MiB)\n",
+                        tp, double(c.rb_prefill.total_allocated_bytes()) / (1024.0 * 1024.0),
+                        double(fb) / (1024.0 * 1024.0));
+        }
+        // Pre-warm zero-scratch fdot2 grouped HLUT3 decode kernel on tp=0,1,2!
+        const auto& b0 = c.blocks[0];
+        if (b0.tp3_hlut3_count > 0 && b0.d_hlut3_gate_tiles != nullptr) {
+            int32_t act0 = -1, off0[2] = {0, 0};
+            DSV41_HIP_CHECK(hipMemcpyAsync(c.d_active_experts, &act0, sizeof(act0), hipMemcpyHostToDevice, c.stream));
+            DSV41_HIP_CHECK(hipMemcpyAsync(c.d_csr_offsets, off0, sizeof(off0), hipMemcpyHostToDevice, c.stream));
+            launch_hlut3_fdot2_grouped_f16(
+                c.d_x_rot_f16, c.d_active_experts, c.d_csr_offsets, c.d_tp3_hlut3_pairs,
+                nullptr, 1, b0.tp3_hlut3_count, kSharedInterTp,
+                b0.d_hlut3_gate_tiles, b0.d_hlut3_up_tiles, b0.d_hlut3_down_tiles,
+                c.d_hlut3_levels, b0.d_signs_i,
+                reinterpret_cast<uint16_t*>(c.d_hlut3_z), c.d_moe_part_f32, c.stream);
+            DSV41_HIP_CHECK(hipStreamSynchronize(c.stream));
+        }
+    }
+    std::fflush(stdout);
+    DSV41_HIP_CHECK(hipSetDevice(0));
 
     // Calibrate gfx906 s_memrealtime reference clock rate on tp=0 (zero-stall stage telemetry)
     {
@@ -5426,7 +6598,7 @@ void Dsv41Runtime::init(
         }
     }
 
-    if (!impl_->expert_perm_disabled) {
+    if (!impl_->wave9_2_perm_ready && !impl_->expert_perm_disabled) {
         if (!impl_->expert_perm_overlay_path.empty() &&
             impl_->expert_perm_overlay_path != rarebal_overlay_path) {
             SafetensorsMmap perm_st(impl_->expert_perm_overlay_path);
@@ -5513,6 +6685,10 @@ void Dsv41Runtime::init(
     double free_mib[3]{0.0, 0.0, 0.0};
     for (int tp = 0; tp < 3; ++tp) {
         DSV41_HIP_CHECK(hipSetDevice(tp));
+        auto& c = impl_->ctx[tp];
+        prewarm_host_ring_and_dev3_local_ctas();
+        launch_hlut3_f16_to_f32(c.d_x_rot_f16, c.d_moe_part_f32, 256, c.stream);
+        DSV41_HIP_CHECK(hipStreamSynchronize(c.stream));
         size_t free_b = 0, total_b = 0;
         DSV41_HIP_CHECK(hipMemGetInfo(&free_b, &total_b));
         free_mib[tp] = double(free_b) / (1024.0 * 1024.0);
@@ -5655,14 +6831,108 @@ Dsv41GpuMemMargin Dsv41Runtime::query_gpu_mem_margin() {
             }
         }
         // Verify 64-bit score scratch indexing at (M = 512, T_comp = 1,048,576) exceeds signed int32 bytes safely via size_t:
-        const uint64_t max_score_bytes = uint64_t(size_t(kMaxChunkM) * size_t(out.max_comp_slots[3]) * sizeof(float));
+        const uint64_t max_score_bytes = uint64_t(size_t(kMaxDecChunkM) * size_t(out.max_comp_slots[3]) * sizeof(float));
         if (impl_->max_seq_len >= 1048576 && max_score_bytes != 2147483648ULL) {
             ptr_ok = false;
         }
     }
+    if (impl_->dev3_engine.active()) {
+        DSV41_HIP_CHECK(hipSetDevice(impl_->dev3_engine.dev_id()));
+        size_t free_d3 = 0, total_d3 = 0;
+        DSV41_HIP_CHECK(hipMemGetInfo(&free_d3, &total_d3));
+        out.dev3_free_mib  = double(free_d3) / (1024.0 * 1024.0);
+        out.dev3_total_mib = double(total_d3) / (1024.0 * 1024.0);
+        out.dev3_active    = true;
+    }
     DSV41_HIP_CHECK(hipSetDevice(0));
     out.pointer_audit_64bit_ok = ptr_ok;
     return out;
+}
+
+Dsv41StageBreakdown Dsv41Runtime::query_stage_breakdown() const {
+    Dsv41StageBreakdown b{};
+    if (!impl_) return b;
+    b.att_qkv_ms       = impl_->sub_att_qkv_ms;
+    b.att_hsi_ms       = impl_->accum_hsi_ms;
+    b.att_sparse_ms    = impl_->sub_att_sparse_ms;
+    b.att_wo_ms        = impl_->sub_att_wo_ms;
+    b.att_ar_ms        = impl_->sub_att_ar_ms;
+    b.moe_router_ms    = impl_->sub_moe_router_ms;
+    b.moe_shared_ms    = impl_->sub_moe_sh_ms;
+    b.moe_tp3_hlut2_ms = impl_->sub_moe_tp3_hlut2_ms;
+    b.moe_tp3_hlut3_ms = impl_->sub_moe_tp3_hlut3_ms;
+    b.moe_dev3_wait_ms = impl_->sub_moe_dev3_wait_ms;
+    b.moe_p150_wait_ms = impl_->accum_p150_wait_ms;
+    b.moe_ar_ms        = impl_->sub_moe_ar_ms;
+    b.mhc_ms           = impl_->sub_mhc_ms;
+    b.commit_ms        = impl_->sub_commit_ms;
+    b.engram_wait_ms   = impl_->accum_engram_wait_ms;
+    b.p150_dev_ms      = impl_->accum_p150_dev_ms;
+    b.dev3_dev_busy_ms = std::max(0.0, impl_->dev3_engine.busy_ms() - impl_->dev3_base_busy_ms);
+    const uint64_t cur_d = impl_->dev3_engine.dispatches();
+    b.dev3_dispatches  = (cur_d >= impl_->dev3_base_dispatches) ? (cur_d - impl_->dev3_base_dispatches) : 0ULL;
+    return b;
+}
+
+void Dsv41Runtime::reset_stage_breakdown() {
+    if (impl_) impl_->reset_stage_timers();
+}
+
+void Dsv41Runtime::seed_synthetic_context_for_profile(int ctx_len) {
+    std::lock_guard<std::mutex> lk(gen_mtx_);
+    if (!ready_ || !impl_) throw std::runtime_error("seed_synthetic_context_for_profile: runtime not ready");
+    ctx_len = std::clamp((ctx_len / kRadixBlockTokens) * kRadixBlockTokens, 512, impl_->max_seq_len - 512);
+    impl_->clear_gpu_kv_state();
+    // Run 1 real 512-token block (4 x 128-token blocks) to produce realistic compressed CSA2 KV + Indexer K,
+    // then replicate across [0 .. ctx_len - 256) and run a real 256-token 40L tail so decode sees genuine KV & SWA!
+    const std::string seed_txt =
+        "In heterogeneous AMD Instinct MI50 gfx906 and Tenstorrent Blackhole P150A inference for DeepSeek-V4.1-Flash, "
+        "CSA2 sparse attention selects top-64 compressed blocks over 1M tokens while WHT128-HLUT3 executes 3-bit "
+        "Gaussian Lloyd-Max tiles with zero scratch memory and zero PCIe system-scope RMW atomics. ";
+    std::vector<int32_t> unit_toks;
+    while (unit_toks.size() < 512u) {
+        auto piece = tokenizer_.encode(seed_txt + "Segment " + std::to_string(unit_toks.size()) + ".\n", false);
+        unit_toks.insert(unit_toks.end(), piece.begin(), piece.end());
+    }
+    unit_toks.resize(512u);
+
+    impl_->engram_cpu.ensure_seq_cache_capacity(ctx_len + 512);
+    impl_->forward_backbone_chunk(unit_toks.data(), 0, 512, true, 0, true, false, 0, false);
+
+    std::array<std::vector<uint8_t>, 4> blk_raw;
+    for (int k = 0; k < 4; ++k) {
+        blk_raw[size_t(k)].resize(kNvmeRadixBlockBytes);
+        impl_->extract_single_radix_block_from_gpu(k, blk_raw[size_t(k)].data());
+    }
+
+    const int n_pop_blks = (ctx_len - 256) / kRadixBlockTokens;
+    std::vector<std::shared_ptr<RadixBlockEntry>> entries;
+    entries.reserve(size_t(n_pop_blks));
+    for (int b = 0; b < n_pop_blks; ++b) {
+        auto e = std::make_shared<RadixBlockEntry>();
+        e->key = RadixKey128{uint64_t(b + 1), 0xBEEF0000ULL | uint64_t(ctx_len)};
+        std::memcpy(e->tokens.data(), unit_toks.data() + size_t(b & 3) * 128u, 128u * sizeof(int32_t));
+        std::memcpy(e->data.data(), blk_raw[size_t(b & 3)].data(), kNvmeRadixBlockBytes);
+        entries.push_back(std::move(e));
+    }
+    impl_->clear_gpu_kv_state();
+    impl_->restore_radix_blocks_gpu(entries);
+
+    const int tail_start = n_pop_blks * kRadixBlockTokens;
+    impl_->cached_tokens.resize(size_t(tail_start));
+    for (int b = 0; b < n_pop_blks; ++b) {
+        std::memcpy(impl_->cached_tokens.data() + size_t(b) * 128u,
+                    unit_toks.data() + size_t(b & 3) * 128u, 128u * sizeof(int32_t));
+    }
+    impl_->engram_cpu.compute_hashes(impl_->cached_tokens.data() + tail_start - 8, 8, tail_start - 8,
+                                     nullptr, impl_->engram_hashes_buf);
+    impl_->forward_backbone_chunk(unit_toks.data(), tail_start, 256, false, 1, true, true, tail_start, false);
+    impl_->update_mtp_window_from_target_hidden(tail_start + 256 - kWindowSize, kWindowSize, 256 - kWindowSize);
+    impl_->win_valid_from_20_39 = tail_start;
+    impl_->cached_tokens.insert(impl_->cached_tokens.end(), unit_toks.begin(), unit_toks.begin() + 256);
+    impl_->cached_block_salts.assign(size_t((ctx_len + 127) / 128), 0ULL);
+    impl_->exported_radix_blocks = ctx_len / kRadixBlockTokens;
+    impl_->mtp_window_seeded = true;
 }
 
 Dsv411MGateReceipt Dsv41Runtime::run_wave8_5_1m_e2e_gate(const std::string& nvme_tmp_dir) {
@@ -7082,8 +8352,17 @@ std::vector<int32_t> Dsv41Runtime::generate(
     {
         int sim_pos = pos;
         const int ced_128_top = (ced_split / kRadixBlockTokens) * kRadixBlockTokens;
-        while (sim_pos < ced_split) {
-            const int target_top = (sim_pos < ced_128_top) ? ced_128_top : ced_split;
+        // Wave 9.4: Snap CED split to the 128-token RadixBlock boundary when the tail fits in one decoder chunk
+        // (<= kMaxDecChunkM = 512), and collapse short interactive tails (<= 384 fresh tokens) into a single
+        // 40-layer decoder chunk instead of splitting into 20L encoder + 40L decoder = 60 layer passes!
+        int eff_ced_split = ced_split;
+        if (P - pos <= 384) {
+            eff_ced_split = pos;
+        } else if (ced_128_top >= pos && (P - ced_128_top) <= kMaxDecChunkM) {
+            eff_ced_split = ced_128_top;
+        }
+        while (sim_pos < eff_ced_split) {
+            const int target_top = (sim_pos < ced_128_top && ced_128_top <= eff_ced_split) ? ced_128_top : eff_ced_split;
             const int rem_enc = target_top - sim_pos;
             int chunk_m = std::min(rem_enc, kMaxChunkM);
             // Align odd `sim_pos` back to an even r=2 boundary on the first encoder chunk!
@@ -7097,7 +8376,8 @@ std::vector<int32_t> Dsv41Runtime::generate(
         }
         const int p_128_top = (P / kRadixBlockTokens) * kRadixBlockTokens;
         while (sim_pos < P) {
-            const int target_top = (sim_pos < p_128_top && p_128_top < P) ? p_128_top : P;
+            const int target_top = ((P - sim_pos) > kMaxDecChunkM && sim_pos < p_128_top && p_128_top < P)
+                ? p_128_top : P;
             const int rem_dec = target_top - sim_pos;
             int chunk_m = std::min(rem_dec, kMaxDecChunkM);
             if (sim_pos + chunk_m < P && ((sim_pos + chunk_m) & 1) != 0 && chunk_m > 1) {

@@ -1,5 +1,5 @@
-// Blackhole P150A down_proj K-Split Reduction + Weighted Expert Combine Writer (RISCV_0 / NOC_1)
-// Writes updated FP32 combined_f32 tiles from CB 16 back to L1 combined_f32.
+// Blackhole P150A Wave 9.4 down_proj K-Split Reduction + Weighted Expert Combine Writer (RISCV_0 / NOC_1)
+// Writes updated FP32 combined_f32 tiles from CB 16 back to L1 combined_f32 with overlapped writes_flushed().
 
 #include "api/dataflow/dataflow_api.h"
 
@@ -14,7 +14,10 @@ void kernel_main() {
     for (uint32_t i = 0; i < tile_cnt; ++i) {
         cb_wait_front(16, 1);
         noc_async_write_tile(first_tile + i, comb_acc, get_read_ptr(16));
-        noc_async_write_barrier();
+        noc_async_writes_flushed();
         cb_pop_front(16, 1);
+    }
+    if (tile_cnt > 0u) {
+        noc_async_write_barrier();
     }
 }

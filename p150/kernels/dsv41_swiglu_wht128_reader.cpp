@@ -26,8 +26,8 @@ void kernel_main() {
     cb_reserve_back(2, 16);
     const uint32_t wht_l1 = get_write_ptr(2);
 
-    // Fetch 64-byte layer_desc from slot_ids[576..639] to extract dynamic wht_q_i DRAM address (ldesc[4])!
-    noc_async_read(ids_acc.get_noc_addr(0, 576u), wht_l1, 64u);
+    // Fetch 64-byte layer_desc from slot_ids[slot_ids_bytes-64 .. slot_ids_bytes-1] to extract dynamic wht_q_i DRAM address (ldesc[4])!
+    noc_async_read(ids_acc.get_noc_addr(0, slot_ids_bytes - 64u), wht_l1, 64u);
     noc_async_read_barrier();
     const uint32_t wht_addr = reinterpret_cast<const volatile uint32_t*>(wht_l1)[4];
     const auto wht_acc = TensorAccessor(w_args, wht_addr, 2048);

@@ -17,8 +17,8 @@
 namespace dsv41 {
 
 static constexpr uint32_t DSV41_P150_SHM_MAGIC       = 0x44343150u;  // 'D41P'
-static constexpr uint32_t DSV41_P150_SHM_VERSION     = 3u;
-static constexpr uint32_t DSV41_P150_MAX_ROWS        = 1024u;
+static constexpr uint32_t DSV41_P150_SHM_VERSION     = 4u;
+static constexpr uint32_t DSV41_P150_MAX_ROWS        = 4096u;
 static constexpr uint32_t DSV41_P150_FAST_RING_SLOTS = 4u;           // 4-slot double-buffered zero-SDMA ring (< 26 MiB /dev/shm)
 static constexpr uint32_t DSV41_P150_FAST_MAX_ROWS   = 64u;          // Covers M=1 decode, M=8/16 DSpark tree, M<=64 chunks
 static constexpr uint32_t DSV41_P150_MAX_SLOTS       = 8u;           // top-6 routed experts padded to 8

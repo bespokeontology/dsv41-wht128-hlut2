@@ -292,6 +292,13 @@ inline constexpr size_t p150_wave84_bank0_l1_bytes_at_18(bool x16_relay) noexcep
 static_assert(p150_wave84_bank0_l1_bytes_at_18(true) + kP150Wave84StreamedPeakStaticCbPerCore <= kP150L1Fabric1DBankBytes,
               "Wave 8.4C 18 hot shards + L1 x_decode + L1 finish_decode[0..1] + x16_relay L1 staging + 204,800 B peak CB must fit <= 1,459,200 B/bank (+11,264 B margin)");
 
+// Wave 9.4 Phase B: Expanding slot_ids + slot_ids_src from 640 B (288 slots) to 1,344 B (640 slots + 64B layer_desc)
+// adds +1,408 B on bank 0 while keeping all 18 hot L1 shards + x_decode + x16_relay (+9,856 B margin remaining!).
+inline constexpr uint32_t kP150Wave94SlotIdsBytes = 1344u;
+static_assert(p150_wave84_bank0_l1_bytes_at_18(true) + 2u * (kP150Wave94SlotIdsBytes - 640u) +
+                  kP150Wave84StreamedPeakStaticCbPerCore <= kP150L1Fabric1DBankBytes,
+              "Wave 9.4 640-slot slot_ids + 18 hot shards + x16_relay + 204,800 B peak CB must fit <= 1,459,200 B/bank (+9,856 B margin)");
+
 inline constexpr size_t kP150Wave84At18PureL1BytesPerCard =
     kP150Tier1At17PureL1BytesPerCard + kP150HotShardBytes; // 134,627,968 B (128.391 MiB/card; +328,320 B with x16_relay)
 

@@ -1,6 +1,8 @@
-// Blackhole P150A Layer-Agnostic Zero-Softfloat HLUT2 Weight Feeder & Partial Writer (RISCV_0 / NOC_1)
-// Supports proj_idx == 3 (fused gate + up in ONE launch, sharing centroids + CB 0 activations!) as well as down (2).
-// Overlaps step's GDDR6 weight reads + scale unpack with compute's execution of step-1 via 8-page CB 16 + async flush!
+// Blackhole P150A Wave 9.4 Multi-Tile Weight-Stationary 2-SB Burst Pipelined HLUT2 Weight Feeder & Partial Writer
+//   1. Publishes slot_ids via CB 6 (0 B extra L1!) so reader_a and compute share exact run plans.
+//   2. Contiguous identical expert_slot runs [b0 .. b0 + run_len - 1] read GDDR6/L1 weights ONCE into CB 1.
+//   3. Empty padding slots (expert_slot >= 0xFFFE) are skipped with 0 GDDR6 reads, 0 CB4/5 fills, 0 compute, 0 writes.
+//   4. 2-superblock parallel burst pipelining over 4-page CB4/CB5 ring overlaps next 2-SB GDDR6 burst with scalar scale unpack!
 
 #include "api/dataflow/dataflow_api.h"
 
@@ -35,7 +37,7 @@ void kernel_main() {
     const uint32_t ks              = get_arg_val<uint32_t>(8);
     const uint32_t nt_total        = get_arg_val<uint32_t>(9);   // 36 (gate/up) or 160 (down)
     const uint32_t m_tiles_ws      = get_arg_val<uint32_t>(10);  // 16 (workspace slot stride per ks)
-    const uint32_t slot_ids_bytes  = get_arg_val<uint32_t>(11);  // 640 B ([0..575]=slot_ids, [576..639]=layer_desc)
+    const uint32_t slot_ids_bytes  = get_arg_val<uint32_t>(11);  // 1344 B ([0..1279]=640 slot_ids, [1280..1343]=layer_desc)
     const uint32_t batch_cnt       = get_arg_val<uint32_t>(12);  // 1..16 expert slots per launch
     const uint32_t partials1_addr  = get_arg_val<uint32_t>(13);  // up_partials when proj_idx == 3
 
@@ -54,13 +56,25 @@ void kernel_main() {
     const auto out_acc0 = TensorAccessor(o_args, partials0_addr, 4096);
     const auto out_acc1 = TensorAccessor(o_args, partials1_addr, 4096);
 
-    // CB 6: 4096 B scratch (64B aligned: [0..639]=slot_ids+layer_desc, [640..703]=centroids, [704..1983]=raw_scales[5])
     cb_reserve_back(6, 1);
     const uint32_t scratch_ptr = get_write_ptr(6);
     noc_async_read(ids_acc.get_noc_addr(0, 0), scratch_ptr, slot_ids_bytes);
     noc_async_read_barrier();
+    cb_push_back(6, 1);
 
-    const volatile uint32_t* ldesc = reinterpret_cast<const volatile uint32_t*>(scratch_ptr + 576u);
+    uint16_t local_eids[24];
+    const volatile uint16_t* slot_u16 = reinterpret_cast<const volatile uint16_t*>(scratch_ptr);
+    bool any_valid = false;
+    for (uint32_t b = 0u; b < batch_cnt; ++b) {
+        const uint16_t e = slot_u16[slot_start + b];
+        local_eids[b] = e;
+        if (e < 0xFFFEu) any_valid = true;
+    }
+    if (!any_valid) {
+        return;
+    }
+
+    const volatile uint32_t* ldesc = reinterpret_cast<const volatile uint32_t*>(scratch_ptr + (slot_ids_bytes - 64u));
     const uint32_t centroids_addr  = ldesc[3];
     const uint32_t lut_addr        = ldesc[8];
     const uint32_t layer_idx       = ldesc[9];
@@ -72,18 +86,22 @@ void kernel_main() {
     const auto hot_acc1      = TensorAccessor(h_args, ldesc[5u + (fused_gu ? 1u : base_proj)], 4352);
     const auto lut_acc       = TensorAccessor(l_args, lut_addr, 512);
 
-    const uint32_t lut_l1 = scratch_ptr + 2048u;
+    const uint32_t lut_l1 = scratch_ptr + 2816u;
     noc_async_read(lut_acc.get_noc_addr(layer_idx, 0), lut_l1, 512u);
     noc_async_read_barrier();
     const volatile uint16_t* hot_lut = reinterpret_cast<const volatile uint16_t*>(lut_l1);
 
     const uint32_t local_sb_off  = nb4 * kt4_total + kb4_start;
-    const uint32_t cent_l1       = scratch_ptr + 640u;
-    const uint32_t raw_scales_0  = scratch_ptr + 704u;
+    const uint32_t cent_l1       = scratch_ptr + slot_ids_bytes;
+    const uint32_t raw_scales_0  = cent_l1 + 64u;
     const uint32_t col_tile_base = nb4 * 4u;
-    uint32_t cb_wr_idx           = 0u;
-    bool page_tail_zeroed[4]     = {false, false, false, false};
-    bool page_full_zeroed[4]     = {false, false, false, false};
+
+    cb_reserve_back(4, 1);
+    cb_reserve_back(5, 1);
+    const uint32_t cb4_base = get_write_ptr(4);
+    const uint32_t cb5_base = get_write_ptr(5);
+    uint32_t cb_wr_idx = 0u;
+    bool page_tail_zeroed[4] = {false, false, false, false};
 
     auto drain_out_step = [&](uint32_t b_done, uint32_t p_done) __attribute__((always_inline)) {
         cb_wait_front(16, 4);
@@ -106,112 +124,69 @@ void kernel_main() {
     uint32_t prev_p = 0u;
     bool has_prev   = false;
 
-    for (uint32_t b = 0; b < batch_cnt; ++b) {
-        const uint32_t slot_idx    = slot_start + b;
-        const uint32_t expert_slot = reinterpret_cast<const volatile uint16_t*>(scratch_ptr)[slot_idx];
-
+    uint32_t b0 = 0u;
+    while (b0 < batch_cnt) {
+        const uint32_t expert_slot = local_eids[b0];
         if (expert_slot >= 0xFFFEu) {
-            for (uint32_t p = 0; p < num_projs; ++p) {
-                for (uint32_t sb0 = 0u; sb0 < num_sb; ) {
-                    const uint32_t rem        = num_sb - sb0;
-                    const uint32_t max_contig = 4u - cb_wr_idx;
-                    const uint32_t chunk      = (rem < max_contig ? rem : max_contig) < 2u
-                                                    ? (rem < max_contig ? rem : max_contig)
-                                                    : 2u;
-                    cb_reserve_back(4, chunk);
-                    cb_reserve_back(5, chunk);
-                    const uint32_t codes_base  = get_write_ptr(4);
-                    const uint32_t scales_base = get_write_ptr(5);
-                    for (uint32_t c = 0u; c < chunk; ++c) {
-                        const uint32_t pg = cb_wr_idx + c;
-                        if (!page_full_zeroed[pg]) {
-                            uint64_t* cu64 = reinterpret_cast<uint64_t*>(codes_base + c * 4096u);
-                            uint64_t* su64 = reinterpret_cast<uint64_t*>(scales_base + c * 4096u);
-                            for (uint32_t idx = 0; idx < 512u; ++idx) {
-                                cu64[idx] = 0ULL;
-                                su64[idx] = 0ULL;
-                            }
-                            page_full_zeroed[pg] = true;
-                            page_tail_zeroed[pg] = true;
-                        }
-                    }
-                    cb_push_back(4, chunk);
-                    cb_push_back(5, chunk);
-                    cb_wr_idx = (cb_wr_idx + chunk) & 3u;
-                    sb0 += chunk;
-                }
-
-                if (has_prev) {
-                    drain_out_step(prev_b, prev_p);
-                }
-                prev_b   = b;
-                prev_p   = p;
-                has_prev = true;
-            }
+            ++b0;
             continue;
         }
+        uint32_t run_len = 1u;
+        while (b0 + run_len < batch_cnt && local_eids[b0 + run_len] == expert_slot) {
+            ++run_len;
+        }
 
-        // O(1) L1 indirection table lookup (updates without invalidating MeshTrace!)
         const uint16_t hs = hot_lut[expert_slot];
         const int32_t hot_slot = (hs != 0xFFFFu) ? static_cast<int32_t>(hs) : -1;
         const uint32_t dram_sb_base = expert_slot * 360u + local_sb_off;
         const uint32_t hot_sb_base  = (hot_slot >= 0) ? (uint32_t(hot_slot) * 360u + local_sb_off) : 0u;
 
-        for (uint32_t p = 0; p < num_projs; ++p) {
+        for (uint32_t p = 0u; p < num_projs; ++p) {
             const uint32_t cur_proj = base_proj + p;
             uint64_t c0_u64 = 0ULL;
             uint64_t dc_u64 = 0ULL;
 
-            // Wave 8.4C: Stream <= 2 contiguous superblocks per burst over 4-page CB4/CB5 ring (frees 49 KiB/core L1!)
-            for (uint32_t sb0 = 0u; sb0 < num_sb; ) {
-                const uint32_t rem        = num_sb - sb0;
-                const uint32_t max_contig = 4u - cb_wr_idx;
-                const uint32_t chunk      = (rem < max_contig ? rem : max_contig) < 2u
-                                                ? (rem < max_contig ? rem : max_contig)
-                                                : 2u;
-                cb_reserve_back(4, chunk);
-                cb_reserve_back(5, chunk);
-                const uint32_t codes_base  = get_write_ptr(4);
-                const uint32_t scales_base = get_write_ptr(5);
-
-                if (p == 0u && sb0 == 0u) {
+            auto issue_burst = [&](uint32_t sb_start, uint32_t cnt, uint32_t ring_pos) __attribute__((always_inline)) {
+                if (p == 0u && sb_start == 0u) {
                     noc_async_read(centroids_acc.get_noc_addr(expert_slot, 0), cent_l1, 64u);
                 }
-                if (p == 0u) {
-                    if (hot_slot >= 0) {
-                        for (uint32_t c = 0u; c < chunk; ++c) {
-                            const uint32_t sb = sb0 + c;
+                for (uint32_t c = 0u; c < cnt; ++c) {
+                    const uint32_t sb = sb_start + c;
+                    const uint32_t codes_ptr = cb4_base + ((ring_pos + c) & 3u) * 4096u;
+                    if (p == 0u) {
+                        if (hot_slot >= 0) {
                             const uint32_t hot_pid = hot_sb_base + sb;
-                            noc_async_read(hot_acc0.get_noc_addr(hot_pid, 0), codes_base + c * 4096u, 4096u);
+                            noc_async_read(hot_acc0.get_noc_addr(hot_pid, 0), codes_ptr, 4096u);
                             noc_async_read(hot_acc0.get_noc_addr(hot_pid, 4096u), raw_scales_0 + sb * 256u, 256u);
-                        }
-                    } else {
-                        for (uint32_t c = 0u; c < chunk; ++c) {
-                            const uint32_t sb = sb0 + c;
+                        } else {
                             const uint32_t page_id = dram_sb_base + sb;
-                            noc_async_read(pages_acc0.get_noc_addr(page_id, 0), codes_base + c * 4096u, 4096u);
+                            noc_async_read(pages_acc0.get_noc_addr(page_id, 0), codes_ptr, 4096u);
                             noc_async_read(pages_acc0.get_noc_addr(page_id, 4096u), raw_scales_0 + sb * 256u, 256u);
                         }
-                    }
-                } else {
-                    if (hot_slot >= 0) {
-                        for (uint32_t c = 0u; c < chunk; ++c) {
-                            const uint32_t sb = sb0 + c;
-                            const uint32_t hot_pid = hot_sb_base + sb;
-                            noc_async_read(hot_acc1.get_noc_addr(hot_pid, 0), codes_base + c * 4096u, 4096u);
-                            noc_async_read(hot_acc1.get_noc_addr(hot_pid, 4096u), raw_scales_0 + sb * 256u, 256u);
-                        }
                     } else {
-                        for (uint32_t c = 0u; c < chunk; ++c) {
-                            const uint32_t sb = sb0 + c;
+                        if (hot_slot >= 0) {
+                            const uint32_t hot_pid = hot_sb_base + sb;
+                            noc_async_read(hot_acc1.get_noc_addr(hot_pid, 0), codes_ptr, 4096u);
+                            noc_async_read(hot_acc1.get_noc_addr(hot_pid, 4096u), raw_scales_0 + sb * 256u, 256u);
+                        } else {
                             const uint32_t page_id = dram_sb_base + sb;
-                            noc_async_read(pages_acc1.get_noc_addr(page_id, 0), codes_base + c * 4096u, 4096u);
+                            noc_async_read(pages_acc1.get_noc_addr(page_id, 0), codes_ptr, 4096u);
                             noc_async_read(pages_acc1.get_noc_addr(page_id, 4096u), raw_scales_0 + sb * 256u, 256u);
                         }
                     }
                 }
-                noc_async_read_barrier();
+            };
 
+            // 2-superblock parallel burst pipelining over 4-page CB4/CB5 ring!
+            const uint32_t chunk0 = (num_sb >= 2u) ? 2u : num_sb;
+            cb_reserve_back(4, chunk0);
+            cb_reserve_back(5, chunk0);
+            issue_burst(0u, chunk0, cb_wr_idx);
+            noc_async_read_barrier();
+
+            uint32_t sb0 = 0u;
+            uint32_t cur_chunk = chunk0;
+            while (sb0 < num_sb) {
                 if (sb0 == 0u) {
                     const volatile uint32_t* cent_u32 = reinterpret_cast<const volatile uint32_t*>(cent_l1);
                     const uint32_t c0_u32 = cent_u32[cur_proj * 2u + 0u];
@@ -220,12 +195,20 @@ void kernel_main() {
                     dc_u64 = uint64_t(dc_u32) | (uint64_t(dc_u32) << 32);
                 }
 
-                for (uint32_t c = 0u; c < chunk; ++c) {
+                const uint32_t next_sb0 = sb0 + cur_chunk;
+                const uint32_t next_rem = (next_sb0 < num_sb) ? (num_sb - next_sb0) : 0u;
+                const uint32_t next_chunk = (next_rem >= 2u) ? 2u : next_rem;
+                if (next_chunk > 0u) {
+                    cb_reserve_back(4, cur_chunk + next_chunk);
+                    cb_reserve_back(5, cur_chunk + next_chunk);
+                    issue_burst(next_sb0, next_chunk, (cb_wr_idx + cur_chunk) & 3u);
+                }
+
+                for (uint32_t c = 0u; c < cur_chunk; ++c) {
                     const uint32_t sb = sb0 + c;
-                    const uint32_t pg = cb_wr_idx + c;
-                    page_full_zeroed[pg] = false;
+                    const uint32_t pg = (cb_wr_idx + c) & 3u;
                     const volatile uint32_t* hs32 = reinterpret_cast<const volatile uint32_t*>(raw_scales_0 + sb * 256u);
-                    uint64_t* su64 = reinterpret_cast<uint64_t*>(scales_base + c * 4096u);
+                    uint64_t* su64 = reinterpret_cast<uint64_t*>(cb5_base + pg * 4096u);
 
                     for (uint32_t nt_sub = 0; nt_sub < 4u; ++nt_sub) {
                         uint64_t* f0_row = su64 + (nt_sub * 4u) * 8u;
@@ -263,19 +246,30 @@ void kernel_main() {
                         page_tail_zeroed[pg] = true;
                     }
                 }
-                cb_push_back(4, chunk);
-                cb_push_back(5, chunk);
-                cb_wr_idx = (cb_wr_idx + chunk) & 3u;
-                sb0 += chunk;
+
+                cb_push_back(4, cur_chunk);
+                cb_push_back(5, cur_chunk);
+                cb_wr_idx = (cb_wr_idx + cur_chunk) & 3u;
+
+                if (next_chunk > 0u) {
+                    noc_async_read_barrier();
+                }
+                sb0 = next_sb0;
+                cur_chunk = next_chunk;
             }
 
             if (has_prev) {
                 drain_out_step(prev_b, prev_p);
             }
-            prev_b   = b;
+            for (uint32_t r = 0u; r + 1u < run_len; ++r) {
+                drain_out_step(b0 + r, p);
+            }
+            prev_b   = b0 + run_len - 1u;
             prev_p   = p;
             has_prev = true;
         }
+
+        b0 += run_len;
     }
 
     if (has_prev) {

@@ -76,35 +76,37 @@ void kernel_main() {
         }
         const uint32_t top_lim = (cnt < 16u) ? 16u : 32u;
         for (uint32_t r = cnt; r < top_lim; ++r) {
-            uint32_t* z = reinterpret_cast<uint32_t*>(gather_l1 + r * 256u);
-            for (uint32_t w = 0; w < 64u; ++w) z[w] = 0u;
+            uint64_t* z = reinterpret_cast<uint64_t*>(gather_l1 + r * 256u);
+            for (uint32_t w = 0; w < 32u; ++w) z[w] = 0ULL;
         }
         if (cnt > 0u) {
             noc_async_read_barrier();
         }
 
-        const uint32_t* src_u32 = reinterpret_cast<const uint32_t*>(gather_l1);
+        const uint64_t* src_u64 = reinterpret_cast<const uint64_t*>(gather_l1);
         for (uint32_t t = 0; t < 2u; ++t) {
             cb_reserve_back(2, 1);
-            uint32_t* dst_tile = reinterpret_cast<uint32_t*>(get_write_ptr(2));
-            const uint32_t col_base = t * 32u;
+            uint64_t* dst_tile = reinterpret_cast<uint64_t*>(get_write_ptr(2));
+            const uint32_t col_base = t * 16u;
             for (uint32_t fr = 0; fr < 16u; ++fr) {
-                const uint32_t* s_top = src_u32 + fr * 64u + col_base;
-                const uint32_t d_off  = fr * 16u;
-                for (uint32_t c = 0; c < 16u; ++c) {
-                    dst_tile[0u   + d_off + c] = s_top[0u  + c];
-                    dst_tile[256u + d_off + c] = s_top[16u + c];
+                const uint64_t* s_top = src_u64 + fr * 32u + col_base;
+                const uint32_t d_off  = fr * 8u;
+                #pragma GCC unroll 8
+                for (uint32_t c = 0; c < 8u; ++c) {
+                    dst_tile[0u   + d_off + c] = s_top[0u + c];
+                    dst_tile[128u + d_off + c] = s_top[8u + c];
                 }
             }
             if (cnt <= 16u) {
-                for (uint32_t w = 512u; w < 1024u; ++w) dst_tile[w] = 0u;
+                for (uint32_t w = 256u; w < 512u; ++w) dst_tile[w] = 0ULL;
             } else {
                 for (uint32_t fr = 0; fr < 16u; ++fr) {
-                    const uint32_t* s_bot = src_u32 + (16u + fr) * 64u + col_base;
-                    const uint32_t d_off  = fr * 16u;
-                    for (uint32_t c = 0; c < 16u; ++c) {
-                        dst_tile[512u + d_off + c] = s_bot[0u  + c];
-                        dst_tile[768u + d_off + c] = s_bot[16u + c];
+                    const uint64_t* s_bot = src_u64 + (16u + fr) * 32u + col_base;
+                    const uint32_t d_off  = fr * 8u;
+                    #pragma GCC unroll 8
+                    for (uint32_t c = 0; c < 8u; ++c) {
+                        dst_tile[256u + d_off + c] = s_bot[0u + c];
+                        dst_tile[384u + d_off + c] = s_bot[8u + c];
                     }
                 }
             }
