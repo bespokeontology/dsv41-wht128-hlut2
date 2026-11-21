@@ -525,8 +525,265 @@ int main(int argc, char** argv) {
         }
 
         rb_dev3.shutdown();
+
+        // 9. Wave 10 Phase C.1: Large-M (M=2048) Dense FP8 HHHS (wqkv, wq_b, wo_a, wo_b, sh_w13, sh_w2) parity & speed
+        {
+            rb_tp3.init(0, stream, /*is_dev3=*/false);
+            struct Fp8Large { const char* name; int M; int N; int K; bool write_f32; };
+            const Fp8Large cases[] = {
+                {"wqkv   [2048x1792x5120]",  2048,  1792, 5120, false},
+                {"wq_b   [2048x12288x1280]", 2048, 12288, 1280, false},
+                {"wo_b   [2048x5120x3072]",  2048,  5120, 3072, false},
+                {"sh_w13 [2048x1536x5120]",  2048,  1536, 5120, false},
+                {"sh_w2  [2048x5120x768]",   2048,  5120,  768, true},
+            };
+            for (const auto& tc : cases) {
+                std::vector<uint8_t> hx(size_t(tc.M) * size_t(tc.K));
+                std::vector<uint8_t> hxs(size_t(tc.M) * size_t(tc.K / 32), 124u);
+                std::vector<uint8_t> hw(size_t(tc.N) * size_t(tc.K));
+                std::vector<uint8_t> hws(size_t(tc.N / 32) * size_t(tc.K / 32), 123u);
+                for (auto& b : hx) b = uint8_t((rng() % 112u) | ((rng() & 1u) << 7));
+                for (auto& b : hw) b = uint8_t((rng() % 112u) | ((rng() & 1u) << 7));
+                uint8_t *dx = nullptr, *dxs = nullptr, *dw = nullptr, *dws = nullptr;
+                check_hip(hipMalloc(&dx, hx.size()), "dx2k");
+                check_hip(hipMalloc(&dxs, hxs.size()), "dxs2k");
+                check_hip(hipMalloc(&dw, hw.size()), "dw2k");
+                check_hip(hipMalloc(&dws, hws.size()), "dws2k");
+                check_hip(hipMemcpy(dx, hx.data(), hx.size(), hipMemcpyHostToDevice), "cp dx2k");
+                check_hip(hipMemcpy(dxs, hxs.data(), hxs.size(), hipMemcpyHostToDevice), "cp dxs2k");
+                check_hip(hipMemcpy(dw, hw.data(), hw.size(), hipMemcpyHostToDevice), "cp dw2k");
+                check_hip(hipMemcpy(dws, hws.data(), hws.size(), hipMemcpyHostToDevice), "cp dws2k");
+                const size_t out_n = size_t(tc.M) * size_t(tc.N);
+                uint16_t *dy16_ref = nullptr, *dy16_rb = nullptr;
+                float *dy32_ref = nullptr, *dy32_rb = nullptr;
+                if (tc.write_f32) {
+                    check_hip(hipMalloc(&dy32_ref, out_n * 4u), "dy32_ref");
+                    check_hip(hipMalloc(&dy32_rb,  out_n * 4u), "dy32_rb");
+                } else {
+                    check_hip(hipMalloc(&dy16_ref, out_n * 2u), "dy16_ref");
+                    check_hip(hipMalloc(&dy16_rb,  out_n * 2u), "dy16_rb");
+                }
+                launch_fp8_gemm(dx, dxs, dw, dws, dy16_ref, dy32_ref, tc.M, tc.N, tc.K, tc.write_f32, false, stream);
+                check_hip(hipStreamSynchronize(stream), "w10 fp8 ref warm");
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int it = 0; it < 3; ++it) {
+                    launch_fp8_gemm(dx, dxs, dw, dws, dy16_ref, dy32_ref, tc.M, tc.N, tc.K, tc.write_f32, false, stream);
+                }
+                check_hip(hipStreamSynchronize(stream), "w10 fp8 ref");
+                const double ref_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 3.0;
+
+                if (!rb_tp3.run_fp8_gemm(dx, dxs, dw, dws, dy16_rb, dy32_rb, tc.M, tc.N, tc.K, tc.write_f32, false, stream)) {
+                    throw std::runtime_error(std::string("W10 run_fp8_gemm false on ") + tc.name);
+                }
+                check_hip(hipStreamSynchronize(stream), "w10 fp8 rb warm");
+                const auto t1 = std::chrono::steady_clock::now();
+                for (int it = 0; it < 3; ++it) {
+                    (void)rb_tp3.run_fp8_gemm(dx, dxs, dw, dws, dy16_rb, dy32_rb, tc.M, tc.N, tc.K, tc.write_f32, false, stream);
+                }
+                check_hip(hipStreamSynchronize(stream), "w10 fp8 rb");
+                const double rb_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count() / 3.0;
+
+                double cos_v = 0.0;
+                if (tc.write_f32) {
+                    std::vector<float> a(out_n), b(out_n);
+                    check_hip(hipMemcpy(a.data(), dy32_ref, out_n * 4u, hipMemcpyDeviceToHost), "d2h32");
+                    check_hip(hipMemcpy(b.data(), dy32_rb,  out_n * 4u, hipMemcpyDeviceToHost), "d2h32");
+                    cos_v = cosine_f32(a, b);
+                } else {
+                    std::vector<uint16_t> a(out_n), b(out_n);
+                    check_hip(hipMemcpy(a.data(), dy16_ref, out_n * 2u, hipMemcpyDeviceToHost), "d2h16");
+                    check_hip(hipMemcpy(b.data(), dy16_rb,  out_n * 2u, hipMemcpyDeviceToHost), "d2h16");
+                    cos_v = cosine_bf16(a, b);
+                }
+                std::printf("[W10-FP8-2K] %-25s | cos=%.8f | custom=%.3f ms | HHHS=%.3f ms (%.2fx)\n",
+                            tc.name, cos_v, ref_ms, rb_ms, ref_ms / std::max(1e-6, rb_ms));
+                if (cos_v < 0.9999) throw std::runtime_error(std::string("W10 FP8 2K cosine failed on ") + tc.name);
+                (void)hipFree(dx); (void)hipFree(dxs); (void)hipFree(dw); (void)hipFree(dws);
+                if (dy16_ref) (void)hipFree(dy16_ref);
+                if (dy16_rb)  (void)hipFree(dy16_rb);
+                if (dy32_ref) (void)hipFree(dy32_ref);
+                if (dy32_rb)  (void)hipFree(dy32_rb);
+            }
+            // Grouped wo_a M=2048
+            const int M = 2048, g_cnt = 3, K_tot = g_cnt * 4096, N_tot = g_cnt * 1024;
+            std::vector<uint8_t> ho(size_t(M) * size_t(K_tot)), hos(size_t(M) * size_t(K_tot / 32), 124u);
+            std::vector<uint8_t> hw(size_t(N_tot) * 4096u), hws(size_t(N_tot / 32) * 128u, 123u);
+            for (auto& b : ho) b = uint8_t((rng() % 112u) | ((rng() & 1u) << 7));
+            for (auto& b : hw) b = uint8_t((rng() % 112u) | ((rng() & 1u) << 7));
+            uint8_t *do_p = nullptr, *dos = nullptr, *dw = nullptr, *dws = nullptr;
+            uint16_t *dy_ref = nullptr, *dy_rb = nullptr;
+            check_hip(hipMalloc(&do_p, ho.size()), "do2k");
+            check_hip(hipMalloc(&dos, hos.size()), "dos2k");
+            check_hip(hipMalloc(&dw, hw.size()), "dw2k");
+            check_hip(hipMalloc(&dws, hws.size()), "dws2k");
+            check_hip(hipMalloc(&dy_ref, size_t(M) * size_t(N_tot) * 2u), "dyr2k");
+            check_hip(hipMalloc(&dy_rb,  size_t(M) * size_t(N_tot) * 2u), "dyb2k");
+            check_hip(hipMemcpy(do_p, ho.data(), ho.size(), hipMemcpyHostToDevice), "cp");
+            check_hip(hipMemcpy(dos, hos.data(), hos.size(), hipMemcpyHostToDevice), "cp");
+            check_hip(hipMemcpy(dw, hw.data(), hw.size(), hipMemcpyHostToDevice), "cp");
+            check_hip(hipMemcpy(dws, hws.data(), hws.size(), hipMemcpyHostToDevice), "cp");
+            launch_fp8_grouped_wo_a(do_p, dos, dw, dws, dy_ref, M, g_cnt, stream);
+            check_hip(hipStreamSynchronize(stream), "w10 woa ref warm");
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int it = 0; it < 3; ++it) launch_fp8_grouped_wo_a(do_p, dos, dw, dws, dy_ref, M, g_cnt, stream);
+            check_hip(hipStreamSynchronize(stream), "w10 woa ref");
+            const double ref_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 3.0;
+            if (!rb_tp3.run_fp8_grouped_wo_a(do_p, dos, dw, dws, dy_rb, M, g_cnt, stream)) {
+                throw std::runtime_error("W10 run_fp8_grouped_wo_a M=2048 false");
+            }
+            check_hip(hipStreamSynchronize(stream), "w10 woa rb warm");
+            const auto t1 = std::chrono::steady_clock::now();
+            for (int it = 0; it < 3; ++it) (void)rb_tp3.run_fp8_grouped_wo_a(do_p, dos, dw, dws, dy_rb, M, g_cnt, stream);
+            check_hip(hipStreamSynchronize(stream), "w10 woa rb");
+            const double rb_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count() / 3.0;
+            std::vector<uint16_t> a(size_t(M) * size_t(N_tot)), b(size_t(M) * size_t(N_tot));
+            check_hip(hipMemcpy(a.data(), dy_ref, a.size() * 2u, hipMemcpyDeviceToHost), "d2h");
+            check_hip(hipMemcpy(b.data(), dy_rb,  b.size() * 2u, hipMemcpyDeviceToHost), "d2h");
+            const double cos_v = cosine_bf16(a, b);
+            std::printf("[W10-WOA-2K] grouped_wo_a [2048x3x1024x4096] | cos=%.8f | custom=%.3f ms | HHHS=%.3f ms (%.2fx)\n",
+                        cos_v, ref_ms, rb_ms, ref_ms / std::max(1e-6, rb_ms));
+            if (cos_v < 0.9999) throw std::runtime_error("W10 wo_a 2K cosine failed");
+            (void)hipFree(do_p); (void)hipFree(dos); (void)hipFree(dw); (void)hipFree(dws);
+            (void)hipFree(dy_ref); (void)hipFree(dy_rb);
+            rb_tp3.shutdown();
+        }
+
+        // 10. Wave 10 Phase C.2: Tiled Multi-Query SWA+CSA2 (k_sparse_attn_multiq4) parity vs k_sparse_attn_allheads
+        {
+            const int M = 256, h_cnt = 24, start_pos = 128, n_comp = 128, T_comp = 256;
+            std::vector<uint16_t> hq(size_t(M) * h_cnt * 512u), hwin(128u * 512u), hcur(size_t(M) * 512u);
+            std::vector<float> hsink(h_cnt, -2.5f);
+            std::vector<uint8_t> hcfp4(size_t(T_comp) * 256u), hce4(size_t(T_comp) * 32u, 0x38u);
+            std::vector<int32_t> hcidx(size_t(M) * n_comp);
+            for (auto& v : hq)   v = f32_to_bf16_h(nd(rng));
+            for (auto& v : hwin) v = f32_to_bf16_h(nd(rng));
+            for (auto& v : hcur) v = f32_to_bf16_h(nd(rng));
+            for (auto& v : hcfp4) v = uint8_t(rng() & 0xFFu);
+            for (int r = 0; r < M; ++r) {
+                for (int k = 0; k < n_comp; ++k) hcidx[size_t(r) * n_comp + k] = (r + k) % T_comp;
+            }
+            uint16_t *dq = nullptr, *dwin = nullptr, *dcur = nullptr, *do_mq = nullptr, *do_ref = nullptr;
+            float* dsink = nullptr;
+            uint8_t *dcfp4 = nullptr, *dce4 = nullptr;
+            int32_t* dcidx = nullptr;
+            check_hip(hipMalloc(&dq, hq.size() * 2u), "dq");
+            check_hip(hipMalloc(&dwin, hwin.size() * 2u), "dwin");
+            check_hip(hipMalloc(&dcur, hcur.size() * 2u), "dcur");
+            check_hip(hipMalloc(&dsink, hsink.size() * 4u), "dsink");
+            check_hip(hipMalloc(&dcfp4, hcfp4.size()), "dcfp4");
+            check_hip(hipMalloc(&dce4, hce4.size()), "dce4");
+            check_hip(hipMalloc(&dcidx, hcidx.size() * 4u), "dcidx");
+            check_hip(hipMalloc(&do_mq, hq.size() * 2u), "do_mq");
+            check_hip(hipMalloc(&do_ref, hq.size() * 2u), "do_ref");
+            check_hip(hipMemcpy(dq, hq.data(), hq.size() * 2u, hipMemcpyHostToDevice), "cp");
+            check_hip(hipMemcpy(dwin, hwin.data(), hwin.size() * 2u, hipMemcpyHostToDevice), "cp");
+            check_hip(hipMemcpy(dcur, hcur.data(), hcur.size() * 2u, hipMemcpyHostToDevice), "cp");
+            check_hip(hipMemcpy(dsink, hsink.data(), hsink.size() * 4u, hipMemcpyHostToDevice), "cp");
+            check_hip(hipMemcpy(dcfp4, hcfp4.data(), hcfp4.size(), hipMemcpyHostToDevice), "cp");
+            check_hip(hipMemcpy(dce4, hce4.data(), hce4.size(), hipMemcpyHostToDevice), "cp");
+            check_hip(hipMemcpy(dcidx, hcidx.data(), hcidx.size() * 4u, hipMemcpyHostToDevice), "cp");
+
+            // Reference: 4 slices of M=64 (exercises k_sparse_attn_allheads!) with rolling ring update
+            std::vector<uint16_t> hwin_roll = hwin;
+            for (int m0 = 0; m0 < M; m0 += 64) {
+                check_hip(hipMemcpy(dwin, hwin_roll.data(), hwin_roll.size() * 2u, hipMemcpyHostToDevice), "cp roll");
+                launch_sparse_attn(
+                    dq + size_t(m0) * h_cnt * 512u, dsink, dwin, dcur + size_t(m0) * 512u,
+                    start_pos + m0, 0, false, dcfp4, dce4, dcidx + size_t(m0) * n_comp, n_comp,
+                    nullptr, do_ref + size_t(m0) * h_cnt * 512u, 64, h_cnt, stream);
+                check_hip(hipStreamSynchronize(stream), "sync ref slice");
+                for (int r = 0; r < 64; ++r) {
+                    const int slot = (start_pos + m0 + r) & 127;
+                    std::memcpy(&hwin_roll[size_t(slot) * 512u], &hcur[size_t(m0 + r) * 512u], 512u * 2u);
+                }
+            }
+            // Restore original dwin and run M=256 k_sparse_attn_multiq4 in one launch!
+            check_hip(hipMemcpy(dwin, hwin.data(), hwin.size() * 2u, hipMemcpyHostToDevice), "cp orig");
+            launch_sparse_attn(dq, dsink, dwin, dcur, start_pos, 0, false, dcfp4, dce4, dcidx, n_comp,
+                               nullptr, do_mq, M, h_cnt, stream);
+            check_hip(hipStreamSynchronize(stream), "sync multiq4");
+            std::vector<uint16_t> ho_ref(hq.size()), ho_mq(hq.size());
+            check_hip(hipMemcpy(ho_ref.data(), do_ref, hq.size() * 2u, hipMemcpyDeviceToHost), "d2h");
+            check_hip(hipMemcpy(ho_mq.data(),  do_mq,  hq.size() * 2u, hipMemcpyDeviceToHost), "d2h");
+            const double cos_mq = cosine_bf16(ho_ref, ho_mq);
+            std::printf("[W10-MULTIQ4-ATTN] M=%d h=%d SWA128+CSA2(%d) | cos=%.9f (gate >= 0.999999)\n",
+                        M, h_cnt, n_comp, cos_mq);
+            if (cos_mq < 0.999999) throw std::runtime_error("W10 k_sparse_attn_multiq4 parity failed!");
+            (void)hipFree(dq); (void)hipFree(dwin); (void)hipFree(dcur); (void)hipFree(dsink);
+            (void)hipFree(dcfp4); (void)hipFree(dce4); (void)hipFree(dcidx); (void)hipFree(do_mq); (void)hipFree(do_ref);
+        }
+
+        // 11. Wave 10 Phase C.3: 3-GPU 128-bit Vectorized 4-Stage Pipelined BF16 HostRingAllReduce Bit-Exact Parity
+        {
+            int ndev = 0;
+            check_hip(hipGetDeviceCount(&ndev), "hipGetDeviceCount");
+            if (ndev >= 3) {
+                const size_t n_elems = 1024u * 5120u; // 10.0 MiB BF16/rank!
+                void* slot_raw = nullptr;
+                check_hip(hipSetDevice(0), "dev0");
+                check_hip(hipHostMalloc(&slot_raw, sizeof(HostRingAllReduceSlot),
+                                        hipHostMallocMapped | hipHostMallocCoherent), "ar slot");
+                std::memset(slot_raw, 0, sizeof(HostRingAllReduceSlot));
+                auto* slot = static_cast<HostRingAllReduceSlot*>(slot_raw);
+
+                std::vector<uint16_t> hsrc[3], hdst(n_elems);
+                uint16_t *dsrc[3]{}, *ddst[3]{};
+                hipStream_t st[3]{};
+                for (int tp = 0; tp < 3; ++tp) {
+                    hsrc[tp].resize(n_elems);
+                    for (size_t i = 0; i < n_elems; ++i) hsrc[tp][i] = f32_to_bf16_h(nd(rng));
+                    check_hip(hipSetDevice(tp), "setdev");
+                    check_hip(hipStreamCreate(&st[tp]), "mkst");
+                    check_hip(hipMalloc(&dsrc[tp], n_elems * 2u), "dsrc");
+                    check_hip(hipMalloc(&ddst[tp], n_elems * 2u), "ddst");
+                    check_hip(hipMemcpy(dsrc[tp], hsrc[tp].data(), n_elems * 2u, hipMemcpyHostToDevice), "cp");
+                }
+                for (int tp = 0; tp < 3; ++tp) {
+                    check_hip(hipSetDevice(tp), "sd");
+                    launch_host_ring_allreduce_bf16(dsrc[tp], ddst[tp], slot, tp, 1ULL, n_elems, st[tp]);
+                }
+                for (int tp = 0; tp < 3; ++tp) {
+                    check_hip(hipSetDevice(tp), "sd");
+                    check_hip(hipStreamSynchronize(st[tp]), "sync ar warm");
+                }
+                const auto ta0 = std::chrono::steady_clock::now();
+                for (int it = 0; it < 5; ++it) {
+                    const uint64_t seq = 2ULL + uint64_t(it);
+                    for (int tp = 0; tp < 3; ++tp) {
+                        check_hip(hipSetDevice(tp), "sd");
+                        launch_host_ring_allreduce_bf16(dsrc[tp], ddst[tp], slot, tp, seq, n_elems, st[tp]);
+                    }
+                    for (int tp = 0; tp < 3; ++tp) {
+                        check_hip(hipSetDevice(tp), "sd");
+                        check_hip(hipStreamSynchronize(st[tp]), "sync ar");
+                    }
+                }
+                const double ar_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ta0).count() / 5.0;
+
+                size_t bit_mismatches = 0;
+                for (int tp = 0; tp < 3; ++tp) {
+                    check_hip(hipSetDevice(tp), "sd");
+                    check_hip(hipMemcpy(hdst.data(), ddst[tp], n_elems * 2u, hipMemcpyDeviceToHost), "d2h");
+                    for (size_t i = 0; i < n_elems; ++i) {
+                        const float s = (bf16_to_f32_h(hsrc[0][i]) + bf16_to_f32_h(hsrc[1][i])) + bf16_to_f32_h(hsrc[2][i]);
+                        if (hdst[i] != f32_to_bf16_h(s)) ++bit_mismatches;
+                    }
+                }
+                const double bw_gbs = (3.0 * 10.0 * 3.0) / (ar_ms * 1.024); // 10 MiB TX + 20 MiB RX per rank across 3 ranks
+                std::printf("[W10-AR-PIPE] 3x MI50 BF16 vec4 4-stage pipe (10 MiB/rank) | mismatches=%zu | %.3f ms (agg=%.2f GB/s)\n",
+                            bit_mismatches, ar_ms, bw_gbs);
+                if (bit_mismatches != 0u) throw std::runtime_error("W10 BF16 vec4_pipe HostRingAllReduce bit mismatch!");
+                for (int tp = 0; tp < 3; ++tp) {
+                    check_hip(hipSetDevice(tp), "sd");
+                    (void)hipFree(dsrc[tp]); (void)hipFree(ddst[tp]); (void)hipStreamDestroy(st[tp]);
+                }
+                (void)hipHostFree(slot_raw);
+                check_hip(hipSetDevice(0), "restore dev0");
+            }
+        }
+
         check_hip(hipStreamDestroy(stream), "hipStreamDestroy");
-        std::printf("PASS: verify_wave9_3_rocblas_prefill (all cosine >= 0.9999)\n");
+        std::printf("PASS: verify_wave9_3_rocblas_prefill (all cosine >= 0.9999 + Wave 10 Phase C parity)\n");
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());

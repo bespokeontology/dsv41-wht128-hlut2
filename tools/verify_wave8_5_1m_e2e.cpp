@@ -36,21 +36,29 @@ void write_receipt_markdown(
     const dsv41::Dsv411MGateReceipt& r,
     const std::string& overlay_path,
     const std::string& dev3_overlay_path,
+    const std::string& dev4_overlay_path,
     const std::string& tp3_overlay_path,
     double total_wall_s)
 {
     std::ofstream f(out_md, std::ios::trunc);
     CHECK_1M(f.is_open(), ("Failed to open receipt output: " + out_md).c_str());
 
-    f << "# Wave 9.2 / 8.5 — 1,048,576-Token (`1M`) End-to-End Silicon Verification Receipt\n\n";
-    if (r.mem_margin.dev3_active) {
+    if (r.mem_margin.dev4_active) {
+        f << "# Wave 10 (`SB-M5-P2-192G`) — 1,048,576-Token (`1M`) End-to-End Silicon Verification Receipt\n\n";
+        f << "- **Runtime Topology**: `3x AMD Instinct MI50 32GB (gfx906 TP3)` + `2x AMD Instinct MI50 16GB (hlut3_dev=3 Switch #1 + hlut3_dev=4 Switch #2 WHT128-HLUT3)` + `2x Tenstorrent Blackhole P150A (TP2, 18/18 L1 + x16->FABRIC_1D)` + `188.83 GiB Locked DDR4 Engram` + `Dsv41VitEngine (tp=2)`\n";
+    } else if (r.mem_margin.dev3_active) {
+        f << "# Wave 9.2 / 8.5 — 1,048,576-Token (`1M`) End-to-End Silicon Verification Receipt\n\n";
         f << "- **Runtime Topology**: `3x AMD Instinct MI50 32GB (gfx906 TP3)` + `1x AMD Instinct MI50 16GB (hlut3_dev=3 WHT128-HLUT3)` + `2x Tenstorrent Blackhole P150A (TP2, 18/18 L1 + x16->FABRIC_1D)` + `188.83 GiB Locked DDR4 Engram` + `Dsv41VitEngine (tp=2)`\n";
     } else {
+        f << "# Wave 9.2 / 8.5 — 1,048,576-Token (`1M`) End-to-End Silicon Verification Receipt\n\n";
         f << "- **Runtime Topology**: `3x AMD Instinct MI50 32GB (gfx906 TP3)` + `2x Tenstorrent Blackhole P150A (TP2, 18/18 L1 + x16->FABRIC_1D)` + `188.83 GiB Locked DDR4 Engram` + `Dsv41VitEngine (tp=2)`\n";
     }
     f << "- **Active Overlay**: `" << overlay_path << "`\n";
     if (!dev3_overlay_path.empty()) {
         f << "- **Active `hlut3_dev=3` Overlay**: `" << dev3_overlay_path << "`\n";
+    }
+    if (!dev4_overlay_path.empty()) {
+        f << "- **Active `hlut3_dev=4` Overlay**: `" << dev4_overlay_path << "`\n";
     }
     if (!tp3_overlay_path.empty()) {
         f << "- **Active `TP3` `HLUT3` Overlay**: `" << tp3_overlay_path << "`\n";
@@ -59,21 +67,30 @@ void write_receipt_markdown(
     f << "- **Total E2E Gate Wall Time**: `" << std::fixed << std::setprecision(2) << total_wall_s << " s`\n\n";
 
     f << "## 1. Simultaneous 1M VRAM Headroom & 64-Bit Pointer Audit\n\n";
-    f << "| Rank | Device Role | Free HBM2 (`MiB`) | Total HBM2 (`MiB`) | `>= 200 MiB` Gate | `uint64_t` Pointer Audit |\n";
+    const double tp_gate_mib = r.mem_margin.dev4_active ? 1600.0 : 200.0;
+    f << "| Rank | Device Role | Free HBM2 (`MiB`) | Total HBM2 (`MiB`) | Headroom Gate | `uint64_t` Pointer Audit |\n";
     f << "| :--- | :--- | ---: | ---: | :---: | :---: |\n";
     for (int tp = 0; tp < 3; ++tp) {
         f << "| `tp=" << tp << "` | " << (tp == 2 ? "`Backbone + Dsv41VitEngine`" : "`Backbone`")
           << " | `" << std::fixed << std::setprecision(2) << r.mem_margin.free_mib[tp]
           << "` | `" << r.mem_margin.total_mib[tp]
-          << "` | `" << (r.mem_margin.free_mib[tp] >= 200.0 ? "PASS" : "FAIL")
+          << "` | `" << (r.mem_margin.free_mib[tp] >= tp_gate_mib ? "PASS" : "FAIL")
           << "` | `" << (r.mem_margin.pointer_audit_64bit_ok ? "PASS" : "FAIL") << "` |\n";
     }
     if (r.mem_margin.dev3_active) {
         const double used_dev3 = r.mem_margin.dev3_total_mib - r.mem_margin.dev3_free_mib;
-        f << "| `hlut3_dev=3` | `Unsharded MTP (384) + Backbone (720) WHT128-HLUT3`"
+        f << "| `hlut3_dev=3` | `Switch #1 Unsharded MTP (384) + Backbone (720) WHT128-HLUT3`"
           << " | `" << std::fixed << std::setprecision(2) << r.mem_margin.dev3_free_mib
           << "` | `" << r.mem_margin.dev3_total_mib
           << "` | `" << (used_dev3 <= 15360.0 && r.mem_margin.dev3_free_mib >= 1000.0 ? "PASS" : "FAIL")
+          << "` | `" << (r.mem_margin.pointer_audit_64bit_ok ? "PASS" : "FAIL") << "` |\n";
+    }
+    if (r.mem_margin.dev4_active) {
+        const double used_dev4 = r.mem_margin.dev4_total_mib - r.mem_margin.dev4_free_mib;
+        f << "| `hlut3_dev=4` | `Switch #2 Unsharded Backbone (1,080) WHT128-HLUT3`"
+          << " | `" << std::fixed << std::setprecision(2) << r.mem_margin.dev4_free_mib
+          << "` | `" << r.mem_margin.dev4_total_mib
+          << "` | `" << (used_dev4 <= 15360.0 && r.mem_margin.dev4_free_mib >= 1000.0 ? "PASS" : "FAIL")
           << "` | `" << (r.mem_margin.pointer_audit_64bit_ok ? "PASS" : "FAIL") << "` |\n";
     }
     f << "\n- **Tiered CSA2 Slot Partition (`tp=0..2`)**:\n";
@@ -152,8 +169,10 @@ int main(int argc, char** argv) {
     bool link_check = false;
     std::string overlay = root_env + "/packed_rarebal_overlay_wave8_5/hot_experts_wave8_5.safetensors";
     std::string dev3_overlay;
+    std::string dev4_overlay;
     std::string tp3_overlay;
     int dev3_id = 3;
+    int dev4_id = 4;
     std::string nvme_tmp = root_env + "/tmp/verify_w85_1m_kv";
     std::string receipt_out = root_env + "/WAVE8_5_1M_E2E_RECEIPT.md";
 
@@ -163,6 +182,8 @@ int main(int argc, char** argv) {
         else if (a == "--overlay" && i + 1 < argc) overlay = argv[++i];
         else if (a == "--hlut3-dev3-overlay" && i + 1 < argc) dev3_overlay = argv[++i];
         else if (a == "--hlut3-dev3-id" && i + 1 < argc) dev3_id = std::atoi(argv[++i]);
+        else if (a == "--hlut3-dev4-overlay" && i + 1 < argc) dev4_overlay = argv[++i];
+        else if (a == "--hlut3-dev4-id" && i + 1 < argc) dev4_id = std::atoi(argv[++i]);
         else if (a == "--hlut3-tp3-overlay" && i + 1 < argc) tp3_overlay = argv[++i];
         else if (a == "--nvme-tmp" && i + 1 < argc) nvme_tmp = argv[++i];
         else if (a == "--receipt-out" && i + 1 < argc) receipt_out = argv[++i];
@@ -188,6 +209,9 @@ int main(int argc, char** argv) {
     rt.set_expert_perm_overlay(overlay);
     if (!dev3_overlay.empty()) {
         rt.set_hlut3_dev3_overlay(dev3_overlay, dev3_id);
+    }
+    if (!dev4_overlay.empty()) {
+        rt.set_hlut3_dev4_overlay(dev4_overlay, dev4_id);
     }
     if (!tp3_overlay.empty()) {
         rt.set_hlut3_tp3_overlay(tp3_overlay);
@@ -221,15 +245,17 @@ int main(int argc, char** argv) {
     write_receipt_markdown(
         receipt_out, rec,
         sanitize_path(overlay),
-        dev3_overlay.empty() ? std::string() : "${DSV41_WAVE9_OVERLAY_DIR}/" + std::filesystem::path(dev3_overlay).filename().string(),
-        tp3_overlay.empty() ? std::string() : "${DSV41_WAVE9_OVERLAY_DIR}/" + std::filesystem::path(tp3_overlay).filename().string(),
+        dev3_overlay.empty() ? std::string() : "${DSV41_WAVE10_OVERLAY_DIR}/" + std::filesystem::path(dev3_overlay).filename().string(),
+        dev4_overlay.empty() ? std::string() : "${DSV41_WAVE10_OVERLAY_DIR}/" + std::filesystem::path(dev4_overlay).filename().string(),
+        tp3_overlay.empty() ? std::string() : "${DSV41_WAVE10_OVERLAY_DIR}/" + std::filesystem::path(tp3_overlay).filename().string(),
         tot_s);
 
     std::printf("[WAVE8_5_1M_E2E] Summary (%.2fs):\n"
-                "  Free HBM2 @ 1M + ViT : %.2f / %.2f / %.2f MiB | dev3_free=%.2f / %.2f MiB (64-bit ptr audit=%d)\n",
+                "  Free HBM2 @ 1M + ViT : %.2f / %.2f / %.2f MiB | dev3_free=%.2f / %.2f MiB | dev4_free=%.2f / %.2f MiB (64-bit ptr audit=%d)\n",
                 tot_s,
                 rec.mem_margin.free_mib[0], rec.mem_margin.free_mib[1], rec.mem_margin.free_mib[2],
                 rec.mem_margin.dev3_free_mib, rec.mem_margin.dev3_total_mib,
+                rec.mem_margin.dev4_free_mib, rec.mem_margin.dev4_total_mib,
                 int(rec.mem_margin.pointer_audit_64bit_ok));
     std::printf("  Engram overlap       : M=512 %.4f ms (%d) | M=1024 %.4f ms (%d)\n"
                 "  1M HSI & CSA2        : top64_overlap=%.3f%% | needles=%d/%d/%d | CSA2 cos=%.8f (max_abs=%.3e) | nonfinite=%zu\n"
@@ -247,11 +273,22 @@ int main(int argc, char** argv) {
                 receipt_out.c_str());
     std::fflush(stdout);
 
-    // Enforce every mandatory Track 8.5C gate!
-    CHECK_1M(rec.mem_margin.free_mib[0] >= 200.0 &&
-             rec.mem_margin.free_mib[1] >= 200.0 &&
-             rec.mem_margin.free_mib[2] >= 200.0,
-             "Failed >= 200.0 MiB free HBM2 per MI50 rank at max_seq_len=1,048,576 + ViT!");
+    // Enforce every mandatory Track 8.5C / Wave 10 gate!
+    const double tp_min_mib = rec.mem_margin.dev4_active ? 1600.0 : 200.0;
+    CHECK_1M(rec.mem_margin.free_mib[0] >= tp_min_mib &&
+             rec.mem_margin.free_mib[1] >= tp_min_mib &&
+             rec.mem_margin.free_mib[2] >= tp_min_mib,
+             "Failed free HBM2 margin per MI50 TP3 rank at max_seq_len=1,048,576 + ViT!");
+    if (rec.mem_margin.dev3_active) {
+        CHECK_1M(rec.mem_margin.dev3_free_mib >= 1000.0 &&
+                 (rec.mem_margin.dev3_total_mib - rec.mem_margin.dev3_free_mib) <= 15360.0,
+                 "Failed dev3 >= 1,000 MiB free & <= 15,360 MiB used gate!");
+    }
+    if (rec.mem_margin.dev4_active) {
+        CHECK_1M(rec.mem_margin.dev4_free_mib >= 1000.0 &&
+                 (rec.mem_margin.dev4_total_mib - rec.mem_margin.dev4_free_mib) <= 15360.0,
+                 "Failed dev4 >= 1,000 MiB free & <= 15,360 MiB used gate!");
+    }
     CHECK_1M(rec.mem_margin.pointer_audit_64bit_ok, "64-bit pointer offset audit failed!");
     CHECK_1M(rec.engram_prefetch_overlap_m512_ok && rec.engram_prefetch_overlap_m1024_ok,
              "Double-buffered M=512 / M=1024 prefill Engram + P150A x16 overlap gate failed!");

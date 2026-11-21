@@ -130,14 +130,17 @@ void launch_p2p_push_f32_2peers(
     hipStream_t stream);
 
 // Zero-CPU-sync Pinned Coherent System-Memory TP3 Ring AllReduce (0 bytes HBM2, 0 PCIe P2P BAR reads, bit-identical (r0+r1)+r2 sum!)
-static constexpr size_t kHostArRingSlots = 8u;
-static constexpr size_t kHostArMaxWords  = 2621440u;  // 10.0 MiB/rank = up to 5,242,880 BF16 (M=1024) or 2,621,440 FP32 elems!
+static constexpr size_t   kHostArRingSlots  = 8u;
+static constexpr size_t   kHostArMaxWords   = 2621440u;  // 10.0 MiB/rank = up to 5,242,880 BF16 (M=1024) or 2,621,440 FP32 elems!
+static constexpr uint32_t kHostArMaxCtas    = 32u;
+static constexpr uint32_t kHostArPipeStages = 4u;
 
 struct HostRingAllReduceSlot {
     alignas(64) uint32_t write_ctas[3][16];
     alignas(64) uint32_t read_ctas[3][16];
     alignas(64) uint64_t ready_seq[3][8];
     alignas(64) uint64_t done_seq[3][8];
+    alignas(64) uint64_t stripe_ready[3][kHostArMaxCtas][kHostArPipeStages][8];
     alignas(64) uint32_t payload[3][kHostArMaxWords];
 };
 
@@ -244,7 +247,10 @@ void launch_host_ring_finish_f32_hc_post(
     Dsv41GpuStageRtc* d_stage_rtc = nullptr,
     const float* d_dev3_f32 = nullptr,
     const uint32_t* d_dev3_done_seq = nullptr,
-    uint32_t dev3_req_seq = 0u);
+    uint32_t dev3_req_seq = 0u,
+    const float* d_dev4_f32 = nullptr,
+    const uint32_t* d_dev4_done_seq = nullptr,
+    uint32_t dev4_req_seq = 0u);
 
 // Wave 8.5B: Cross-sublayer fused HostRing TP3 AllReduce + mHC post + next-sublayer H_pre contraction +
 // RMSNorm + optional UE8M0/32 FP8 quant + optional WHT128 (M <= 16 decode fast path, ScratchSize == 0).
@@ -299,7 +305,10 @@ void launch_host_ring_finish_f32_mhc_fused(
     Dsv41GpuStageRtc* d_stage_rtc = nullptr,
     const float* d_dev3_f32 = nullptr,
     const uint32_t* d_dev3_done_seq = nullptr,
-    uint32_t dev3_req_seq = 0u);
+    uint32_t dev3_req_seq = 0u,
+    const float* d_dev4_f32 = nullptr,
+    const uint32_t* d_dev4_done_seq = nullptr,
+    uint32_t dev4_req_seq = 0u);
 
 void launch_add_f32_inplace(
     float* d_dst_f32,
@@ -790,9 +799,11 @@ struct DsparkGpuSampleSlot {
     float    rank_max[5][3];
     int32_t  rank_argmax[5][3];
     double   rank_sum_exp[5][3];
-    double   rank_cand_mass[5][3];
-    uint32_t rank_cand_cnt[5][3];
-    uint32_t rank_overflow[5][3];
+    // Disjoint tier-0 / tier-1 candidate slots eliminate any cross-rank TOCTOU race between
+    // rank 0 entering tier 1 (1e-5f) and ranks 1/2 reading tier 0 (2.5e-4f) mass/cnt/overflow!
+    double   rank_cand_mass[2][5][3];
+    uint32_t rank_cand_cnt[2][5][3];
+    uint32_t rank_overflow[2][5][3];
 
     int32_t  out_drafts[5];
     float    out_q_selected[5];
@@ -815,8 +826,8 @@ struct DsparkGpuSampleSlot {
     int32_t  kept_id[5][kDsparkMaxCand];
     float    kept_q[5][kDsparkMaxCand];
 
-    int32_t  rank_cand_id[3][kDsparkMaxCand];
-    float    rank_cand_exp[3][kDsparkMaxCand];
+    int32_t  rank_cand_id[2][3][kDsparkMaxCand];
+    float    rank_cand_exp[2][3][kDsparkMaxCand];
 };
 
 void launch_dspark_prepare_markov_emb(

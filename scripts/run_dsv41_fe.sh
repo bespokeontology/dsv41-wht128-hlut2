@@ -5,6 +5,7 @@ export GPU_MAX_HW_QUEUES="${GPU_MAX_HW_QUEUES:-8}"
 
 DSV41_ROOT="${DSV41_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 DSV41_WEIGHTS_DIR="${DSV41_WEIGHTS_DIR:-$DSV41_ROOT}"
+DSV41_WAVE10_OVERLAY_DIR="${DSV41_WAVE10_OVERLAY_DIR:-$DSV41_WEIGHTS_DIR/wave10_overlays}"
 DSV41_OVERLAY_DIR="${DSV41_OVERLAY_DIR:-$DSV41_WEIGHTS_DIR/wave9_2_overlays}"
 DSV41_KV_CACHE_DIR="${DSV41_KV_CACHE_DIR:-$DSV41_WEIGHTS_DIR/nvme_kv_cache}"
 
@@ -12,9 +13,19 @@ OVERLAY="${DSV41_OVERLAY:-$DSV41_WEIGHTS_DIR/packed_rarebal_overlay_wave8_5/hot_
 if [[ ! -f "$OVERLAY" && -f "$DSV41_WEIGHTS_DIR/hot_experts_wave8_5.safetensors" ]]; then
   OVERLAY="$DSV41_WEIGHTS_DIR/hot_experts_wave8_5.safetensors"
 fi
-DEV3_OVERLAY="${DSV41_DEV3_OVERLAY:-$DSV41_OVERLAY_DIR/wave9_2_dev3_hlut3.safetensors}"
-TP3_OVERLAY="${DSV41_TP3_OVERLAY:-$DSV41_OVERLAY_DIR/wave9_2_tp3_hlut3.safetensors}"
+
+# Prefer Wave 10 (5x MI50 dual-switchbox, 3,344 HLUT3) when present; fall back cleanly to Wave 9.2 (4x MI50, 1,704 HLUT3)
+if [[ -z "${DSV41_DEV3_OVERLAY:-}" && -f "$DSV41_WAVE10_OVERLAY_DIR/wave10_dev3_hlut3.safetensors" ]]; then
+  DEV3_OVERLAY="$DSV41_WAVE10_OVERLAY_DIR/wave10_dev3_hlut3.safetensors"
+  DEV4_OVERLAY="${DSV41_DEV4_OVERLAY:-$DSV41_WAVE10_OVERLAY_DIR/wave10_dev4_hlut3.safetensors}"
+  TP3_OVERLAY="${DSV41_TP3_OVERLAY:-$DSV41_WAVE10_OVERLAY_DIR/wave10_tp3_hlut3.safetensors}"
+else
+  DEV3_OVERLAY="${DSV41_DEV3_OVERLAY:-$DSV41_OVERLAY_DIR/wave9_2_dev3_hlut3.safetensors}"
+  DEV4_OVERLAY="${DSV41_DEV4_OVERLAY:-}"
+  TP3_OVERLAY="${DSV41_TP3_OVERLAY:-$DSV41_OVERLAY_DIR/wave9_2_tp3_hlut3.safetensors}"
+fi
 DEV3_ID="${DSV41_DEV3_ID:-3}"
+DEV4_ID="${DSV41_DEV4_ID:-4}"
 
 SEARCH_URL="${SEARCH_URL:-http://127.0.0.1:8888}"
 NVME_KV_GB="${DSV41_NVME_KV_GB:-32}"
@@ -26,6 +37,7 @@ EXTRA_ARGS=()
 HAS_OV_FLAG=0
 HAS_PERM_FLAG=0
 HAS_DEV3_FLAG=0
+HAS_DEV4_FLAG=0
 HAS_TP3_FLAG=0
 HAS_CSA2_SH8=0
 for arg in "$@"; do
@@ -33,6 +45,7 @@ for arg in "$@"; do
     --rarebal-overlay|--no-rarebal-overlay) HAS_OV_FLAG=1 ;;
     --expert-perm-overlay|--no-expert-perm) HAS_PERM_FLAG=1 ;;
     --hlut3-dev3-overlay)                   HAS_DEV3_FLAG=1 ;;
+    --hlut3-dev4-overlay)                   HAS_DEV4_FLAG=1 ;;
     --hlut3-tp3-overlay)                    HAS_TP3_FLAG=1 ;;
     --csa2-shared-tree8|--no-csa2-shared-tree8) HAS_CSA2_SH8=1 ;;
   esac
@@ -46,6 +59,9 @@ if [[ "$HAS_PERM_FLAG" -eq 0 && -f "$OVERLAY" ]]; then
 fi
 if [[ "$HAS_DEV3_FLAG" -eq 0 && -f "$DEV3_OVERLAY" ]]; then
   EXTRA_ARGS+=("--hlut3-dev3-overlay" "$DEV3_OVERLAY" "--hlut3-dev3-id" "$DEV3_ID")
+fi
+if [[ "$HAS_DEV4_FLAG" -eq 0 && -n "$DEV4_OVERLAY" && -f "$DEV4_OVERLAY" ]]; then
+  EXTRA_ARGS+=("--hlut3-dev4-overlay" "$DEV4_OVERLAY" "--hlut3-dev4-id" "$DEV4_ID")
 fi
 if [[ "$HAS_TP3_FLAG" -eq 0 && -f "$TP3_OVERLAY" ]]; then
   EXTRA_ARGS+=("--hlut3-tp3-overlay" "$TP3_OVERLAY")

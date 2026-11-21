@@ -317,7 +317,8 @@ inline RadixKey128 compute_model_overlay_uuid(
     const std::string& rarebal_overlay_path,
     const std::string& expert_perm_overlay_path = "",
     const std::string& hlut3_dev3_overlay_path = "",
-    const std::string& hlut3_tp3_overlay_path = "") noexcept
+    const std::string& hlut3_tp3_overlay_path = "",
+    const std::string& hlut3_dev4_overlay_path = "") noexcept
 {
     uint64_t h1 = 0xCBF29CE484222325ULL;
     uint64_t h2 = 0x84222325CBF29CE4ULL;
@@ -360,6 +361,12 @@ inline RadixKey128 compute_model_overlay_uuid(
         mix_str("hlut3_tp3:");
         mix_str(slash == std::string::npos ? hlut3_tp3_overlay_path : hlut3_tp3_overlay_path.substr(slash + 1));
         mix_stat(hlut3_tp3_overlay_path);
+    }
+    if (!hlut3_dev4_overlay_path.empty()) {
+        const size_t slash = hlut3_dev4_overlay_path.find_last_of('/');
+        mix_str("hlut3_dev4:");
+        mix_str(slash == std::string::npos ? hlut3_dev4_overlay_path : hlut3_dev4_overlay_path.substr(slash + 1));
+        mix_stat(hlut3_dev4_overlay_path);
     }
     if (h1 == 0ULL && h2 == 0ULL) h1 = 1ULL;
     return RadixKey128{h1, h2};

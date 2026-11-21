@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -96,26 +97,42 @@ public:
     uint64_t dispatches() const noexcept { return stat_dispatches_.load(std::memory_order_relaxed); }
     double   busy_ms() const noexcept { return double(stat_busy_ns_.load(std::memory_order_relaxed)) * 1e-6; }
 
-    // Initializes hlut3_dev=3 (0000:85:00.0), enforces <= 15,360 MiB hard cap, uploads weights,
-    // and starts the dedicated coherent host-ring polling worker thread.
+    // Initializes hlut3 offload GPU (dev3=85:00.0 Switch #1 or dev4=08:00.0 Switch #2), enforces <= 15,360 MiB
+    // hard cap, uploads weights, and starts the dedicated coherent host-ring polling worker thread.
     void init(const std::string& overlay_path,
               const std::string& mi50_packed_root,
               int dev_id = kDevIdDefault,
               bool enable_rocblas_prefill = true,
-              int rocblas_expert_thresh = RocblasPrefillEngine::kDefaultExpertThreshM)
+              int rocblas_expert_thresh = RocblasPrefillEngine::kDefaultExpertThreshM,
+              int pin_core = 24,
+              const std::string& tensor_prefix = "")
     {
         shutdown();
         dev_id_ = dev_id;
+        pin_core_ = pin_core;
         enable_rocblas_prefill_ = enable_rocblas_prefill;
         rocblas_expert_thresh_ = std::max(4, rocblas_expert_thresh);
 
         int dev_count = 0;
         if (hipGetDeviceCount(&dev_count) != hipSuccess || dev_id_ < 0 || dev_id_ >= dev_count) {
             throw std::runtime_error("Hlut3Dev3Engine requires HIP device " + std::to_string(dev_id_) +
-                                     " (set HIP_VISIBLE_DEVICES=0,2,3,1); visible count=" + std::to_string(dev_count));
+                                     " (set HIP_VISIBLE_DEVICES=0,2,3,1,4); visible count=" + std::to_string(dev_count));
         }
 
         SafetensorsMmap ov(overlay_path);
+
+        // Auto-detect tensor prefix ("dev3" vs "dev4") if not explicitly supplied
+        std::string pfx_root = tensor_prefix;
+        if (pfx_root.empty()) {
+            pfx_root = "dev3";
+            for (int bid = 0; bid < kTotalBlocks; ++bid) {
+                if (ov.contains("dev4.b" + std::to_string(bid) + ".gate_tiles")) {
+                    pfx_root = "dev4";
+                    break;
+                }
+            }
+        }
+        tag_ = (pfx_root == "dev4") ? "DSV41_DEV4" : "DSV41_DEV3";
 
         // 1. Inspect overlay contents & compute exact projected HBM2 usage BEFORE allocating!
         uint64_t tile_bytes_needed = 0ULL;
@@ -124,7 +141,7 @@ public:
         std::array<int, kTotalBlocks> exp_counts{};
 
         for (int bid = 0; bid < kTotalBlocks; ++bid) {
-            const std::string pfx = "dev3.b" + std::to_string(bid) + ".";
+            const std::string pfx = pfx_root + ".b" + std::to_string(bid) + ".";
             if (!ov.contains(pfx + "gate_tiles") ||
                 !ov.contains(pfx + "up_tiles") ||
                 !ov.contains(pfx + "down_tiles")) {
@@ -134,18 +151,18 @@ public:
             const size_t ub = size_t(ov.at(pfx + "up_tiles").byte_size());
             const size_t db = size_t(ov.at(pfx + "down_tiles").byte_size());
             if (gb == 0 || gb != ub || gb != db || (gb % kHlut3UnshardedProjBytes) != 0) {
-                throw std::runtime_error("Invalid dev3 HLUT3 tile tensor byte size at block " + std::to_string(bid));
+                throw std::runtime_error("Invalid " + pfx_root + " HLUT3 tile tensor byte size at block " + std::to_string(bid));
             }
             const int ne = int(gb / kHlut3UnshardedProjBytes);
             if (bid >= kNumBackboneLayers) {
                 if (ne != 128) {
-                    throw std::runtime_error("MTP dev3 HLUT3 block " + std::to_string(bid) + " must have 128 experts");
+                    throw std::runtime_error("MTP " + pfx_root + " HLUT3 block " + std::to_string(bid) + " must have 128 experts");
                 }
                 ++mtp_blocks_found;
             } else {
                 if (!ov.contains(pfx + "logical_eids") ||
                     size_t(ov.at(pfx + "logical_eids").byte_size()) != size_t(ne) * sizeof(uint16_t)) {
-                    throw std::runtime_error("Missing/invalid logical_eids for dev3 backbone block " + std::to_string(bid));
+                    throw std::runtime_error("Missing/invalid logical_eids for " + pfx_root + " backbone block " + std::to_string(bid));
                 }
                 bb_experts_found += ne;
             }
@@ -154,55 +171,64 @@ public:
         }
 
         if (mtp_blocks_found != 0 && mtp_blocks_found != kNumMtpBlocks) {
-            throw std::runtime_error("dev3 overlay must provide either 0 or all 3 MTP blocks (40..42)");
+            throw std::runtime_error(pfx_root + " overlay must provide either 0 or all 3 MTP blocks (40..42)");
         }
 
-        const uint64_t mtp_shared_bytes = (mtp_blocks_found == kNumMtpBlocks)
+        const bool need_mtp_scratch = (mtp_blocks_found == kNumMtpBlocks);
+        const uint64_t mtp_shared_bytes = need_mtp_scratch
             ? uint64_t(kNumMtpBlocks) * (2ULL * 2304ULL * 5120ULL + 2ULL * 72ULL * 160ULL +
                                          5120ULL * 2304ULL + 160ULL * 72ULL)
             : 0ULL;
-        const uint64_t rb_bytes = enable_rocblas_prefill_ ? (105ULL << 20) : 0ULL;
-        const uint64_t scratch_bytes =
-            uint64_t(kMaxChunkM) * kHidden * sizeof(uint16_t) +               // d_x_rot_f16 (40 MiB @ M=4096; aliases BF16 D2H!)
-            uint64_t(kMaxMtpShChunkM) * kHidden * sizeof(uint16_t) +          // d_x_norm_bf16 (5 MiB)
-            uint64_t(kMaxMtpShChunkM) * (kHidden + 160ULL) +                  // fp8_act + scale (2.58 MiB)
-            uint64_t(kMaxMtpShChunkM) * (2 * kInter) * sizeof(uint16_t) +     // sh_gateup_bf16 (4.50 MiB)
-            uint64_t(kMaxChunkM) * kHidden * sizeof(float) +                  // d_out_f32 (80 MiB @ M=4096; aliases INT8 H2D!)
-            uint64_t(kMaxScratchPairs) * kInter * sizeof(float) * 2ULL +      // z + zrot (9.0 MiB)
-            rb_bytes +                                                        // Wave 9.4 rocBLAS FP16 workspace (95.5 MiB)
-            1024ULL * 1024ULL;                                                // pairs/CSR/scales/guard (1 MiB)
-
-        check_hip(hipSetDevice(dev_id_), "hipSetDevice(dev3)");
+        const uint64_t mtp_scratch_bytes = need_mtp_scratch
+            ? (uint64_t(kMaxMtpShChunkM) * kHidden * sizeof(uint16_t) +
+               uint64_t(kMaxMtpShChunkM) * (kHidden + 160ULL) +
+               uint64_t(kMaxMtpShChunkM) * (2 * kInter) * sizeof(uint16_t))
+            : 0ULL;
+        check_hip(hipSetDevice(dev_id_), "hipSetDevice(offload)");
         size_t free_b = 0, total_b = 0;
-        check_hip(hipMemGetInfo(&free_b, &total_b), "hipMemGetInfo(dev3)");
+        check_hip(hipMemGetInfo(&free_b, &total_b), "hipMemGetInfo(offload)");
         const uint64_t base_used = (total_b >= free_b) ? uint64_t(total_b - free_b) : 0ULL;
+
+        // Empirical gfx906 finding: unsharded N_inter=2304 (4608x5120) already saturates all 60 CUs via Split-K
+        // at B=1 (beats strided-batched B=4 by -216 ms @ M=4096 and preserves +135 MiB free HBM2 on dev3/dev4!).
+        const int chosen_offload_max_b = 1;
+        const uint64_t base_scratch_no_rb =
+            uint64_t(kMaxChunkM) * kHidden * sizeof(uint16_t) +
+            mtp_scratch_bytes +
+            uint64_t(kMaxChunkM) * kHidden * sizeof(float) +
+            uint64_t(kMaxScratchPairs) * kInter * sizeof(float) +
+            1024ULL * 1024ULL;
+        const uint64_t rb_bytes = enable_rocblas_prefill_ ? ((60ULL + 45ULL * uint64_t(chosen_offload_max_b)) << 20) : 0ULL;
+        const uint64_t scratch_bytes = base_scratch_no_rb + rb_bytes;
         const uint64_t projected_used = base_used + tile_bytes_needed + mtp_shared_bytes + scratch_bytes;
 
         if (projected_used > kHardUsedCapBytes || free_b < (tile_bytes_needed + mtp_shared_bytes + scratch_bytes + (512ULL << 20))) {
             char msg[384];
             std::snprintf(msg, sizeof(msg),
-                          "[DSV41_DEV3] ABORT: projected HBM2 usage %.2f MiB exceeds 15,360.00 MiB hard guard on dev=%d (total=%.2f MiB, free=%.2f MiB)",
-                          double(projected_used) / (1024.0 * 1024.0), dev_id_,
+                          "[%s] ABORT: projected HBM2 usage %.2f MiB exceeds 15,360.00 MiB hard guard on dev=%d (total=%.2f MiB, free=%.2f MiB)",
+                          tag_.c_str(), double(projected_used) / (1024.0 * 1024.0), dev_id_,
                           double(total_b) / (1024.0 * 1024.0), double(free_b) / (1024.0 * 1024.0));
             throw std::runtime_error(msg);
         }
 
         int lo_pri = 0, hi_pri = 0;
-        check_hip(hipDeviceGetStreamPriorityRange(&lo_pri, &hi_pri), "hipDeviceGetStreamPriorityRange(dev3)");
-        check_hip(hipStreamCreateWithPriority(&stream_, hipStreamNonBlocking, hi_pri), "hipStreamCreate(dev3)");
+        check_hip(hipDeviceGetStreamPriorityRange(&lo_pri, &hi_pri), "hipDeviceGetStreamPriorityRange(offload)");
+        check_hip(hipStreamCreateWithPriority(&stream_, hipStreamNonBlocking, hi_pri), "hipStreamCreate(offload)");
 
-        // 2. Allocate coherent mapped pinned host DDR4 rings (separate MTP & Backbone rings) & prefill staging buffers
-        void* h_mtp_raw = nullptr;
+        // 2. Allocate coherent mapped pinned host DDR4 rings & prefill staging buffers
+        if (need_mtp_scratch) {
+            void* h_mtp_raw = nullptr;
+            check_hip(hipHostMalloc(&h_mtp_raw, kHlut3OffloadRingSlots * sizeof(Hlut3OffloadSlot),
+                                    hipHostMallocMapped | hipHostMallocCoherent),
+                      "hipHostMalloc(h_mtp_ring_)");
+            std::memset(h_mtp_raw, 0, kHlut3OffloadRingSlots * sizeof(Hlut3OffloadSlot));
+            h_mtp_ring_ = static_cast<Hlut3OffloadSlot*>(h_mtp_raw);
+        }
         void* h_bb_raw  = nullptr;
-        check_hip(hipHostMalloc(&h_mtp_raw, kHlut3OffloadRingSlots * sizeof(Hlut3OffloadSlot),
-                                hipHostMallocMapped | hipHostMallocCoherent),
-                  "hipHostMalloc(h_mtp_ring_)");
         check_hip(hipHostMalloc(&h_bb_raw, kHlut3OffloadRingSlots * sizeof(Hlut3OffloadSlot),
                                 hipHostMallocMapped | hipHostMallocCoherent),
                   "hipHostMalloc(h_bb_ring_)");
-        std::memset(h_mtp_raw, 0, kHlut3OffloadRingSlots * sizeof(Hlut3OffloadSlot));
         std::memset(h_bb_raw,  0, kHlut3OffloadRingSlots * sizeof(Hlut3OffloadSlot));
-        h_mtp_ring_ = static_cast<Hlut3OffloadSlot*>(h_mtp_raw);
         h_bb_ring_  = static_cast<Hlut3OffloadSlot*>(h_bb_raw);
 
         check_hip(hipHostMalloc(reinterpret_cast<void**>(&h_prefill_x_rot_f16_),
@@ -214,9 +240,11 @@ public:
         check_hip(hipHostMalloc(reinterpret_cast<void**>(&h_prefill_x_scales_f16_),
                                 size_t(kMaxChunkM) * size_t(kHidden / 128) * sizeof(uint16_t), hipHostMallocDefault),
                   "hipHostMalloc(h_prefill_x_scales_f16_)");
-        check_hip(hipHostMalloc(reinterpret_cast<void**>(&h_prefill_x_norm_bf16_),
-                                size_t(kMaxMtpShChunkM) * kHidden * sizeof(uint16_t), hipHostMallocDefault),
-                  "hipHostMalloc(h_prefill_x_norm_bf16_)");
+        if (need_mtp_scratch) {
+            check_hip(hipHostMalloc(reinterpret_cast<void**>(&h_prefill_x_norm_bf16_),
+                                    size_t(kMaxMtpShChunkM) * kHidden * sizeof(uint16_t), hipHostMallocDefault),
+                      "hipHostMalloc(h_prefill_x_norm_bf16_)");
+        }
         check_hip(hipHostMalloc(reinterpret_cast<void**>(&h_prefill_pairs_),
                                 size_t(kMaxChunkM) * kHlut3OffloadMaxTopk * sizeof(Mi50RoutedPair), hipHostMallocDefault),
                   "hipHostMalloc(h_prefill_pairs_)");
@@ -229,7 +257,7 @@ public:
                                 hipHostMallocMapped | hipHostMallocCoherent),
                   "hipHostMalloc(h_prefill_y_out_bf16_)");
 
-        // 3. Allocate device scratch on hlut3_dev=3 (0000:85:00.0)
+        // 3. Allocate device scratch on offload GPU
         const auto sol = solve_gaussian_lloyd_max_hlut3();
         const float lv[4] = {float(sol.levels[0]), float(sol.levels[1]),
                              float(sol.levels[2]), float(sol.levels[3])};
@@ -238,13 +266,14 @@ public:
 
         d_x_rot_f16_     = alloc_dev<uint16_t>(size_t(kMaxChunkM) * kHidden);
         d_x_scales_f16_  = alloc_dev<uint16_t>(size_t(kMaxChunkM) * size_t(kHidden / 128));
-        d_x_norm_bf16_   = alloc_dev<uint16_t>(size_t(kMaxMtpShChunkM) * kHidden);
-        d_fp8_act_       = alloc_dev<uint8_t>(size_t(kMaxMtpShChunkM) * kHidden);
-        d_fp8_scale_     = alloc_dev<uint8_t>(size_t(kMaxMtpShChunkM) * (kHidden / 32));
-        d_sh_gateup_bf16_= alloc_dev<uint16_t>(size_t(kMaxMtpShChunkM) * 2u * kInter);
+        if (need_mtp_scratch) {
+            d_x_norm_bf16_   = alloc_dev<uint16_t>(size_t(kMaxMtpShChunkM) * kHidden);
+            d_fp8_act_       = alloc_dev<uint8_t>(size_t(kMaxMtpShChunkM) * kHidden);
+            d_fp8_scale_     = alloc_dev<uint8_t>(size_t(kMaxMtpShChunkM) * (kHidden / 32));
+            d_sh_gateup_bf16_= alloc_dev<uint16_t>(size_t(kMaxMtpShChunkM) * 2u * kInter);
+        }
         d_out_f32_       = alloc_dev<float>(size_t(kMaxChunkM) * kHidden);
         d_inter_z_f32_   = alloc_dev<float>(size_t(kMaxScratchPairs) * kInter);
-        d_inter_zrot_f32_= alloc_dev<float>(size_t(kMaxScratchPairs) * kInter);
         d_pairs_         = alloc_dev<Mi50RoutedPair>(size_t(kMaxChunkM) * kHlut3OffloadMaxTopk);
         d_active_exp_    = alloc_dev<int32_t>(256u);
         d_csr_offsets_   = alloc_dev<int32_t>(257u);
@@ -259,7 +288,6 @@ public:
             auto& b = blocks_[size_t(bid)];
             b.n_experts = ne;
 
-            // Gather full 36-word signs_i across tp=0,1,2 packed_mi50 shards
             std::vector<uint64_t> signs_i_full;
             signs_i_full.reserve(36u);
             char tag[64];
@@ -277,7 +305,7 @@ public:
             check_hip(hipMemcpy(b.d_signs_i, signs_i_full.data(), 36u * sizeof(uint64_t), hipMemcpyHostToDevice),
                       "copy d_signs_i");
 
-            const std::string pfx = "dev3.b" + std::to_string(bid) + ".";
+            const std::string pfx = pfx_root + ".b" + std::to_string(bid) + ".";
             if (bid < kNumBackboneLayers) {
                 const auto* eids_ptr = reinterpret_cast<const uint16_t*>(ov.tensor_bytes(pfx + "logical_eids"));
                 b.logical_eids.assign(eids_ptr, eids_ptr + ne);
@@ -336,8 +364,13 @@ public:
             }
         }
 
-        if (enable_rocblas_prefill_) {
-            rb_prefill_.init(dev_id_, stream_, /*is_dev3=*/true);
+        static std::mutex rb_prewarm_mtx;
+        {
+            std::lock_guard<std::mutex> rb_lk(rb_prewarm_mtx);
+            check_hip(hipSetDevice(dev_id_), "hipSetDevice(rb_init)");
+            if (enable_rocblas_prefill_) {
+                rb_prefill_.init(dev_id_, stream_, /*is_dev3=*/true, /*max_bucket_m=*/1024, chosen_offload_max_b);
+            }
         }
 
         size_t free_after = 0, total_after = 0;
@@ -345,31 +378,33 @@ public:
         const uint64_t actual_used = (total_after >= free_after) ? uint64_t(total_after - free_after) : 0ULL;
         if (actual_used > kHardUsedCapBytes) {
             shutdown();
-            throw std::runtime_error("[DSV41_DEV3] ABORT: actual HBM2 used exceeded 15,360 MiB hard guard");
+            throw std::runtime_error("[" + tag_ + "] ABORT: actual HBM2 used exceeded 15,360 MiB hard guard");
         }
 
         has_mtp_ = (mtp_blocks_found == kNumMtpBlocks);
         total_mtp_experts_ = mtp_blocks_found * 128;
         total_backbone_experts_ = bb_experts_found;
 
-        // Pre-warm BOTH dsv41_mi50_kernels.o and dsv41_hlut3_kernels.o HIP fatbin code objects
-        // on hlut3_dev=3 at boot before worker_ or DpmWarmGuard starts, eliminating cold-JIT lock stalls!
+        // Pre-warm HIP fatbin code objects on offload GPU at boot before worker_ or DpmWarmGuard starts!
         {
+            std::lock_guard<std::mutex> rb_lk(rb_prewarm_mtx);
+            check_hip(hipSetDevice(dev_id_), "hipSetDevice(prewarm)");
             int warm_bid = -1;
             for (int bid = 0; bid < kTotalBlocks; ++bid) {
                 if (blocks_[size_t(bid)].n_experts > 0) { warm_bid = bid; break; }
             }
             if (warm_bid >= 0) {
                 const auto& wb = blocks_[size_t(warm_bid)];
-                h_mtp_ring_[0].topk_ids[0] = -1;
-                h_mtp_ring_[0].topk_weights[0] = 0.0f;
+                Hlut3OffloadSlot* warm_slot = h_mtp_ring_ ? &h_mtp_ring_[0] : &h_bb_ring_[0];
+                warm_slot->topk_ids[0] = -1;
+                warm_slot->topk_weights[0] = 0.0f;
                 launch_dev3_ingest_and_pack_csr(
-                    &h_mtp_ring_[0], d_x_rot_f16_, d_x_norm_bf16_,
+                    warm_slot, d_x_rot_f16_, d_x_norm_bf16_,
                     d_active_exp_, d_csr_offsets_, d_pairs_, d_num_act_,
                     1, 1, 0, wb.n_experts, (wb.d_sh_w13_w != nullptr), stream_);
-                if (wb.d_sh_w13_w != nullptr) {
+                if (wb.d_sh_w13_w != nullptr && d_x_norm_bf16_ != nullptr) {
                     run_mtp_shared_fp8(wb, 1);
-                } else {
+                } else if (d_x_norm_bf16_ != nullptr) {
                     launch_act_quant_ue8m0_32(d_x_norm_bf16_, d_fp8_act_, d_fp8_scale_, nullptr, 1, kHidden, false, stream_);
                 }
                 launch_hlut3_fdot2_grouped_f16(
@@ -379,7 +414,6 @@ public:
                     d_levels_, wb.d_signs_i,
                     reinterpret_cast<uint16_t*>(d_inter_z_f32_), d_out_f32_, stream_);
                 if (rb_prefill_.active()) {
-                    // Pre-warm all Wave 9.3 HLUT3 unpack/gather/scatter code objects on dev3 at boot!
                     Mi50RoutedPair dummy_pr{0, 0, 0.0f, 0};
                     check_hip(hipMemcpyAsync(d_pairs_, &dummy_pr, sizeof(dummy_pr), hipMemcpyHostToDevice, stream_), "cp dummy");
                     rb_prefill_.run_hlut3_expert_bucket(
@@ -387,11 +421,12 @@ public:
                         wb.d_gate_tiles, wb.d_up_tiles, wb.d_down_tiles,
                         d_levels_, wb.d_signs_i, d_out_f32_, stream_);
                 }
-                launch_dev3_publish_f32(d_out_f32_, &h_mtp_ring_[0], d_publish_sync_, 1, 1u, stream_);
-                check_hip(hipStreamSynchronize(stream_), "prewarm dev3 kernels");
-                std::memset(h_mtp_ring_, 0, kHlut3OffloadRingSlots * sizeof(Hlut3OffloadSlot));
+                launch_dev3_publish_f32(d_out_f32_, warm_slot, d_publish_sync_, 1, 1u, stream_);
+                check_hip(hipStreamSynchronize(stream_), "prewarm offload kernels");
+                if (h_mtp_ring_) std::memset(h_mtp_ring_, 0, kHlut3OffloadRingSlots * sizeof(Hlut3OffloadSlot));
                 std::memset(h_bb_ring_,  0, kHlut3OffloadRingSlots * sizeof(Hlut3OffloadSlot));
                 check_hip(hipMemset(d_publish_sync_, 0, 2u * kHlut3OffloadRingSlots * 16u * sizeof(uint32_t)), "re-zero d_publish_sync_");
+                check_hip(hipStreamSynchronize(nullptr), "sync stream0 after offload re-zero");
             }
         }
 
@@ -404,8 +439,8 @@ public:
 
         worker_ = std::thread([this]() { worker_loop(); });
 
-        std::printf("[DSV41_DEV3] Asymmetric 4th GPU hlut3_dev=%d READY: mtp_experts=%d backbone_experts=%d HBM=%.2f / %.2f GiB used (free=%.1f MiB, cap=15360 MiB)\n",
-                    dev_id_, total_mtp_experts_, total_backbone_experts_,
+        std::printf("[%s] Offload GPU hlut3_dev=%d (core=%d, rb_B=%d) READY: mtp_experts=%d backbone_experts=%d HBM=%.2f / %.2f GiB used (free=%.1f MiB, cap=15360 MiB)\n",
+                    tag_.c_str(), dev_id_, pin_core_, chosen_offload_max_b, total_mtp_experts_, total_backbone_experts_,
                     double(actual_used) / double(1ULL << 30),
                     double(total_after) / double(1ULL << 30),
                     double(free_after) / (1024.0 * 1024.0));
@@ -459,19 +494,35 @@ public:
         int n_pairs,
         bool out_bf16 = true)
     {
+        return submit_prefill_int8_shared_async(
+            block_id, M, h_prefill_x_i8_, h_prefill_x_scales_f16_, h_local_pairs, n_pairs, out_bf16);
+    }
+
+    // Wave 10 Phase B: Zero-duplicate shared INT8-BLK128 input staging read concurrently by dev3 & dev4!
+    uint32_t submit_prefill_int8_shared_async(
+        int block_id,
+        int M,
+        const int8_t* shared_x_i8,
+        const uint16_t* shared_x_scales_f16,
+        const Mi50RoutedPair* h_local_pairs,
+        int n_pairs,
+        bool out_bf16 = true)
+    {
         if (!active_ || M <= 0 || M > kMaxChunkM) {
-            throw std::runtime_error("submit_prefill_int8_async invalid M or inactive Hlut3Dev3Engine");
+            throw std::runtime_error("submit_prefill_int8_shared_async invalid M or inactive Hlut3Dev3Engine");
         }
         if (n_pairs > 0 && h_local_pairs != nullptr) {
             std::memcpy(h_prefill_pairs_, h_local_pairs, size_t(n_pairs) * sizeof(Mi50RoutedPair));
         }
-        prefill_block_id_  = block_id;
-        prefill_rows_      = M;
-        prefill_n_pairs_   = n_pairs;
-        prefill_mtp_sh_    = false;
-        prefill_x_is_bf16_ = false;
-        prefill_x_is_int8_ = true;
-        prefill_out_bf16_  = out_bf16;
+        prefill_block_id_     = block_id;
+        prefill_rows_         = M;
+        prefill_n_pairs_      = n_pairs;
+        prefill_mtp_sh_       = false;
+        prefill_x_is_bf16_    = false;
+        prefill_x_is_int8_    = true;
+        prefill_out_bf16_     = out_bf16;
+        prefill_x_i8_src_     = shared_x_i8 ? shared_x_i8 : h_prefill_x_i8_;
+        prefill_x_scales_src_ = shared_x_scales_f16 ? shared_x_scales_f16 : h_prefill_x_scales_f16_;
         const uint32_t seq = prefill_req_seq_.load(std::memory_order_relaxed) + 1u;
         prefill_req_seq_.store(seq, std::memory_order_release);
         return seq;
@@ -518,6 +569,10 @@ public:
         if (h_prefill_pairs_ != nullptr)        { (void)hipHostFree(h_prefill_pairs_);        h_prefill_pairs_ = nullptr; }
         if (h_prefill_y_out_f32_ != nullptr)    { (void)hipHostFree(h_prefill_y_out_f32_);    h_prefill_y_out_f32_ = nullptr; }
         if (h_prefill_y_out_bf16_ != nullptr)   { (void)hipHostFree(h_prefill_y_out_bf16_);   h_prefill_y_out_bf16_ = nullptr; }
+        d_x_norm_bf16_ = nullptr;
+        d_fp8_act_ = nullptr;
+        d_fp8_scale_ = nullptr;
+        d_sh_gateup_bf16_ = nullptr;
         blocks_ = {};
         active_ = false;
         has_mtp_ = false;
@@ -602,11 +657,11 @@ private:
     }
 
     void worker_loop() {
-        // Wave 9.3 Phase D.4: Pin dev3 (0000:85:00.0) worker thread to dedicated physical EPYC 7542 core
-        {
+        // Wave 9.3 / Wave 10: Pin offload worker thread (dev3 -> core 24, p150 -> core 25, dev4 -> core 26)
+        if (pin_core_ >= 0) {
             cpu_set_t cs;
             CPU_ZERO(&cs);
-            CPU_SET(24, &cs);
+            CPU_SET(pin_core_, &cs);
             (void)::pthread_setaffinity_np(::pthread_self(), sizeof(cs), &cs);
         }
         (void)hipSetDevice(dev_id_);
@@ -619,21 +674,22 @@ private:
         std::vector<Mi50RoutedPair> h_sorted;
         std::vector<Mi50RoutedPair> h_rb_pairs;
         std::vector<Mi50RoutedPair> flat_sorted;
-        struct RbBucket { int eid; int p_start; int m_e; };
-        std::vector<RbBucket> rb_buckets;
+        std::vector<RocblasPrefillEngine::ExpertBucketDesc> rb_descs;
         h_act.reserve(256u);
         h_off.reserve(257u);
         h_sorted.reserve(kMaxScratchPairs);
         h_rb_pairs.reserve(size_t(kMaxChunkM) * kHlut3OffloadMaxTopk);
         flat_sorted.resize(size_t(kMaxChunkM) * kHlut3OffloadMaxTopk);
-        rb_buckets.reserve(256u);
+        rb_descs.reserve(256u);
 
         while (!stop_worker_.load(std::memory_order_acquire)) {
-            Hlut3OffloadSlot* mslot = &h_mtp_ring_[(next_mtp - 1u) & uint32_t(kHlut3OffloadRingSlots - 1u)];
-            if (static_cast<int32_t>(__atomic_load_n(&mslot->ready_seq, __ATOMIC_ACQUIRE) - next_mtp) >= 0) {
-                process_fast_slot(mslot, next_mtp, 0u);
-                ++next_mtp;
-                continue;
+            if (h_mtp_ring_ != nullptr) {
+                Hlut3OffloadSlot* mslot = &h_mtp_ring_[(next_mtp - 1u) & uint32_t(kHlut3OffloadRingSlots - 1u)];
+                if (static_cast<int32_t>(__atomic_load_n(&mslot->ready_seq, __ATOMIC_ACQUIRE) - next_mtp) >= 0) {
+                    process_fast_slot(mslot, next_mtp, 0u);
+                    ++next_mtp;
+                    continue;
+                }
             }
 
             Hlut3OffloadSlot* bslot = &h_bb_ring_[(next_bb - 1u) & uint32_t(kHlut3OffloadRingSlots - 1u)];
@@ -658,9 +714,9 @@ private:
                 if (x_int8) {
                     // Alias d_out_f32_ (80 MiB, unused before hipMemsetAsync!) for 2x smaller INT8 H2D wire -> 0 B extra HBM2!
                     int8_t* d_i8_alias = reinterpret_cast<int8_t*>(d_out_f32_);
-                    (void)hipMemcpyAsync(d_i8_alias, h_prefill_x_i8_,
+                    (void)hipMemcpyAsync(d_i8_alias, prefill_x_i8_src_,
                                          size_t(M) * kHidden * sizeof(int8_t), hipMemcpyHostToDevice, stream_);
-                    (void)hipMemcpyAsync(d_x_scales_f16_, h_prefill_x_scales_f16_,
+                    (void)hipMemcpyAsync(d_x_scales_f16_, prefill_x_scales_src_,
                                          size_t(M) * size_t(kHidden / 128) * sizeof(uint16_t), hipMemcpyHostToDevice, stream_);
                     launch_w94_dequant_int8_to_f16_rowwise(d_i8_alias, d_x_scales_f16_, d_x_rot_f16_, M, kHidden, stream_);
                 } else {
@@ -704,34 +760,38 @@ private:
                         }
                     }
 
-                    // Dispatch hot expert buckets (m_e >= rocblas_expert_thresh_) via rocBLAS FP16->FP32 GEMM
+                    // Dispatch hot expert buckets (m_e >= rocblas_expert_thresh_) via B=3/4 Strided-Batched HHHS rocBLAS!
                     const bool use_rb = (rb_prefill_.active() && M >= RocblasPrefillEngine::kDefaultDenseThreshM);
                     if (use_rb) {
                         h_rb_pairs.clear();
-                        rb_buckets.clear();
+                        rb_descs.clear();
                         for (int e = 0; e < ne_lim; ++e) {
                             const int cnt = counts[size_t(e)];
                             if (cnt >= rocblas_expert_thresh_) {
-                                const int ps = int(h_rb_pairs.size());
-                                const int src0 = offsets[size_t(e)];
-                                h_rb_pairs.insert(h_rb_pairs.end(),
-                                                  flat_sorted.begin() + src0,
-                                                  flat_sorted.begin() + src0 + cnt);
-                                rb_buckets.push_back(RbBucket{e, ps, cnt});
+                                rb_descs.push_back(RocblasPrefillEngine::ExpertBucketDesc{e, 0, cnt});
                                 counts[size_t(e)] = 0;
                             }
                         }
-                        if (!h_rb_pairs.empty()) {
+                        if (!rb_descs.empty()) {
+                            std::sort(rb_descs.begin(), rb_descs.end(),
+                                      [](const auto& a, const auto& b) {
+                                          return (a.m_e != b.m_e) ? (a.m_e > b.m_e) : (a.eid < b.eid);
+                                      });
+                            for (auto& bk : rb_descs) {
+                                bk.p_start = int(h_rb_pairs.size());
+                                const int src0 = offsets[size_t(bk.eid)];
+                                h_rb_pairs.insert(h_rb_pairs.end(),
+                                                  flat_sorted.begin() + src0,
+                                                  flat_sorted.begin() + src0 + bk.m_e);
+                            }
                             (void)hipMemcpyAsync(d_pairs_, h_rb_pairs.data(),
                                                  h_rb_pairs.size() * sizeof(Mi50RoutedPair),
                                                  hipMemcpyHostToDevice, stream_);
-                            for (const auto& bk : rb_buckets) {
-                                rb_prefill_.run_hlut3_expert_bucket(
-                                    d_x_rot_f16_, d_pairs_,
-                                    bk.eid, bk.p_start, bk.m_e, kInter,
-                                    b.d_gate_tiles, b.d_up_tiles, b.d_down_tiles,
-                                    d_levels_, b.d_signs_i, d_out_f32_, stream_);
-                            }
+                            rb_prefill_.run_hlut3_expert_buckets_batched(
+                                d_x_rot_f16_, d_pairs_,
+                                rb_descs.data(), int(rb_descs.size()), kInter,
+                                b.d_gate_tiles, b.d_up_tiles, b.d_down_tiles,
+                                d_levels_, b.d_signs_i, d_out_f32_, stream_);
                         }
                     }
 
@@ -808,6 +868,8 @@ private:
     }
 
     int dev_id_ = kDevIdDefault;
+    int pin_core_ = 24;
+    std::string tag_ = "DSV41_DEV3";
     bool active_ = false;
     bool has_mtp_ = false;
     bool enable_rocblas_prefill_ = true;
@@ -829,7 +891,6 @@ private:
     uint16_t*       d_sh_gateup_bf16_ = nullptr;
     float*          d_out_f32_        = nullptr;
     float*          d_inter_z_f32_    = nullptr;
-    float*          d_inter_zrot_f32_ = nullptr;
     Mi50RoutedPair* d_pairs_          = nullptr;
     int32_t*        d_active_exp_     = nullptr;
     int32_t*        d_csr_offsets_    = nullptr;
@@ -844,6 +905,8 @@ private:
     uint16_t*       h_prefill_x_rot_f16_    = nullptr;
     int8_t*         h_prefill_x_i8_         = nullptr;
     uint16_t*       h_prefill_x_scales_f16_ = nullptr;
+    const int8_t*   prefill_x_i8_src_       = nullptr;
+    const uint16_t* prefill_x_scales_src_   = nullptr;
     uint16_t*       h_prefill_x_norm_bf16_  = nullptr;
     Mi50RoutedPair* h_prefill_pairs_        = nullptr;
     float*          h_prefill_y_out_f32_    = nullptr;

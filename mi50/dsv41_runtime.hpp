@@ -97,6 +97,9 @@ struct Dsv41GpuMemMargin {
     double dev3_free_mib = 0.0;
     double dev3_total_mib = 0.0;
     bool dev3_active = false;
+    double dev4_free_mib = 0.0;
+    double dev4_total_mib = 0.0;
+    bool dev4_active = false;
     bool pointer_audit_64bit_ok = false;
     size_t max_comp_slots[4]{};
     size_t hot_comp_slots[4]{};
@@ -114,6 +117,7 @@ struct Dsv41StageBreakdown {
     double moe_tp3_hlut2_ms = 0.0;
     double moe_tp3_hlut3_ms = 0.0;
     double moe_dev3_wait_ms = 0.0;
+    double moe_dev4_wait_ms = 0.0;
     double moe_p150_wait_ms = 0.0;
     double moe_ar_ms = 0.0;
     double mhc_ms = 0.0;
@@ -122,6 +126,8 @@ struct Dsv41StageBreakdown {
     double p150_dev_ms = 0.0;
     double dev3_dev_busy_ms = 0.0;
     uint64_t dev3_dispatches = 0;
+    double dev4_dev_busy_ms = 0.0;
+    uint64_t dev4_dispatches = 0;
 };
 
 struct Dsv411MDecodeBurstRow {
@@ -218,6 +224,7 @@ public:
     //   --hlut3-dev3-overlay: 384 unsharded MTP + up to 720 unsharded backbone experts on hlut3_dev=3 (0000:85:00.0)
     //   --hlut3-tp3-overlay : 600+ TP3-sharded backbone experts promoted in-place on tp=0,1,2 (C7/88/03)
     void set_hlut3_dev3_overlay(const std::string& overlay_path, int dev_id = 3);
+    void set_hlut3_dev4_overlay(const std::string& overlay_path, int dev_id = 4);
     void set_hlut3_tp3_overlay(const std::string& overlay_path);
     void set_rocblas_prefill(bool enable);
     void set_rocblas_expert_thresh(int thresh);

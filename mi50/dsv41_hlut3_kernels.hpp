@@ -160,6 +160,23 @@ void launch_stage_and_arm_hlut3_dev3(
     uint32_t req_seq,
     hipStream_t stream);
 
+// Wave 10 Dual-Switchbox: Single-HBM2-read fused staging & simultaneous doorbell arming for
+// BOTH dev3 (0000:85:00.0, Switch #1) and dev4 (0000:08:00.0, Switch #2) on backbone M <= 64!
+void launch_stage_and_arm_hlut3_dual(
+    Hlut3OffloadSlot* d_mapped_slot3,
+    Hlut3OffloadSlot* d_mapped_slot4,
+    uint32_t* d_local_wg_sync,
+    const int32_t* d_topk_ids,
+    const float* d_topk_weights,
+    const uint16_t* d_x_rot_f16,
+    uint32_t block_id,
+    int M, int top_k,
+    int exp3_begin, int exp3_end,
+    int exp4_begin, int exp4_end,
+    uint32_t req_seq3,
+    uint32_t req_seq4,
+    hipStream_t stream);
+
 // Runs on hlut3_dev=3 (0000:85:00.0): ingests x_rot_f16 (+ optional x_norm_bf16) and packs
 // ranged [exp_begin, exp_end) pairs from coherent pinned DDR4 slot into 85:00.0 HBM2.
 void launch_dev3_ingest_and_pack(

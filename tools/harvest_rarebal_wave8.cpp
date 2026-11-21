@@ -376,6 +376,10 @@ int main(int argc, char** argv) {
     std::string cal_dir      = "/dev/shm/dsv41_rarebal_cal_wave8_5";
     std::string spill_dirs;
     std::string overlay_path = root_env + "/packed_rarebal_overlay_wave8_4/hot_experts_wave8_4_perm.safetensors";
+    std::string hlut3_dev3_overlay;
+    std::string hlut3_tp3_overlay;
+    int hlut3_dev3_id        = 3;
+    bool enable_rocblas      = false;
     std::vector<std::string> src_roots = {root_env};
     std::vector<std::string> session_zstds;
     size_t target_tokens     = 2050000;
@@ -393,6 +397,10 @@ int main(int argc, char** argv) {
         else if (a == "--cal-dir" && i + 1 < argc) cal_dir = argv[++i];
         else if (a == "--spill-dirs" && i + 1 < argc) spill_dirs = argv[++i];
         else if (a == "--overlay" && i + 1 < argc) overlay_path = argv[++i];
+        else if (a == "--hlut3-dev3-overlay" && i + 1 < argc) hlut3_dev3_overlay = argv[++i];
+        else if (a == "--hlut3-dev3-id" && i + 1 < argc) hlut3_dev3_id = std::stoi(argv[++i]);
+        else if (a == "--hlut3-tp3-overlay" && i + 1 < argc) hlut3_tp3_overlay = argv[++i];
+        else if (a == "--rocblas-prefill") enable_rocblas = true;
         else if (a == "--src-root" && i + 1 < argc) { src_roots.clear(); src_roots.push_back(argv[++i]); }
         else if (a == "--extra-src-root" && i + 1 < argc) src_roots.push_back(argv[++i]);
         else if (a == "--session-zstd" && i + 1 < argc) session_zstds.push_back(argv[++i]);
@@ -433,6 +441,15 @@ int main(int argc, char** argv) {
     dsv41::Dsv41Runtime rt;
     // Match live p150_dsv41_worker Wave 8.4 physical permutation while mapping recorded IDs back to logical 0..383!
     rt.set_expert_perm_overlay(eff_ov);
+    if (!hlut3_dev3_overlay.empty() && std::filesystem::is_regular_file(hlut3_dev3_overlay, ec)) {
+        rt.set_hlut3_dev3_overlay(hlut3_dev3_overlay, hlut3_dev3_id);
+    }
+    if (!hlut3_tp3_overlay.empty() && std::filesystem::is_regular_file(hlut3_tp3_overlay, ec)) {
+        rt.set_hlut3_tp3_overlay(hlut3_tp3_overlay);
+    }
+    if (enable_rocblas) {
+        rt.set_rocblas_prefill(true);
+    }
     rt.init(mi50_root, tok_json, shm_name, 16384, eff_ov, cal_dir, eff_vit);
     rt.set_dual_stream_overlap(true);
 

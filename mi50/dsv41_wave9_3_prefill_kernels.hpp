@@ -73,13 +73,14 @@ void launch_w93_unpack_hlut3_gateup_f16(
     uint16_t* d_out_gu_f16,
     hipStream_t stream);
 
-// Gather m_e token activation rows from d_x_rot_f16[M, 5120] -> contiguous d_gather_f16[m_e, 5120].
+// Gather m_e token activation rows from d_x_rot_f16[M, 5120] -> contiguous d_gather_f16[m_pad, 5120] (zeros r >= m_e).
 void launch_w93_gather_rows_f16(
     const uint16_t* d_x_rot_f16,
     const Mi50RoutedPair* d_pairs,
     int p_start, int m_e,
     uint16_t* d_gather_f16,
-    hipStream_t stream);
+    hipStream_t stream,
+    int m_pad = 0);
 
 // Fused Clamped-SwiGLU10 + WHT128(signs_i) -> FP16:
 // Input d_gu_f32 is [m_e, 2 * N_inter] where row r has gate[0..N_inter-1] followed by up[0..N_inter-1].
@@ -153,6 +154,24 @@ void launch_w94_add_bf16_to_f32_inplace(
 // Convert FP16 -> BF16 RNE (2x less HBM2 read traffic than F32->BF16)
 void launch_w94_f16_to_bf16_rne(
     const uint16_t* d_in_f16,
+    uint16_t* d_out_bf16,
+    size_t n_elems,
+    hipStream_t stream);
+
+// Wave 10 Phase C.1: Vectorized FP16 -> FP32 (used for HHHS FP8 GEMMs targeting F32 accumulators like sh_w2)
+void launch_w10_f16_to_f32(
+    const uint16_t* d_in_f16,
+    float* d_out_f32,
+    size_t n_elems,
+    hipStream_t stream);
+
+// Wave 10 Phase C: Single-pass fused FP32 + up to 3 optional BF16 offload streams (dev3 + dev4 + P150A) -> BF16 RNE
+// Eliminates 3x post-AllReduce P150A hipMemcpyAsync H2D copies and 2x FP32 RMW passes on tp=0!
+void launch_w10_add_3bf16_to_f32_and_bf16(
+    const float* d_base_f32,
+    const uint16_t* d_add0_bf16,
+    const uint16_t* d_add1_bf16,
+    const uint16_t* d_add2_bf16,
     uint16_t* d_out_bf16,
     size_t n_elems,
     hipStream_t stream);

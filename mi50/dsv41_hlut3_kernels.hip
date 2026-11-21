@@ -715,6 +715,91 @@ void k_stage_and_arm_hlut3_dev3(
     }
 }
 
+// Wave 10 Dual-Switchbox: Single-HBM2-read fused staging & simultaneous doorbell arming for dev3 + dev4
+__global__ __launch_bounds__(256, 4)
+void k_stage_and_arm_hlut3_dual(
+    Hlut3OffloadSlot* __restrict__ slot3,
+    Hlut3OffloadSlot* __restrict__ slot4,
+    uint32_t* __restrict__ d_local_wg_sync,
+    const int32_t* __restrict__ d_topk_ids,
+    const float* __restrict__ d_topk_weights,
+    const uint16_t* __restrict__ d_x_rot_f16,
+    uint32_t block_id,
+    int M, int top_k,
+    int exp3_begin, int exp3_end,
+    int exp4_begin, int exp4_end,
+    uint32_t req_seq3,
+    uint32_t req_seq4)
+{
+    const int tid = int(threadIdx.x);
+    const int gid = int(blockIdx.x) * 256 + tid;
+    const int stride = int(gridDim.x) * 256;
+
+    if (tid == 0) {
+        if (req_seq3 > kHlut3OffloadRingSlots) {
+            const uint32_t min3 = req_seq3 - uint32_t(kHlut3OffloadRingSlots);
+            while (static_cast<int32_t>(__hip_atomic_load(&slot3->done_seq, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) - min3) < 0) {
+                __builtin_amdgcn_s_sleep(1);
+            }
+        }
+        if (req_seq4 > kHlut3OffloadRingSlots) {
+            const uint32_t min4 = req_seq4 - uint32_t(kHlut3OffloadRingSlots);
+            while (static_cast<int32_t>(__hip_atomic_load(&slot4->done_seq, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) - min4) < 0) {
+                __builtin_amdgcn_s_sleep(1);
+            }
+        }
+    }
+    __syncthreads();
+
+    const int total_pairs = M * top_k;
+    for (int i = gid; i < total_pairs; i += stride) {
+        const int32_t id = d_topk_ids[i];
+        const uint32_t wu = __float_as_uint(d_topk_weights[i]);
+        __hip_atomic_store(&slot3->topk_ids[i], id, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        __hip_atomic_store(reinterpret_cast<uint32_t*>(&slot3->topk_weights[i]), wu, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        __hip_atomic_store(&slot4->topk_ids[i], id, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        __hip_atomic_store(reinterpret_cast<uint32_t*>(&slot4->topk_weights[i]), wu, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+
+    const int n_words = (M * kHlut3OffloadHidden) >> 1;
+    const uint32_t* src_rot_u32 = reinterpret_cast<const uint32_t*>(d_x_rot_f16);
+    uint32_t* dst3_u32 = reinterpret_cast<uint32_t*>(slot3->x_rot_f16);
+    uint32_t* dst4_u32 = reinterpret_cast<uint32_t*>(slot4->x_rot_f16);
+    for (int w = gid; w < n_words; w += stride) {
+        const uint32_t v = src_rot_u32[w];
+        __hip_atomic_store(&dst3_u32[w], v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        __hip_atomic_store(&dst4_u32[w], v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+
+    if (gid == 0) {
+        __hip_atomic_store(&slot3->block_id, block_id, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        __hip_atomic_store(&slot3->rows, uint32_t(M), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        __hip_atomic_store(&slot3->top_k, uint32_t(top_k), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        __hip_atomic_store(reinterpret_cast<uint32_t*>(&slot3->exp_begin), uint32_t(exp3_begin), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        __hip_atomic_store(reinterpret_cast<uint32_t*>(&slot3->exp_end), uint32_t(exp3_end), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        __hip_atomic_store(&slot3->include_mtp_shared, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+
+        __hip_atomic_store(&slot4->block_id, block_id, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        __hip_atomic_store(&slot4->rows, uint32_t(M), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        __hip_atomic_store(&slot4->top_k, uint32_t(top_k), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        __hip_atomic_store(reinterpret_cast<uint32_t*>(&slot4->exp_begin), uint32_t(exp4_begin), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        __hip_atomic_store(reinterpret_cast<uint32_t*>(&slot4->exp_end), uint32_t(exp4_end), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        __hip_atomic_store(&slot4->include_mtp_shared, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        __threadfence_system();
+        const uint32_t prev = __hip_atomic_fetch_add(d_local_wg_sync, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        if (prev + 1u == uint32_t(gridDim.x)) {
+            __hip_atomic_store(d_local_wg_sync, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __threadfence_system();
+            __hip_atomic_store(&slot3->ready_seq, req_seq3, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+            __hip_atomic_store(&slot4->ready_seq, req_seq4, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        }
+    }
+}
+
 __global__ __launch_bounds__(256, 8)
 void k_dev3_ingest_and_pack(
     const Hlut3OffloadSlot* __restrict__ slot,
@@ -1009,6 +1094,28 @@ void launch_stage_and_arm_hlut3_dev3(
                        exp_begin, exp_end, include_mtp_shared, req_seq);
 }
 
+void launch_stage_and_arm_hlut3_dual(
+    Hlut3OffloadSlot* d_mapped_slot3,
+    Hlut3OffloadSlot* d_mapped_slot4,
+    uint32_t* d_local_wg_sync,
+    const int32_t* d_topk_ids,
+    const float* d_topk_weights,
+    const uint16_t* d_x_rot_f16,
+    uint32_t block_id,
+    int M, int top_k,
+    int exp3_begin, int exp3_end,
+    int exp4_begin, int exp4_end,
+    uint32_t req_seq3,
+    uint32_t req_seq4,
+    hipStream_t stream)
+{
+    if (d_mapped_slot3 == nullptr || d_mapped_slot4 == nullptr || M <= 0 || M > kHlut3OffloadMaxRows) return;
+    hipLaunchKernelGGL(k_stage_and_arm_hlut3_dual, dim3(8), dim3(256), 0, stream,
+                       d_mapped_slot3, d_mapped_slot4, d_local_wg_sync, d_topk_ids, d_topk_weights,
+                       d_x_rot_f16, block_id, M, top_k,
+                       exp3_begin, exp3_end, exp4_begin, exp4_end, req_seq3, req_seq4);
+}
+
 void launch_dev3_ingest_and_pack(
     const Hlut3OffloadSlot* d_mapped_slot,
     uint16_t* d_x_rot_f16_dst,
@@ -1140,7 +1247,7 @@ void k_hlut3_fdot2_grouped_gu_f16(
     uint16_t* __restrict__ inter_f16,
     int n_experts, int N_inter)
 {
-    __shared__ uint32_t s_x[8][17];   // 8 tokens x 16 f16x2 pairs (32 cols) + bank pad = 544 B
+    __shared__ uint32_t s_x[8][17]; // 8 tokens x 16 f16x2 pairs + bank pad = 544 B (overlaps HBM2 weight loads!)
     __shared__ int32_t  s_row[8];
 
     const int ae = int(blockIdx.y);
@@ -1344,7 +1451,6 @@ void k_hlut3_fdot2_grouped_gu_f16(
             } else if (hw < 8) {
                 s_x[hw][lane16] = 0u;
             }
-
             const Hlut3Tile32x32* __restrict__ gt = gtile_row + kt;
             const Hlut3Tile32x32* __restrict__ ut = utile_row + kt;
             const uint32_t g_lo = gt->q_lo2[lo_idx];

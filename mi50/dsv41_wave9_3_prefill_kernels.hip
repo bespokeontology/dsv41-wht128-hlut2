@@ -342,14 +342,19 @@ void k_w93_gather_rows_f16(
     const uint16_t* __restrict__ x_rot_f16,
     const Mi50RoutedPair* __restrict__ pairs,
     int p_start,
+    int m_e,
     uint16_t* __restrict__ gather_f16)
 {
     const int r    = int(blockIdx.y);
     const int col4 = int(blockIdx.x) * 256 + int(threadIdx.x); // 0..639 uint4s (640 * 8 = 5120 FP16)
     if (col4 >= 640) return;
+    uint4* dst = reinterpret_cast<uint4*>(gather_f16 + size_t(r) * 5120u);
+    if (r >= m_e) {
+        dst[col4] = make_uint4(0u, 0u, 0u, 0u);
+        return;
+    }
     const int src_row = pairs[p_start + r].row;
     const uint4* src = reinterpret_cast<const uint4*>(x_rot_f16 + size_t(src_row) * 5120u);
-    uint4*       dst = reinterpret_cast<uint4*>(gather_f16 + size_t(r) * 5120u);
     dst[col4] = src[col4];
 }
 
@@ -493,12 +498,13 @@ void launch_w93_unpack_hlut3_gateup_f16(
 
 void launch_w93_gather_rows_f16(
     const uint16_t* d_x_rot_f16, const Mi50RoutedPair* d_pairs,
-    int p_start, int m_e, uint16_t* d_gather_f16, hipStream_t stream)
+    int p_start, int m_e, uint16_t* d_gather_f16, hipStream_t stream, int m_pad)
 {
     if (m_e <= 0) return;
+    const int grid_y = (m_pad > m_e) ? m_pad : m_e;
     hipLaunchKernelGGL(k_w93_gather_rows_f16,
-                       dim3(3u, unsigned(m_e)), dim3(256), 0, stream,
-                       d_x_rot_f16, d_pairs, p_start, d_gather_f16);
+                       dim3(3u, unsigned(grid_y)), dim3(256), 0, stream,
+                       d_x_rot_f16, d_pairs, p_start, m_e, d_gather_f16);
 }
 
 void launch_w93_swiglu10_wht128_f32_to_f16(
@@ -1066,6 +1072,29 @@ void k_w94_gather_padded_batch_f16(
     dst[col4] = src[col4];
 }
 
+__global__ __launch_bounds__(256, 8)
+void k_w10_f16_to_f32(
+    const uint16_t* __restrict__ in_f16,
+    float* __restrict__ out_f32,
+    size_t n_elems)
+{
+    const size_t i4 = size_t(blockIdx.x) * 256u + size_t(threadIdx.x);
+    const size_t base = i4 << 2;
+    if (base + 4u <= n_elems) {
+        const uint2 hv = reinterpret_cast<const uint2*>(in_f16)[i4];
+        float4 fv;
+        fv.x = d_w93_f16_to_f32(uint16_t(hv.x & 0xFFFFu));
+        fv.y = d_w93_f16_to_f32(uint16_t(hv.x >> 16));
+        fv.z = d_w93_f16_to_f32(uint16_t(hv.y & 0xFFFFu));
+        fv.w = d_w93_f16_to_f32(uint16_t(hv.y >> 16));
+        reinterpret_cast<float4*>(out_f32)[i4] = fv;
+    } else if (base < n_elems) {
+        for (size_t k = base; k < n_elems; ++k) {
+            out_f32[k] = d_w93_f16_to_f32(in_f16[k]);
+        }
+    }
+}
+
 void launch_w94_f16_to_bf16_rne(
     const uint16_t* d_in_f16, uint16_t* d_out_bf16, size_t n_elems, hipStream_t stream)
 {
@@ -1074,6 +1103,90 @@ void launch_w94_f16_to_bf16_rne(
     hipLaunchKernelGGL(k_w94_f16_to_bf16_rne,
                        dim3(unsigned((n4 + 255u) / 256u)), dim3(256), 0, stream,
                        d_in_f16, d_out_bf16, n_elems);
+}
+
+__global__ __launch_bounds__(256, 8)
+void k_w10_add_3bf16_to_f32_and_bf16(
+    const float*    __restrict__ base_f32,
+    const uint16_t* __restrict__ add0_bf16,
+    const uint16_t* __restrict__ add1_bf16,
+    const uint16_t* __restrict__ add2_bf16,
+    uint16_t*       __restrict__ out_bf16,
+    size_t n_elems)
+{
+    const size_t i4 = size_t(blockIdx.x) * 256u + size_t(threadIdx.x);
+    const size_t base = i4 << 2;
+    if (base + 4u <= n_elems) {
+        float4 v = reinterpret_cast<const float4*>(base_f32)[i4];
+        const size_t w0 = i4 << 1;
+        // System-scope relaxed loads (pure read-only global_load_dword glc, 0 RMW atomics)
+        // bypass stale gfx906 L2 cache lines for host-written mapped /dev/shm & coherent offload buffers!
+        if (add0_bf16 != nullptr) {
+            const uint32_t* p32 = reinterpret_cast<const uint32_t*>(add0_bf16);
+            const uint32_t px = __hip_atomic_load(&p32[w0 + 0u], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            const uint32_t py = __hip_atomic_load(&p32[w0 + 1u], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            v.x += d_w93_bf16_to_f32(uint16_t(px & 0xFFFFu));
+            v.y += d_w93_bf16_to_f32(uint16_t(px >> 16));
+            v.z += d_w93_bf16_to_f32(uint16_t(py & 0xFFFFu));
+            v.w += d_w93_bf16_to_f32(uint16_t(py >> 16));
+        }
+        if (add1_bf16 != nullptr) {
+            const uint32_t* p32 = reinterpret_cast<const uint32_t*>(add1_bf16);
+            const uint32_t px = __hip_atomic_load(&p32[w0 + 0u], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            const uint32_t py = __hip_atomic_load(&p32[w0 + 1u], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            v.x += d_w93_bf16_to_f32(uint16_t(px & 0xFFFFu));
+            v.y += d_w93_bf16_to_f32(uint16_t(px >> 16));
+            v.z += d_w93_bf16_to_f32(uint16_t(py & 0xFFFFu));
+            v.w += d_w93_bf16_to_f32(uint16_t(py >> 16));
+        }
+        if (add2_bf16 != nullptr) {
+            const uint32_t* p32 = reinterpret_cast<const uint32_t*>(add2_bf16);
+            const uint32_t px = __hip_atomic_load(&p32[w0 + 0u], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            const uint32_t py = __hip_atomic_load(&p32[w0 + 1u], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            v.x += d_w93_bf16_to_f32(uint16_t(px & 0xFFFFu));
+            v.y += d_w93_bf16_to_f32(uint16_t(px >> 16));
+            v.z += d_w93_bf16_to_f32(uint16_t(py & 0xFFFFu));
+            v.w += d_w93_bf16_to_f32(uint16_t(py >> 16));
+        }
+        uint2 out;
+        out.x = uint32_t(d_w93_f32_to_bf16_rne(v.x)) | (uint32_t(d_w93_f32_to_bf16_rne(v.y)) << 16);
+        out.y = uint32_t(d_w93_f32_to_bf16_rne(v.z)) | (uint32_t(d_w93_f32_to_bf16_rne(v.w)) << 16);
+        reinterpret_cast<uint2*>(out_bf16)[i4] = out;
+    } else if (base < n_elems) {
+        for (size_t k = base; k < n_elems; ++k) {
+            float v = base_f32[k];
+            if (add0_bf16 != nullptr) v += d_w93_bf16_to_f32(__hip_atomic_load(&add0_bf16[k], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM));
+            if (add1_bf16 != nullptr) v += d_w93_bf16_to_f32(__hip_atomic_load(&add1_bf16[k], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM));
+            if (add2_bf16 != nullptr) v += d_w93_bf16_to_f32(__hip_atomic_load(&add2_bf16[k], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM));
+            out_bf16[k] = d_w93_f32_to_bf16_rne(v);
+        }
+    }
+}
+
+void launch_w10_f16_to_f32(
+    const uint16_t* d_in_f16, float* d_out_f32, size_t n_elems, hipStream_t stream)
+{
+    if (n_elems == 0) return;
+    const size_t n4 = (n_elems + 3u) >> 2;
+    hipLaunchKernelGGL(k_w10_f16_to_f32,
+                       dim3(unsigned((n4 + 255u) / 256u)), dim3(256), 0, stream,
+                       d_in_f16, d_out_f32, n_elems);
+}
+
+void launch_w10_add_3bf16_to_f32_and_bf16(
+    const float* d_base_f32,
+    const uint16_t* d_add0_bf16,
+    const uint16_t* d_add1_bf16,
+    const uint16_t* d_add2_bf16,
+    uint16_t* d_out_bf16,
+    size_t n_elems,
+    hipStream_t stream)
+{
+    if (n_elems == 0) return;
+    const size_t n4 = (n_elems + 3u) >> 2;
+    hipLaunchKernelGGL(k_w10_add_3bf16_to_f32_and_bf16,
+                       dim3(unsigned((n4 + 255u) / 256u)), dim3(256), 0, stream,
+                       d_base_f32, d_add0_bf16, d_add1_bf16, d_add2_bf16, d_out_bf16, n_elems);
 }
 
 void launch_w94_swiglu10_wht128_f16_to_f16(

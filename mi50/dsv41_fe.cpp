@@ -842,14 +842,28 @@ int main(int argc, char** argv) {
         std::string expert_perm_overlay;
         std::string hlut3_mtp_overlay;
         std::string hlut3_dev3_overlay;
+        std::string hlut3_dev4_overlay;
         std::string hlut3_tp3_overlay;
         int hlut3_dev3_id = 3;
-        if (const char* w9_dir = std::getenv("DSV41_WAVE9_OVERLAY_DIR")) {
-            if (*w9_dir != '\0') {
-                const std::string c_dev3 = std::string(w9_dir) + "/wave9_2_dev3_hlut3.safetensors";
-                const std::string c_tp3  = std::string(w9_dir) + "/wave9_2_tp3_hlut3.safetensors";
+        int hlut3_dev4_id = 4;
+        if (const char* w10_dir = std::getenv("DSV41_WAVE10_OVERLAY_DIR")) {
+            if (*w10_dir != '\0') {
+                const std::string c_dev3 = std::string(w10_dir) + "/wave10_dev3_hlut3.safetensors";
+                const std::string c_dev4 = std::string(w10_dir) + "/wave10_dev4_hlut3.safetensors";
+                const std::string c_tp3  = std::string(w10_dir) + "/wave10_tp3_hlut3.safetensors";
                 if (std::ifstream(c_dev3, std::ios::binary).good()) hlut3_dev3_overlay = c_dev3;
+                if (std::ifstream(c_dev4, std::ios::binary).good()) hlut3_dev4_overlay = c_dev4;
                 if (std::ifstream(c_tp3, std::ios::binary).good())  hlut3_tp3_overlay  = c_tp3;
+            }
+        }
+        if (hlut3_dev3_overlay.empty() && hlut3_tp3_overlay.empty()) {
+            if (const char* w9_dir = std::getenv("DSV41_WAVE9_OVERLAY_DIR")) {
+                if (*w9_dir != '\0') {
+                    const std::string c_dev3 = std::string(w9_dir) + "/wave9_2_dev3_hlut3.safetensors";
+                    const std::string c_tp3  = std::string(w9_dir) + "/wave9_2_tp3_hlut3.safetensors";
+                    if (std::ifstream(c_dev3, std::ios::binary).good()) hlut3_dev3_overlay = c_dev3;
+                    if (std::ifstream(c_tp3, std::ios::binary).good())  hlut3_tp3_overlay  = c_tp3;
+                }
             }
         }
         bool disable_expert_perm = false;
@@ -872,8 +886,8 @@ int main(int argc, char** argv) {
         bool fused_mhc_norm      = true;
         bool fused_dspark_epilogue = true;
         bool rocblas_prefill     = true;
-        int rocblas_expert_thresh = 18;
-        int rocblas_hlut2_thresh  = 20;
+        int rocblas_expert_thresh = 20;
+        int rocblas_hlut2_thresh  = 24;
         int prefill_superchunk_m  = 2048;
         float tree8_conf_thresh   = 0.72f;
         int chain_max_b           = 5;
@@ -945,6 +959,12 @@ int main(int argc, char** argv) {
                 hlut3_dev3_overlay.clear();
             } else if (arg == "--hlut3-dev3-id" && i + 1 < argc) {
                 hlut3_dev3_id = std::stoi(argv[++i]);
+            } else if (arg == "--hlut3-dev4-overlay" && i + 1 < argc) {
+                hlut3_dev4_overlay = argv[++i];
+            } else if (arg == "--no-hlut3-dev4-overlay") {
+                hlut3_dev4_overlay.clear();
+            } else if (arg == "--hlut3-dev4-id" && i + 1 < argc) {
+                hlut3_dev4_id = std::stoi(argv[++i]);
             } else if (arg == "--hlut3-tp3-overlay" && i + 1 < argc) {
                 hlut3_tp3_overlay = argv[++i];
             } else if (arg == "--no-hlut3-tp3-overlay") {
@@ -1030,6 +1050,9 @@ int main(int argc, char** argv) {
         runtime.set_hlut3_mtp_overlay(hlut3_mtp_overlay);
         if (!hlut3_dev3_overlay.empty()) {
             runtime.set_hlut3_dev3_overlay(hlut3_dev3_overlay, hlut3_dev3_id);
+        }
+        if (!hlut3_dev4_overlay.empty()) {
+            runtime.set_hlut3_dev4_overlay(hlut3_dev4_overlay, hlut3_dev4_id);
         }
         if (!hlut3_tp3_overlay.empty()) {
             runtime.set_hlut3_tp3_overlay(hlut3_tp3_overlay);
