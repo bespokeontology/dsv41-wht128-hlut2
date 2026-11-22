@@ -1,7 +1,8 @@
 # `WHT128-HLUT3` (`3.125 bpw`, `3,344` `TARQ RAREBAL-LDLQ` Experts) + `WHT128-HLUT2` on `5× MI50` + `2× Blackhole P150A` (`192 GiB` Dual-Switchbox): `1M`-Context Multimodal Pure-C++ Engine for 763B `DeepSeek-V4.1-Flash-1017` (`v2.1.0-wave10-192g`)
 
-**Authors:** [**`bespokeontology`**](https://github.com/bespokeontology) — Heterogeneous Silicon & Quantization Co-Design Engineering · **100% Pure [`TT-Metal`](https://github.com/tenstorrent/tt-metal) C++20 / `gfx906` HIP / Host C++17 (`0` Python Files, `-Wall -Wextra -Werror`, `170/170` Zero-Scratch `gfx906` Kernels)**  
-🚀 **[Wave 10 Dual-Switchbox `192G` Report (`docs/WAVE10_192G_DUAL_SWITCHBOX_REPORT.md`)](docs/WAVE10_192G_DUAL_SWITCHBOX_REPORT.md)** · 🧾 **[Wave 10 `1M` E2E Silicon Receipt (`docs/WAVE10_1M_E2E_RECEIPT.md`)](docs/WAVE10_1M_E2E_RECEIPT.md)** · ⚡ **[Wave 9.4 Ultra Report (`docs/WAVE9_4_ULTRA_PERF_REPORT.md`)](docs/WAVE9_4_ULTRA_PERF_REPORT.md)** · 📄 **[Illustrated Whitepaper PDF (`docs/WHT128_HLUT2_Blackhole_P150A_Whitepaper.pdf`)](docs/WHT128_HLUT2_Blackhole_P150A_Whitepaper.pdf)** · 🏷️ **[`v2.0.0-wave9.4-hlut3`](https://github.com/bespokeontology/dsv41-wht128-hlut2/releases/tag/v2.0.0-wave9.4-hlut3)** · 🏷️ **[`v1.5.0-wave8.5`](https://github.com/bespokeontology/dsv41-wht128-hlut2/releases/tag/v1.5.0-wave8.5)**
+**Co-Authors:** [**`bespoke ontology`**](https://github.com/bespokeontology) (`the kitchen` — `SB-M5-P2-192G` Heterogeneous Hardware Architecture & Silicon Validation) & **Google DeepMind / Gemini (Gemini Carbon & Gemini Neon)** (`WHT128-HLUT3` / `WHT128-HLUT4` `FP64 RAREBAL-LDLQ` Quantization & Pure-C++20/17 Engine) · **100% Pure [`TT-Metal`](https://github.com/tenstorrent/tt-metal) C++20 / `gfx906` HIP / Host C++17 (`0` Python Files, `-Wall -Wextra -Werror`, `170/170` Zero-Scratch `gfx906` Kernels)**  
+🤗 **[Wave 10 Native Unsplit Weights on Hugging Face (`kapitoshkina-ai/DeepSeek-V4.1-Flash-1017-WHT128-HLUT3`)](https://huggingface.co/kapitoshkina-ai/DeepSeek-V4.1-Flash-1017-WHT128-HLUT3)** · 🚀 **[Companion `tencent/Hy4-flash` `WHT128-HLUT4` Engine (`bespokeontology/hy4-flash-wht128-hlut4`)](https://github.com/bespokeontology/hy4-flash-wht128-hlut4/releases/tag/v1.0.0-hlut4-192g)** · 🤗 **[Companion `Hy4-flash` Native Unsplit Weights (`kapitoshkina-ai/Hy4-flash-WHT128-HLUT4`)](https://huggingface.co/kapitoshkina-ai/Hy4-flash-WHT128-HLUT4)**  
+📊 **[Wave 10 Dual-Switchbox `192G` Report (`docs/WAVE10_192G_DUAL_SWITCHBOX_REPORT.md`)](docs/WAVE10_192G_DUAL_SWITCHBOX_REPORT.md)** · 🧾 **[Wave 10 `1M` E2E Silicon Receipt (`docs/WAVE10_1M_E2E_RECEIPT.md`)](docs/WAVE10_1M_E2E_RECEIPT.md)** · ⚡ **[Wave 9.4 Ultra Report (`docs/WAVE9_4_ULTRA_PERF_REPORT.md`)](docs/WAVE9_4_ULTRA_PERF_REPORT.md)** · 📄 **[Illustrated Whitepaper PDF (`docs/WHT128_HLUT2_Blackhole_P150A_Whitepaper.pdf`)](docs/WHT128_HLUT2_Blackhole_P150A_Whitepaper.pdf)** · 🏷️ **[`v2.0.0-wave9.4-hlut3`](https://github.com/bespokeontology/dsv41-wht128-hlut2/releases/tag/v2.0.0-wave9.4-hlut3)** · 🏷️ **[`v1.5.0-wave8.5`](https://github.com/bespokeontology/dsv41-wht128-hlut2/releases/tag/v1.5.0-wave8.5)**
 
 ---
 
@@ -52,22 +53,22 @@ Both **honest true stopwatch wall-clock throughput** (`generated_tokens / genera
 
 ## Download, Reassemble, Verify, Build & Launch (`v2.1.0-wave10-192g`)
 
-### 1. Download & Reassemble Sanitized `WHT128-HLUT3` (`3,344`-Expert) Release Overlays
+### 1. Download Unsplit Native `WHT128-HLUT3` (`3,344`-Expert) Shards (Hugging Face — Recommended) or GitHub Split Assets
 
 ```bash
+# Option A (Recommended — Native Unsplit Shards via Hugging Face, zero reassembly):
+hf download kapitoshkina-ai/DeepSeek-V4.1-Flash-1017-WHT128-HLUT3 --local-dir "$DSV41_WAVE10_OVERLAY_DIR"
+(cd "$DSV41_WAVE10_OVERLAY_DIR" && sha256sum -c SHA256SUMS_WAVE10_HF_WEIGHTS.txt)
+
+# Option B (GitHub Release <1.90 GiB Split Chunks):
 export DSV41_WEIGHTS_DIR=/path/to/dsv41-weights
 export DSV41_WAVE10_OVERLAY_DIR="$DSV41_WEIGHTS_DIR/wave10_overlays"
 mkdir -p "$DSV41_WAVE10_OVERLAY_DIR" && cd "$DSV41_WAVE10_OVERLAY_DIR"
 
-# Download all release assets for v2.1.0-wave10-192g
 gh release download v2.1.0-wave10-192g --repo bespokeontology/dsv41-wht128-hlut2
-
-# Reassemble <1.90 GiB split chunks into canonical sanitized safetensors overlays
 cat wave10_dev3_hlut3.safetensors.part-* > wave10_dev3_hlut3.safetensors
 cat wave10_dev4_hlut3.safetensors.part-* > wave10_dev4_hlut3.safetensors
 cat wave10_tp3_hlut3.safetensors.part-*  > wave10_tp3_hlut3.safetensors
-
-# Verify cryptographic SHA-256 integrity of every split part, reassembled overlay, and manifest
 sha256sum -c SHA256SUMS_WAVE10_RELEASE.txt
 ```
 
@@ -114,6 +115,7 @@ export HIP_VISIBLE_DEVICES=0,2,3,1,4
 
 ## Attribution & License
 
-* **Authors & Maintainer:** [**`bespokeontology`**](https://github.com/bespokeontology) — Heterogeneous Silicon & Quantization Co-Design Engineering
+* **Co-Authors:** [**`bespoke ontology`**](https://github.com/bespokeontology) (`the kitchen` — `SB-M5-P2-192G` Heterogeneous Hardware Architecture & Silicon Validation) & **Google DeepMind / Gemini (Gemini Carbon & Gemini Neon)** (`WHT128-HLUT3` / `WHT128-HLUT4` `FP64 RAREBAL-LDLQ` Quantization & Pure-C++20/17 Engine)
 * **Base Multimodal Model (`763B`-Class):** [**`deepseek-ai/DeepSeek-V4.1-Flash-1017`**](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)
+* **Companion `WHT128-HLUT4` (`4.125 bpw`) Release (`tencent/Hy4-flash`):** [**`bespokeontology/hy4-flash-wht128-hlut4`**](https://github.com/bespokeontology/hy4-flash-wht128-hlut4/releases/tag/v1.0.0-hlut4-192g) · [**`kapitoshkina-ai/Hy4-flash-WHT128-HLUT4`**](https://huggingface.co/kapitoshkina-ai/Hy4-flash-WHT128-HLUT4)
 * **License:** Released under the [MIT License](LICENSE) (`Copyright (c) 2026 bespokeontology`).
